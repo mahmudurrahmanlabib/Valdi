@@ -54,8 +54,10 @@ void ViewNodeRenderer::visit(RenderRequestEntries::CreateElement& entry) {
         return;
     }
 
-    auto viewNode =
-        Valdi::makeShared<ViewNode>(_attributesManager.getYogaConfig(), _attributesManager.getAttributeIds(), _logger);
+    auto viewNode = Valdi::makeShared<ViewNode>(_attributesManager.getYogaConfig(),
+                                                _attributesManager.getAttributeIds(),
+                                                _attributesManager.getColorPaletteManager()->getActiveColorPalette(),
+                                                _logger);
     viewNode->setViewFactory(_viewTransactionScope, _viewNodeTree.getOrCreateViewFactory(entry.getViewClassName()));
     viewNode->setRawId(entry.getElementId());
 
@@ -93,6 +95,9 @@ void ViewNodeRenderer::visit(RenderRequestEntries::SetRootElement& entry) {
 
 void ViewNodeRenderer::visit(RenderRequestEntries::SetElementAttribute& entry) {
     if (!setCurrent(entry.getElementId(), entry)) {
+        return;
+    }
+    if (_currentNode->getViewFactory() == nullptr) {
         return;
     }
 
@@ -187,6 +192,10 @@ void ViewNodeRenderer::visit(RenderRequestEntries::CancelAnimation& entry) {
 
 void ViewNodeRenderer::visit(RenderRequestEntries::OnLayoutComplete& entry) {
     _viewNodeTree.onNextLayout(entry.getCallback());
+}
+
+void ViewNodeRenderer::visit(RenderRequestEntries::OnNextDraw& entry) {
+    _viewNodeTree.onNextDraw(entry.getCallback());
 }
 
 void ViewNodeRenderer::onCurrentNodeAttributeChange() {

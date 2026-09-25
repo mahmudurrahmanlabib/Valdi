@@ -7,7 +7,7 @@ set -x
 
 # We're not installing the ios_webkit_debug_proxy and we're not runnig any simulators at this point
 # However we want the valdi doctor command to believe there is an ios_webkit_debug_proxy
-mkdir ~/bin
+mkdir -p ~/bin
 export PATH=$HOME/bin:$PATH
 touch ~/bin/ios_webkit_debug_proxy
 chmod +x ~/bin/ios_webkit_debug_proxy
@@ -16,6 +16,10 @@ which ios_webkit_debug_proxy
 
 OPEN_SOURCE_DIR="$(pwd)"
 APP_DIR="/tmp/valdi_app"
+
+# Auto-repin Rust crate lockfiles so the digest matches regardless of whether
+# @valdi is the root module (public repo) or a dependency (internal monorepo).
+export CARGO_BAZEL_REPIN=true
 
 # Make sure the targets build
 if [[ $(uname) != Linux ]] ; then

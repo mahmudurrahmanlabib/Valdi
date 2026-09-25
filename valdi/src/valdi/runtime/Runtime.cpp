@@ -11,6 +11,7 @@
 #include "valdi/runtime/Attributes/ValueConverters.hpp"
 #include "valdi/runtime/Attributes/Yoga/Yoga.hpp"
 #include "valdi/runtime/Context/ViewNodeTree.hpp"
+#include "valdi/runtime/ValdiBuildFlags.hpp"
 #include "valdi_core/cpp/Constants.hpp"
 
 #include "valdi/runtime/Attributes/AttributeOwner.hpp"
@@ -18,6 +19,7 @@
 #include "valdi/runtime/CSS/CSSDocument.hpp"
 
 #include "valdi/runtime/Rendering/RenderRequest.hpp"
+#include "valdi/runtime/Rendering/RenderRequestEntries.hpp"
 #include "valdi/runtime/Rendering/ViewNodeRenderer.hpp"
 
 #include "valdi/runtime/Resources/AssetCatalog.hpp"
@@ -28,6 +30,8 @@
 #include "valdi/runtime/Context/ViewNodeViewStats.hpp"
 #include "valdi_core/cpp/Context/ComponentPath.hpp"
 
+#include "valdi/runtime/JavaScript/Modules/AttributedTextNativeModuleFactory.hpp"
+#include "valdi/runtime/JavaScript/Modules/Base64ModuleFactory.hpp"
 #include "valdi/runtime/JavaScript/Modules/FileSystemFactory.hpp"
 #include "valdi/runtime/JavaScript/Modules/JavaScriptModuleFactoryBridge.hpp"
 #include "valdi/runtime/JavaScript/Modules/PersistentStoreModuleFactory.hpp"
@@ -38,6 +42,7 @@
 #include "valdi/runtime/Metrics/Metrics.hpp"
 
 #include "valdi/RuntimeMessageHandler.hpp"
+#include "valdi/runtime/ErrorCodes.hpp"
 #include "valdi/runtime/Runtime.hpp"
 #include "valdi/runtime/ValdiRuntimeTweaks.hpp"
 #include "valdi_core/cpp/Resources/ResourceId.hpp"
@@ -49,10 +54,60 @@
 #include "utils/time/StopWatch.hpp"
 #include <algorithm>
 #include <fmt/format.h>
+#include <set>
 #include <vector>
 #include <yoga/YGNode.h>
+#include <yoga/YGValue.h>
 
 namespace Valdi {
+
+namespace {
+
+#if VALDI_DEBUG_TREE_UPDATES
+constexpr size_t kMaxAttributeNamesInTrace = 12;
+constexpr size_t kMaxTraceTriggerAttributeLength = 96;
+
+std::string getRenderRequestAttributeNamesTrigger(const RenderRequest& request, const AttributeIds& attributeIds) {
+    std::set<std::string> names;
+    struct Visitor {
+        const AttributeIds& ids;
+        std::set<std::string>& out;
+        void visit(RenderRequestEntries::EntryBase& entry) {
+            if (entry.getType() == RenderRequestEntryType::SetElementAttribute) {
+                auto& setAttr = static_cast<RenderRequestEntries::SetElementAttribute&>(entry);
+                out.insert(ids.getNameForId(setAttr.getAttributeId()).slowToString());
+            }
+        }
+    } visitor{attributeIds, names};
+    request.visitEntries(visitor);
+
+    if (names.empty()) {
+        return "render_request";
+    }
+    std::string trigger = "render_request|";
+    size_t count = 0;
+    size_t length = trigger.size();
+    for (const auto& name : names) {
+        if (count >= kMaxAttributeNamesInTrace ||
+            (length + name.size() + (count ? 1 : 0) > kMaxTraceTriggerAttributeLength)) {
+            if (count > 0) {
+                trigger += ",...";
+            }
+            break;
+        }
+        if (count != 0) {
+            trigger += ",";
+            length += 1;
+        }
+        trigger += name;
+        length += name.size();
+        ++count;
+    }
+    return trigger;
+}
+#endif
+
+} // namespace
 
 constexpr bool kTCPSocketEnabled = (snap::kIsGoldBuild || snap::kIsDevBuild);
 
@@ -69,7 +124,7 @@ Runtime::Runtime(AttributeIds& attributeIds,
                  const Shared<IResourceLoader>& resourceLoader,
                  const Ref<AssetLoaderManager>& assetLoaderManager,
                  const Holder<Shared<snap::valdi_core::HTTPRequestManager>>& requestManager,
-                 const Ref<ColorPalette>& colorPalette,
+                 const Ref<ColorPaletteManager>& colorPaletteManager,
                  const Ref<IDiskCache>& diskCache,
                  const std::shared_ptr<YGConfig>& yogaConfig,
                  const Shared<snap::valdi::RuntimeMessageHandler>& runtimeMessageHandler,
@@ -89,10 +144,10 @@ Runtime::Runtime(AttributeIds& attributeIds,
                                                    deviceDensity,
                                                    debuggerServiceEnabled,
                                                    *logger)),
-      _contextManager(logger, this),
+      _contextManager(makeShared<ContextManager>(logger, this)),
       _viewNodeManager(*mainThreadManager, *logger),
       _mainThreadManager(mainThreadManager),
-      _colorPalette(colorPalette),
+      _colorPaletteManager(colorPaletteManager),
       _diskCache(diskCache),
       _userSession(userSession),
       _requestManager(requestManager),
@@ -131,7 +186,7 @@ void Runtime::fullTeardown() {
         VALDI_INFO(*_logger, "Tearing down Valdi Runtime");
     }
     _viewNodeManager.removeAllViewNodeTrees();
-    _contextManager.destroyAllContexts();
+    _contextManager->destroyAllContexts();
 
     if (_javaScriptRuntime != nullptr) {
         _javaScriptRuntime->fullTeardown();
@@ -145,22 +200,26 @@ void Runtime::postInit() {
     _didInit = true;
 
     if (_javaScriptRuntime != nullptr) {
-        _javaScriptRuntime->setListener(this);
+        _javaScriptRuntime->setListener(this, weakRef(this));
+        _javaScriptRuntime->setANRDiagnosticsEnabled(enableANRDiagnostics());
     }
     _viewNodeManager.setRuntime(weakRef(this));
-    _contextManager.setListener(this);
+    _contextManager->setListener(this);
 
     if (_javaScriptRuntime != nullptr) {
         _javaScriptRuntime->postInit();
 
         if (_diskCache != nullptr) {
             registerNativeModuleFactory(Valdi::makeShared<PersistentStoreModuleFactory>(
-                _diskCache, _workerQueue, _userSession, _keychain, *_logger, disablePersistentStoreEncryption()));
+                _diskCache, _workerQueue, _userSession, _keychain, *_logger));
         }
         registerNativeModuleFactory(makeShared<FileSystemFactory>().toShared());
+        registerNativeModuleFactory(
+            makeShared<AttributedTextNativeModuleFactory>(_colorPaletteManager, *_logger).toShared());
 
         registerJavaScriptModuleFactory(makeShared<ProtobufModuleFactory>(*_resourceManager, _workerQueue, *_logger));
         registerJavaScriptModuleFactory(makeShared<UnicodeModuleFactory>());
+        registerJavaScriptModuleFactory(makeShared<Base64ModuleFactory>());
 
         if constexpr (kTCPSocketEnabled) {
             registerNativeModuleFactory(makeShared<TCPSocketModuleFactory>().toShared());
@@ -200,13 +259,13 @@ SharedContext Runtime::createContext(const Ref<ViewManagerContext>& viewManagerC
         contextHandler = _javaScriptRuntime->getContextHandler();
     }
 
-    auto context = _contextManager.createContext(contextHandler,
-                                                 viewManagerContext,
-                                                 componentPath,
-                                                 initialViewModel,
-                                                 componentContext,
-                                                 _shouldProcessUpdatesSynchronously,
-                                                 deferRender);
+    auto context = _contextManager->createContext(contextHandler,
+                                                  viewManagerContext,
+                                                  componentPath,
+                                                  initialViewModel,
+                                                  componentContext,
+                                                  _shouldProcessUpdatesSynchronously,
+                                                  deferRender);
 
     _resourceManager->preloadForComponentPath(componentPath);
 
@@ -248,12 +307,14 @@ SharedViewNodeTree Runtime::getOrCreateViewNodeTreeForContextId(ContextId contex
         return tree;
     }
 
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         return nullptr;
     }
 
-    return createViewNodeTree(context);
+    // Use the thread-safe getOrCreateViewNodeTreeForContext which holds the lock
+    // during both the existence check and creation to avoid TOCTOU race conditions.
+    return _viewNodeManager.getOrCreateViewNodeTreeForContext(context, ViewNodeTreeThreadAffinity::MAIN_THREAD);
 }
 
 void Runtime::destroyContext(const SharedContext& context) {
@@ -274,7 +335,7 @@ void Runtime::doDestroyContext(const SharedContext& context) {
     ScopedMetrics metrics =
         Metrics::scopedDestroyContextLatency(getMetrics(), context->getPath().getResourceId().bundleName);
 
-    _contextManager.destroyContext(context);
+    _contextManager->destroyContext(context);
     auto viewNodeTree = _viewNodeManager.getViewNodeTreeForContextId(context->getContextId());
     if (viewNodeTree != nullptr) {
         destroyViewNodeTree(*viewNodeTree);
@@ -301,14 +362,30 @@ void appendAllViews(ViewNode* viewNode, std::vector<Ref<View>>& views) {
 void Runtime::destroyViewNodeTree(ViewNodeTree& viewNodeTree) {
     _viewNodeManager.removeViewNodeTree(viewNodeTree);
 
-    viewNodeTree.scheduleExclusiveUpdate([&]() {
-        auto rootViewNode = viewNodeTree.getRootViewNode();
-        if (rootViewNode != nullptr) {
-            viewNodeTree.removeViewNode(rootViewNode->getRawId());
-        }
+#if VALDI_DEBUG_TREE_UPDATES
+    viewNodeTree.scheduleExclusiveUpdate(
+        [&]() {
+            auto rootViewNode = viewNodeTree.getRootViewNode();
+            if (rootViewNode != nullptr) {
+                viewNodeTree.removeViewNode(rootViewNode->getRawId());
+            }
 
-        viewNodeTree.clear();
-    });
+            viewNodeTree.clear();
+        },
+        DispatchFunction(),
+        "destroy");
+#else
+    viewNodeTree.scheduleExclusiveUpdate(
+        [&]() {
+            auto rootViewNode = viewNodeTree.getRootViewNode();
+            if (rootViewNode != nullptr) {
+                viewNodeTree.removeViewNode(rootViewNode->getRawId());
+            }
+
+            viewNodeTree.clear();
+        },
+        DispatchFunction());
+#endif
 }
 
 void Runtime::updateAttributeState(ViewNode& viewNode, const StringBox& attributeName, const Value& attributeValue) {
@@ -322,7 +399,7 @@ DumpedLogs Runtime::dumpContextsLogs() const {
 
     ValueArrayBuilder builder;
 
-    auto contexts = _contextManager.getAllContexts();
+    auto contexts = _contextManager->getAllContexts();
     std::sort(contexts.begin(), contexts.end(), [](const auto& left, const auto& right) -> bool {
         return left->getContextId() < right->getContextId();
     });
@@ -480,19 +557,20 @@ void Runtime::onViewNodeTreeLayoutBecameDirty(ViewNodeTree& viewNodeTree) {
 
 void Runtime::runWithExclusiveJsThreadLock(DispatchFunction&& cb) {
     if (_didInit) {
-        _javaScriptRuntime->dispatchOnJsThreadAsync(nullptr, [cb = std::move(cb)](auto& /*jsEntry*/) { cb(); });
+        _javaScriptRuntime->dispatchOnJsThreadAsync(JsThreadDispatchReason::ExclusiveJsThreadLock,
+                                                    [cb = std::move(cb)](auto& /*jsEntry*/) { cb(); });
     } else {
         _mainThreadManager->dispatch(nullptr, std::move(cb));
     }
 }
 
-bool Runtime::disablePersistentStoreEncryption() {
+bool Runtime::enableANRDiagnostics() {
     const auto& runtimeTweaks = getRuntimeTweaks();
     if (runtimeTweaks == NULL) {
         return false;
     }
 
-    return runtimeTweaks->disablePersistentStoreEncryption();
+    return runtimeTweaks->enableANRDiagnostics();
 }
 
 void Runtime::daemonClientConnected(const Shared<IDaemonClient>& daemonClient) {
@@ -519,7 +597,7 @@ void Runtime::setAutoRenderDisabled(bool autoRenderDisabled) {
     auto oldValue = _autoRenderDisabled.exchange(autoRenderDisabled);
 
     if (!autoRenderDisabled && oldValue) {
-        for (const auto& context : _contextManager.getAllContexts()) {
+        for (const auto& context : _contextManager->getAllContexts()) {
             if (context->hasPendingRenderRequests()) {
                 getMainThreadManager().dispatch(context, [context]() { context->flushRenderRequests(); });
             }
@@ -528,7 +606,7 @@ void Runtime::setAutoRenderDisabled(bool autoRenderDisabled) {
 }
 
 void Runtime::receivedRenderRequest(const Ref<RenderRequest>& renderRequest) {
-    auto context = _contextManager.getContext(renderRequest->getContextId());
+    auto context = _contextManager->getContext(renderRequest->getContextId());
     if (context == nullptr) {
         return;
     }
@@ -557,9 +635,41 @@ void Runtime::processRenderRequest(const Ref<RenderRequest>& rawRenderRequest) {
         return;
     }
 
+#if VALDI_DEBUG_TREE_UPDATES
+    std::string renderTrigger = getRenderRequestAttributeNamesTrigger(*rawRenderRequest, _attributeIds);
     viewNodeTree->scheduleExclusiveUpdate(
         [=]() {
-            VALDI_TRACE("Valdi.processRenderRequest");
+            VALDI_TRACE_META("Valdi.processRenderRequest", std::to_string(rawRenderRequest->getEntriesSize()));
+
+            ViewNodeRenderer renderer(*viewNodeTree, viewNodeTree->getContext()->getLogger(), _limitToViewportDisabled);
+
+            renderer.render(*rawRenderRequest);
+
+            if (Valdi::traceRenderingPerformance) {
+                VALDI_INFO(
+                    *_logger, "Finished rendering {} in {}", viewNodeTree->getContext()->getPath(), sw.elapsed());
+            }
+
+            if (rawRenderRequest->getEntriesSize() >= Valdi::kEmitProcessRequestLatencyEntriesThreshold) {
+                const auto& metrics = getMetrics();
+                if (metrics != nullptr) {
+                    metrics->emitProcessRequestLatency(viewNodeTree->getContext()->getPath().getResourceId().bundleName,
+                                                       sw.elapsed());
+                }
+            }
+
+            viewNodeTree->getContext()->onRendered();
+        },
+        [=]() {
+            if (_listener != nullptr) {
+                _listener->onContextRendered(*this, viewNodeTree->getContext());
+            }
+        },
+        std::move(renderTrigger));
+#else
+    viewNodeTree->scheduleExclusiveUpdate(
+        [=]() {
+            VALDI_TRACE_META("Valdi.processRenderRequest", std::to_string(rawRenderRequest->getEntriesSize()));
 
             ViewNodeRenderer renderer(*viewNodeTree, viewNodeTree->getContext()->getLogger(), _limitToViewportDisabled);
 
@@ -585,12 +695,13 @@ void Runtime::processRenderRequest(const Ref<RenderRequest>& rawRenderRequest) {
                 _listener->onContextRendered(*this, viewNodeTree->getContext());
             }
         });
+#endif
 }
 
 void Runtime::receivedCallActionMessage(const ContextId& contextId,
                                         const StringBox& actionName,
                                         const Ref<ValueArray>& parameters) {
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         VALDI_WARN(*_logger, "Cannot call action: Context {} was already destroyed.", contextId);
         return;
@@ -638,6 +749,25 @@ void Runtime::registerTypeConverter(const StringBox& className, const StringBox&
 
 void Runtime::setRuntimeTweaks(const Ref<ValdiRuntimeTweaks>& runtimeTweaks) {
     _resourceManager->setRuntimeTweaks(runtimeTweaks);
+    if (_javaScriptRuntime != nullptr) {
+        // Push the resolution-teardown-degrade kill switch down to the JS runtime so it can be read
+        // during teardown, when the listener (this Runtime) is no longer reachable.
+        _javaScriptRuntime->setResolutionTeardownDegradeEnabled(
+            runtimeTweaks != nullptr ? runtimeTweaks->enableResolutionTeardownDegrade() : true);
+        // Same for the termination mode. This reaches the host runtime; worker runtimes pull it
+        // themselves in JavaScriptRuntime::postInit (they inherit the host's listener, not this
+        // pushed tweak), so a host override reaches both.
+        _javaScriptRuntime->setCooperativeTermination(
+            runtimeTweaks != nullptr ? runtimeTweaks->useCooperativeTermination() : true);
+        // Push the teardown-join kill switch down too (read during ~JavaScriptRuntime, when this
+        // Runtime listener is no longer reachable). Workers pull it themselves in postInit.
+        _javaScriptRuntime->setJoinJsThreadOnTeardown(
+            runtimeTweaks != nullptr ? runtimeTweaks->joinJsThreadOnTeardown() : true);
+    }
+}
+
+void Runtime::setMmapCacheDirectory(const Path& path) {
+    _resourceManager->setMmapCacheDirectory(path);
 }
 
 void Runtime::setMetrics(const Ref<Metrics>& metrics) {
@@ -652,41 +782,43 @@ Ref<ValdiRuntimeTweaks> Runtime::getRuntimeTweaks() {
     return _resourceManager->getRuntimeTweaks();
 }
 
+bool Runtime::disableHitTestSyncDeadline() const {
+    const auto& tweaks = _resourceManager->getRuntimeTweaks();
+    return tweaks.get() != nullptr && tweaks->disableHitTestSyncDeadline();
+}
+
 void Runtime::registerJavaScriptModuleFactory(const Ref<JavaScriptModuleFactory>& moduleFactory) {
     _javaScriptRuntime->registerJavaScriptModuleFactory(moduleFactory);
 }
 
-void Runtime::updateColorPalette(const Value& colorPaletteMap) {
+const Ref<ColorPaletteManager>& Runtime::getColorPaletteManager() const {
+    return _colorPaletteManager;
+}
+
+void Runtime::configureColorPalette(const StringBox& name, const Value& colorPaletteMap) {
     if (colorPaletteMap.isMap()) {
         FlatMap<StringBox, Color> colors;
         for (const auto& it : *colorPaletteMap.getMap()) {
-            auto colorResult = ValueConverter::toColor(*_colorPalette, it.second);
-            if (!colorResult) {
-                VALDI_ERROR(*_logger, "Failed to parse color '{}': {}", it.first, colorResult.error());
+            auto colorValue = ValueConverter::toColorValue(it.second);
+            if (!colorValue) {
+                VALDI_ERROR(*_logger, "Failed to parse color '{}': {}", it.first, colorValue.error());
                 continue;
             }
-
-            colors[it.first] = colorResult.value();
+            colors[it.first] = Color(colorValue.value().toLong());
         }
 
-        _colorPalette->updateColors(colors);
+        _colorPaletteManager->configureColorPalette(name, colors);
     }
 }
 
-Value Runtime::getColorPalette() {
-    auto valueMap = Valdi::makeShared<Valdi::ValueMap>();
-    for (const auto& [name, color] : _colorPalette->getColors()) {
-        (*valueMap)[name] = Valdi::Value(color.value);
-    }
-
-    return Valdi::Value(std::move(valueMap));
+void Runtime::setActiveColorPalette(const StringBox& name) {
+    _colorPaletteManager->setActiveColorPalette(name);
 }
 
 void Runtime::onUncaughtJsError(const StringBox& moduleName, const Error& error) {
-    static const int kValdiUncaughtErrorCode = 1;
     if (_runtimeMessageHandler != nullptr) {
         auto flattenedError = error.flatten();
-        _runtimeMessageHandler->onUncaughtJsError(kValdiUncaughtErrorCode,
+        _runtimeMessageHandler->onUncaughtJsError(error.getErrorCode(),
                                                   moduleName,
                                                   flattenedError.getMessage().slowToString(),
                                                   flattenedError.getStack().slowToString());
@@ -708,7 +840,7 @@ void Runtime::onContextCreated(const SharedContext& context) {
 void Runtime::onContextDestroyed(Context& context) {
     if (_listener != nullptr) {
         _listener->onContextDestroyed(*this, context);
-        if (_contextManager.getContextsSize() == 0) {
+        if (_contextManager->getContextsSize() == 0) {
             _listener->onAllContextsDestroyed(*this);
         }
     }
@@ -735,11 +867,11 @@ MainThreadManager& Runtime::getMainThreadManager() {
 }
 
 const ContextManager& Runtime::getContextManager() const {
-    return _contextManager;
+    return *_contextManager;
 }
 
 ContextManager& Runtime::getContextManager() {
-    return _contextManager;
+    return *_contextManager;
 }
 
 const ViewNodeTreeManager& Runtime::getViewNodeTreeManager() const {
@@ -788,12 +920,17 @@ void Runtime::setRuntimeMessageHandler(const Shared<snap::valdi::RuntimeMessageH
 
 void Runtime::setShouldProcessUpdatesSynchronously(bool shouldProcessUpdatesSynchronously) {
     _shouldProcessUpdatesSynchronously = shouldProcessUpdatesSynchronously;
-    for (const auto& context : _contextManager.getAllContexts()) {
+    for (const auto& context : _contextManager->getAllContexts()) {
         context->setUpdateHandlerSynchronously(shouldProcessUpdatesSynchronously);
     }
 }
 
 void Runtime::emitInitMetrics() {
+    auto metrics = getMetrics();
+    if (metrics != nullptr && _initStopWatch != nullptr) {
+        metrics->emitRuntimePreInitLatency(_initStopWatch->elapsed());
+    }
+
     runWithExclusiveJsThreadLock([this]() {
         auto initStopWatch = std::move(_initStopWatch);
         auto metrics = getMetrics();

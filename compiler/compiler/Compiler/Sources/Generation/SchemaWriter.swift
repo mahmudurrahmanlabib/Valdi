@@ -8,7 +8,19 @@
 import Foundation
 
 protocol SchemaWriterListener: AnyObject {
-    func getClassName(nodeMapping: ValdiNodeClassMapping) throws -> String?
+    func getClassName(nodeMapping: ValdiNodeClassMapping, typeArguments: [ValdiModelPropertyType]?) throws -> String?
+
+    /// Called around the return type of a function whose sync-value return marshaller is resolved
+    /// lazily at runtime (matches the native `deferReturnMarshaller` rule). Lets a listener record which
+    /// type references are reachable only through a deferred return. Default no-ops: only the Kotlin
+    /// generator (Android batched descriptor walk) needs this.
+    func enterDeferrableReturnType()
+    func exitDeferrableReturnType()
+}
+
+extension SchemaWriterListener {
+    func enterDeferrableReturnType() {}
+    func exitDeferrableReturnType() {}
 }
 
 class SchemaWriter {
@@ -33,21 +45,42 @@ class SchemaWriter {
         str.append(",")
     }
 
-    func appendClass(_ clsName: String, properties: [ValdiModelProperty]) throws {
+    func appendClass(_ clsName: String, properties: [ValdiModelProperty], asyncStrictMode: Bool = false) throws {
         str.append("c '\(clsName)'")
-        try appendProperties(properties: properties, isMethod: false)
+        try appendProperties(properties: properties, isMethod: false, asyncStrictMode: asyncStrictMode)
     }
 
-    func appendInterface(_ clsName: String, properties: [ValdiModelProperty]) throws {
-        str.append("c+ '\(clsName)'{")
-        try appendProperties(properties: properties, isMethod: true)
-        str.append("}")
+    func appendInterface(_ clsName: String, properties: [ValdiModelProperty], asyncStrictMode: Bool = false) throws {
+        str.append("c+ '\(clsName)'")
+        try appendProperties(properties: properties, isMethod: true, asyncStrictMode: asyncStrictMode)
     }
 
-    func appendFunction(returnType: ValdiModelPropertyType, parameters: [ValdiModelProperty], isOptional: Bool, isMethod: Bool, isSingleCall: Bool, shouldCallOnWorkerThread: Bool) throws {
+    func appendStringEnum(_ enumName: String, enumCases: [EnumCase<String>]) throws {
+        try appendEnum(enumName, enumTypename: "s", enumCases: enumCases) { value in
+            return "'\(value)'"
+        }
+    }
+
+    func appendIntEnum(_ enumName: String, enumCases: [EnumCase<Int>]) throws {
+        try appendEnum(enumName, enumTypename: "i", enumCases: enumCases) { value in
+            return "\(value)"
+        }
+    }
+
+    private func appendEnum<T>(_ enumName: String, enumTypename: String, enumCases: [EnumCase<T>], caseToString: (T) -> String) throws {
+        str.append("e<\(enumTypename)> '\(enumName)'")
+        try appendList(list: enumCases, startDelimiter: "{", endDelimiter: "}", handle: { enumCase in
+            appendPropertyName(enumCase.name)
+            str.append(caseToString(enumCase.value))
+        })
+    }
+
+    func appendFunction(returnType: ValdiModelPropertyType, parameters: [ValdiModelProperty], isOptional: Bool, isMethod: Bool, isSingleCall: Bool, shouldCallOnWorkerThread: Bool, allowSyncCall: Bool, asyncStrictMode: Bool = false) throws {
         doAppendTypeName("f", boxed: false, isOptional: isOptional)
 
-        if isMethod || isSingleCall || shouldCallOnWorkerThread {
+        // `b` (bansync) = ban sync calls (opt-in). Omit = allow sync (majority of modules).
+        let banSyncCall = asyncStrictMode && !allowSyncCall
+        if isMethod || isSingleCall || shouldCallOnWorkerThread || banSyncCall {
             var modifiers = [String]()
             if isMethod {
                 modifiers.append("m")
@@ -58,6 +91,9 @@ class SchemaWriter {
             if shouldCallOnWorkerThread {
                 modifiers.append("w")
             }
+            if banSyncCall {
+                modifiers.append("b")
+            }
 
             try appendList(list: modifiers, startDelimiter: "|", endDelimiter: "|", handle: { modifier in
                 str.append(modifier)
@@ -66,17 +102,36 @@ class SchemaWriter {
 
         let shouldBoxParametersAndReturnValue = !isMethod && self.alwaysBoxFunctionParametersAndReturnValue
         try appendList(list: parameters, startDelimiter: "(", endDelimiter: ")") { parameter in
-            try appendType(parameter.type, asBoxed: shouldBoxParametersAndReturnValue, isMethod: false)
+            try appendType(parameter.type, asBoxed: shouldBoxParametersAndReturnValue, isMethod: false, asyncStrictMode: asyncStrictMode)
         }
 
         if !returnType.isVoid {
             str.append(": ")
-            try appendType(returnType, asBoxed: shouldBoxParametersAndReturnValue, isMethod: false)
+            // LAZY_RETURN_DEFERRAL_PREDICATE v1 — keep in sync with the native runtime.
+            // Mirror of ValueMarshallerRegistry::createFunctionValueMarshaller's deferReturnMarshaller: a
+            // sync-value return — not a promise, not dispatched to a worker thread (void is excluded by
+            // the enclosing `if`) — has its marshaller resolved lazily at runtime, so its type-reference
+            // closure is reachable only through the deferred return. The listener uses this to emit
+            // lazyReturnTypeReferences so the Android batched-descriptor walk skips exactly those types.
+            // If you change this rule, bump the version tag in BOTH places (see that C++ site) and rebuild
+            // the prebuilt compiler archive; drift only over/under-fetches (self-healing), never miscompiles.
+            var isPromiseReturn = false
+            if case .promise = returnType.unwrappingOptional {
+                isPromiseReturn = true
+            }
+            let deferrableReturn = !isPromiseReturn && !shouldCallOnWorkerThread
+            if deferrableReturn {
+                listener.enterDeferrableReturnType()
+            }
+            try appendType(returnType, asBoxed: shouldBoxParametersAndReturnValue, isMethod: false, asyncStrictMode: asyncStrictMode)
+            if deferrableReturn {
+                listener.exitDeferrableReturnType()
+            }
         }
     }
 
     func appendTypeRef(nodeMapping: ValdiNodeClassMapping, boxed: Bool, isOptional: Bool, hasConverter: Bool) throws {
-        guard let className = try listener.getClassName(nodeMapping: nodeMapping) else {
+        guard let className = try listener.getClassName(nodeMapping: nodeMapping, typeArguments: nil) else {
             doAppendTypeName("u", boxed: false, isOptional: isOptional)
             return
         }
@@ -96,8 +151,9 @@ class SchemaWriter {
     func appendGenTypeRef(nodeMapping: ValdiNodeClassMapping,
                           isOptional: Bool,
                           hasConverter: Bool,
-                          typeArguments: [ValdiModelPropertyType]) throws {
-        guard let className = try listener.getClassName(nodeMapping: nodeMapping) else {
+                          typeArguments: [ValdiModelPropertyType],
+                          asyncStrictMode: Bool = false) throws {
+        guard let className = try listener.getClassName(nodeMapping: nodeMapping, typeArguments: typeArguments) else {
             doAppendTypeName("u", boxed: false, isOptional: isOptional)
             return
         }
@@ -110,14 +166,14 @@ class SchemaWriter {
         str.append(className)
         str.append("'")
         try appendList(list: typeArguments, startDelimiter: "<", endDelimiter: ">") { item in
-            try appendType(item, asBoxed: true, isMethod: false)
+            try appendType(item, asBoxed: true, isMethod: false, asyncStrictMode: asyncStrictMode)
         }
     }
 
-    func appendPromise(isOptional: Bool, typeArgument: ValdiModelPropertyType) throws {
+    func appendPromise(isOptional: Bool, typeArgument: ValdiModelPropertyType, asyncStrictMode: Bool = false) throws {
         doAppendTypeName("p", boxed: false, isOptional: isOptional)
         str.append("<")
-        try appendType(typeArgument, asBoxed: true, isMethod: false)
+        try appendType(typeArgument, asBoxed: true, isMethod: false, asyncStrictMode: asyncStrictMode)
         str.append(">")
     }
 
@@ -131,7 +187,7 @@ class SchemaWriter {
         }
     }
 
-    func appendType(_ type: ValdiModelPropertyType, asBoxed: Bool, isMethod: Bool) throws {
+    func appendType(_ type: ValdiModelPropertyType, asBoxed: Bool, isMethod: Bool, asyncStrictMode: Bool = false) throws {
         let innerType = type.unwrappingOptional
         let isOptional = type.isOptional
 
@@ -147,23 +203,23 @@ class SchemaWriter {
         case .array(elementType: let elementType):
             doAppendTypeName("a", boxed: false, isOptional: isOptional)
             str.append("<")
-            try appendType(elementType, asBoxed: true, isMethod: false)
+            try appendType(elementType, asBoxed: true, isMethod: false, asyncStrictMode: asyncStrictMode)
             str.append(">")
         case .bytes:
             doAppendTypeName("t", boxed: false, isOptional: isOptional)
         case .map(keyType: let keyType, valueType: let valueType):
             doAppendTypeName("m", boxed: false, isOptional: isOptional)
             str.append("<")
-            try appendType(keyType, asBoxed: true, isMethod: false)
+            try appendType(keyType, asBoxed: true, isMethod: false, asyncStrictMode: asyncStrictMode)
             str.append(",")
-            try appendType(valueType, asBoxed: true, isMethod: false)
+            try appendType(valueType, asBoxed: true, isMethod: false, asyncStrictMode: asyncStrictMode)
             str.append(">")
         case .any:
             doAppendTypeName("u", boxed: false, isOptional: isOptional)
         case .void:
             doAppendTypeName("v", boxed: false, isOptional: isOptional)
-        case .function(parameters: let parameters, returnType: let returnType, isSingleCall: let isSingleCall, shouldCallOnWorkerThread: let shouldCallOnWorkerThread):
-            try appendFunction(returnType: returnType, parameters: parameters, isOptional: isOptional, isMethod: isMethod, isSingleCall: isSingleCall, shouldCallOnWorkerThread: shouldCallOnWorkerThread)
+        case .function(parameters: let parameters, returnType: let returnType, isSingleCall: let isSingleCall, shouldCallOnWorkerThread: let shouldCallOnWorkerThread, allowSyncCall: let allowSyncCall):
+            try appendFunction(returnType: returnType, parameters: parameters, isOptional: isOptional, isMethod: isMethod, isSingleCall: isSingleCall, shouldCallOnWorkerThread: shouldCallOnWorkerThread, allowSyncCall: allowSyncCall, asyncStrictMode: asyncStrictMode)
         case .object(let nodeMapping):
             try appendTypeRef(nodeMapping: nodeMapping, boxed: false, isOptional: isOptional, hasConverter: nodeMapping.converter != nil)
         case .genericTypeParameter(name: let name):
@@ -176,9 +232,9 @@ class SchemaWriter {
             doAppendTypeName("r", boxed: false, isOptional: isOptional)
             str.append(":\(index)")
         case .genericObject(let nodeMapping, let typeArguments):
-            try appendGenTypeRef(nodeMapping: nodeMapping, isOptional: isOptional, hasConverter: nodeMapping.converter != nil, typeArguments: typeArguments)
+            try appendGenTypeRef(nodeMapping: nodeMapping, isOptional: isOptional, hasConverter: nodeMapping.converter != nil, typeArguments: typeArguments, asyncStrictMode: asyncStrictMode)
         case .promise(typeArgument: let typeArgument):
-            try appendPromise(isOptional: isOptional, typeArgument: typeArgument)
+            try appendPromise(isOptional: isOptional, typeArgument: typeArgument, asyncStrictMode: asyncStrictMode)
         case .enum(let e):
             let shouldBoxEnum = e.kind == .enum && self.boxIntEnums && (asBoxed || isOptional)
             try appendTypeRef(nodeMapping: e, boxed: shouldBoxEnum, isOptional: isOptional, hasConverter: false)
@@ -187,9 +243,9 @@ class SchemaWriter {
         }
     }
 
-    func appendProperties(properties: [ValdiModelProperty], isMethod: Bool) throws {
+    func appendProperties(properties: [ValdiModelProperty], isMethod: Bool, asyncStrictMode: Bool = false) throws {
         try appendList(list: properties, startDelimiter: "{", endDelimiter: "}") { property in
-            try appendProperty(property: property, isMethod: isMethod)
+            try appendProperty(property: property, isMethod: isMethod, asyncStrictMode: asyncStrictMode)
         }
     }
 
@@ -197,9 +253,9 @@ class SchemaWriter {
         str.append("'\(propertyName)':")
     }
 
-    func appendProperty(property: ValdiModelProperty, isMethod: Bool) throws {
+    func appendProperty(property: ValdiModelProperty, isMethod: Bool, asyncStrictMode: Bool = false) throws {
         appendPropertyName(property.name)
-        try appendType(property.type, asBoxed: false, isMethod: isMethod)
+        try appendType(property.type, asBoxed: false, isMethod: isMethod, asyncStrictMode: asyncStrictMode)
     }
 
     func appendEnumValue(_ value: String) {

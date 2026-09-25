@@ -1,0 +1,6 @@
+{
+    "homepage": "https://github.com/bazel-contrib/toolchains_llvm",
+    "maintainers": [],
+    "versions": ["1.7.0"],
+    "yanked_versions": {}
+}

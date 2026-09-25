@@ -8,7 +8,9 @@
 
 #pragma once
 
+#include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "valdi/runtime/Resources/Bundle.hpp"
@@ -105,6 +107,10 @@ public:
 
     void preloadForComponentPath(const ComponentPath& componentPath);
 
+    void warmUpBundles(const std::vector<StringBox>& modulePaths);
+
+    int32_t getApiVersion();
+
     bool enableAccessibility() const;
     bool enableDeferredGC() const;
     bool isLazyModulePreloadingEnabled() const;
@@ -115,6 +121,8 @@ public:
 
     void setInlineAssetsEnabled(bool inlineAssetsEnabled);
 
+    void setMmapCacheDirectory(const Path& path);
+
 private:
     Shared<IResourceLoader> _resourceLoader;
     Ref<IDiskCache> _diskCache;
@@ -124,20 +132,36 @@ private:
     double _deviceDensity;
     Ref<ValdiRuntimeTweaks> _runtimeTweaks;
     Ref<Metrics> _metrics;
-    bool _didSetupImageAssetOverrideDirectory = false;
+    std::once_flag _imageAssetOverrideDirectoryOnce;
     bool _enableTSN = true;
     bool _inlineAssetsEnabled = true;
     bool _hotReloaderEnabled;
+    std::optional<int32_t> _apiVersion;
     std::atomic_bool _lazyModulePreloadingEnabled = true;
+    Path _mmapCacheDirectory;
 
     ILogger& _logger;
     FlatMap<StringBox, Ref<Bundle>> _bundleByName;
-    FlatSet<StringBox> _seenComponentPaths;
     std::vector<IResourceManagerListener*> _listeners;
     std::shared_ptr<snap::valdi_core::HTTPRequestManager> _requestManager;
+    // Guards the bundle table and settings. Lock order is _mutex -> Bundle mutex (getBundle takes the
+    // new Bundle's mutex via BundleInitializer while holding _mutex); never take _mutex while holding
+    // a Bundle mutex. Do not hold _mutex across anything that can block for long: the resource
+    // loader, runtime tweak reads, disk I/O, or waiting on a Bundle mutex another thread holds across
+    // its init. The main thread contends on this mutex from Runtime::createContext.
     mutable Mutex _mutex;
+    // Separate from _mutex so the main-thread dedupe in preloadForComponentPath never queues
+    // behind a bundle load.
+    mutable Mutex _seenComponentPathsMutex;
+    FlatSet<StringBox> _seenComponentPaths;
 
-    [[nodiscard]] Result<Ref<ValdiModuleArchive>> getArchiveForModule(const StringBox& modulePath);
+    // Resolved mmap/metrics settings are passed in by the caller (getBundle) rather than read
+    // here: this runs while the caller holds the Bundle's mutex, and acquiring _mutex under that
+    // lock would invert the cleanup path's _mutex -> Bundle order and can deadlock.
+    [[nodiscard]] Result<Ref<ValdiModuleArchive>> getArchiveForModule(const StringBox& modulePath,
+                                                                      bool useMmap,
+                                                                      const Path& mmapCacheDir,
+                                                                      const Ref<Metrics>& metrics);
     void initializeBundle(BundleInitializer& bundleInitializer, Ref<ValdiModuleArchive> moduleArchive);
 
     BundleInitializer registerBundle(const StringBox& bundleName);

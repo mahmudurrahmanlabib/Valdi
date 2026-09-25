@@ -6,17 +6,23 @@
 //
 
 #import "valdi/ios/NativeModules/Drawing/SCValdiDrawingModuleFactory.h"
-#import "valdi/ios/NativeModules/Drawing/SCValdiDrawingModule.h"
-
 #import "valdi/ios/Text/NSAttributedString+Valdi.h"
 #import "valdi/ios/Text/SCValdiFont.h"
 #import "valdi/ios/Text/SCValdiFontManager.h"
 #import "valdi/ios/SCValdiContext.h"
 #import "valdi/ios/Views/SCValdiLabel.h"
+#import "valdi/ios/Text/SCValdiAttributedText.h"
 
-#import "valdi_core/SCValdiError.h"
+#import "valdi_core/SCValdiLogger.h"
 
 #import <UIKit/UIKit.h>
+
+@interface SCValdiContext (DrawingMeasurement)
+
++ (UITraitCollection *_Nullable)currentTraitCollectionForMeasurementContextDestroyed:
+    (BOOL *_Nullable)contextDestroyed;
+
+@end
 
 @interface SCValdiDrawingFontImpl: NSObject<SCValdiDrawingFont>
 
@@ -55,10 +61,22 @@
 
 - (SCValdiDrawingSize * _Nonnull)measureTextWithText:(NSString * _Nonnull)text maxWidth:(NSNumber * _Nullable)maxWidth maxHeight:(NSNumber * _Nullable)maxHeight maxLines:(NSNumber * _Nullable)maxLines
 {
+    return [self _measureText:text maxWidth:maxWidth maxHeight:maxHeight maxLines:maxLines];
+}
+
+- (SCValdiDrawingSize * _Nonnull)measureAttributedTextWithAttributedText:(SCValdiWrappedValue * _Nonnull)attributedText maxWidth:(NSNumber * _Nullable)maxWidth maxHeight:(NSNumber * _Nullable)maxHeight maxLines:(NSNumber * _Nullable)maxLines
+{
+    SCValdiAttributedText *valdiAttributedText = [[SCValdiAttributedText alloc] initWithWrappedValue:attributedText];
+    return [self _measureText:valdiAttributedText maxWidth:maxWidth maxHeight:maxHeight maxLines:maxLines];
+}
+
+- (SCValdiDrawingSize * _Nonnull)_measureText:(id)text maxWidth:(NSNumber * _Nullable)maxWidth maxHeight:(NSNumber * _Nullable)maxHeight maxLines:(NSNumber * _Nullable)maxLines
+{
     SCValdiFontAttributes *fontAttributes = [NSAttributedString fontAttributesWithFont:_font
                                                                                     color:nil
                                                                                 textAlign:nil
                                                                                lineHeight:_lineHeight
+                                                                     lineHeightAbsolute:nil
                                                                            textDecoration:nil
                                                                             letterSpacing:nil
                                                                             numberOfLines:maxLines
@@ -68,9 +86,18 @@
     CGFloat maxHeightF = maxHeight != nil ? maxHeight.doubleValue : CGFLOAT_MAX;
     CGSize maxSize = CGSizeMake(maxWidthF, maxHeightF);
 
-    UITraitCollection *traitCollection = SCValdiContext.currentContext.traitCollection;
+    BOOL destroyedContext = NO;
+    UITraitCollection *traitCollection =
+        [SCValdiContext currentTraitCollectionForMeasurementContextDestroyed:&destroyedContext];
+    if (destroyedContext) {
+        return [[SCValdiDrawingSize alloc] initWithWidth:0 height:0];
+    }
 
-    CGSize measuredSize = [SCValdiLabel measureSizeWithMaxSize:maxSize fontAttributes:fontAttributes fontManager:_font.fontManager text:text traitCollection:traitCollection];
+    CGSize measuredSize = [SCValdiLabel measureSizeWithMaxSize:maxSize
+                                                fontAttributes:fontAttributes
+                                                   fontManager:_font.fontManager
+                                                          text:text
+                                               traitCollection:traitCollection];
 
     return [[SCValdiDrawingSize alloc] initWithWidth:ceil(measuredSize.width) height:ceil(measuredSize.height)];
 }
@@ -113,7 +140,7 @@
     return SCValdiDrawingModuleMarshall(marshaller, self);
 }
 
-- (id<SCValdiDrawingFont> _Nullable)getFontWithSpecs:(SCValdiDrawingFontSpecs * _Nonnull)specs
+- (id<SCValdiDrawingFont> _Nonnull)getFontWithSpecs:(SCValdiDrawingFontSpecs * _Nonnull)specs
 {
     SCValdiFont *font = [SCValdiFont fontFromValdiAttribute:specs.font fontManager:_fontManager];
 
@@ -132,19 +159,19 @@
     NSError *error = nil;
     NSData *fontData = [NSData dataWithContentsOfFile:filename options:0 error:&error];
 
-    if (fontData) {
-        if (![_fontManager registerFontWithFontName:fontName data:fontData error:&error]) {
-            SCValdiErrorThrow([error localizedDescription]);
-        }
-    } else {
-        SCValdiErrorThrow([error localizedDescription]);
+    // A downloaded font file can be evicted from the content cache before it gets registered, and
+    // this is a void bridge method, so throwing aborts the app instead of surfacing to JS. Report
+    // the failure and let callers fall back to a default font, as the Android module does.
+    if (!fontData) {
+        SCLogValdiWarning(@"Could not read font file for '%@', skipping registration: %@",
+                          fontName,
+                          [error localizedDescription]);
+        return;
+    }
+
+    if (![_fontManager registerFontWithFontName:fontName data:fontData error:&error]) {
+        SCLogValdiError(@"Failed to register font '%@': %@", fontName, [error localizedDescription]);
     }
 }
 
 @end
-
-/**
- * Marshall the instance into the given SCValdiMarshaller.
- */
-FOUNDATION_EXPORT NSInteger SCValdiDrawingModuleMarshall(SCValdiMarshallerRef _Nonnull marshaller,
-        id<SCValdiDrawingModule> _Nonnull instance);

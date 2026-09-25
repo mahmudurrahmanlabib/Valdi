@@ -11,9 +11,13 @@
 #include "valdi/runtime/Context/AttributionResolver.hpp"
 #include "valdi/runtime/Context/ViewManagerContext.hpp"
 #include "valdi/runtime/Resources/BytesAssetLoader.hpp"
+#include "valdi/runtime/ValdiBuildFlags.hpp"
 #include "valdi/runtime/ValdiRuntimeTweaks.hpp"
+#include <yoga/Yoga.h>
 
 #include "valdi/runtime/Resources/AssetLoaderManager.hpp"
+#include "valdi/runtime/Resources/AssetsManager.hpp"
+#include "valdi/runtime/Resources/ResourceManager.hpp"
 
 #include "valdi/runtime/JavaScript/JavaScriptANRDetector.hpp"
 
@@ -32,12 +36,14 @@
 #include "valdi_core/cpp/Utils/LoggerUtils.hpp"
 
 #include <algorithm>
+#include <memory>
 
 namespace Valdi {
 
 Shared<DebuggerService> createDebuggerService(bool enableDebuggerService,
                                               bool disableHotReloader,
                                               bool isStandalone,
+                                              std::optional<uint32_t> debuggerPort,
                                               PlatformType platformType,
                                               const Shared<snap::valdi::RuntimeMessageHandler>& runtimeMessageHandler,
                                               const Ref<ILogger>& logger) {
@@ -54,11 +60,30 @@ Shared<DebuggerService> createDebuggerService(bool enableDebuggerService,
             case PlatformTypeAndroid:
                 platform = snap::valdi_core::Platform::Android;
                 break;
+            case PlatformTypeMacOS:
+            case PlatformTypeWeb:
+            case PlatformTypeLinux:
+                platform = snap::valdi_core::Platform::Ios;
+                break;
         }
-        auto debuggerPort = DebuggerService::resolveDebuggerPort(isStandalone);
+        auto debuggerPortResolution = DebuggerService::resolveDebuggerPortWithDiagnostics(isStandalone, debuggerPort);
+        if (debuggerPortResolution.rejectedRequestedPort.has_value()) {
+            VALDI_WARN(*logger,
+                       "Ignoring invalid debugger port from requestedPort: <redacted> (expected 1...65535); "
+                       "trying VALDI_DEBUGGER_SERVICE_PORT, then the platform default.");
+        }
+        if (debuggerPortResolution.environmentError.has_value()) {
+            VALDI_WARN(*logger,
+                       "Ignoring invalid debugger port from VALDI_DEBUGGER_SERVICE_PORT: <redacted {} value> (expected "
+                       "1...65535); using platform default {}.",
+                       debuggerPortResolution.environmentError.value() == DebuggerPortEnvironmentError::OutOfRange ?
+                           "out-of-range" :
+                           "malformed",
+                       debuggerPortResolution.port);
+        }
 
         auto debuggerService = Valdi::makeShared<DebuggerService>(
-            runtimeMessageHandler, platform, debuggerPort, disableHotReloader, logger);
+            runtimeMessageHandler, platform, debuggerPortResolution.port, disableHotReloader, logger);
         debuggerService->postInit();
         return debuggerService.toShared();
     } else {
@@ -80,20 +105,11 @@ public:
             _runtimeMessageHandler->onJsCrash(anr.getModuleName(), anr.getMessage(), stackTrace, true);
         }
 
-        if (_shouldCrashOnANR && !anr.hasRunningStacktrace()) {
-            return JavaScriptANRBehavior::CRASH;
-        } else {
-            return JavaScriptANRBehavior::KEEP_GOING;
-        }
-    }
-
-    void setShouldCrashOnANR(bool shouldCrashOnANR) {
-        _shouldCrashOnANR = shouldCrashOnANR;
+        return JavaScriptANRBehavior::KEEP_GOING;
     }
 
 private:
     Shared<snap::valdi::RuntimeMessageHandler> _runtimeMessageHandler;
-    std::atomic_bool _shouldCrashOnANR = false;
 };
 
 RuntimeManager::RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispatcher,
@@ -107,10 +123,40 @@ RuntimeManager::RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispa
                                bool enableDebuggerService,
                                bool disableHotReloader,
                                bool isStandalone)
+    : RuntimeManager(mainThreadDispatcher,
+                     jsBridge,
+                     diskCache,
+                     std::move(keychain),
+                     runtimeMessageHandler,
+                     platformType,
+                     jsThreadQoS,
+                     logger,
+                     enableDebuggerService,
+                     disableHotReloader,
+                     isStandalone,
+                     std::nullopt) {}
+
+RuntimeManager::RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispatcher,
+                               IJavaScriptBridge* jsBridge,
+                               const Ref<IDiskCache>& diskCache,
+                               Shared<snap::valdi::Keychain> keychain,
+                               const Shared<snap::valdi::RuntimeMessageHandler>& runtimeMessageHandler,
+                               PlatformType platformType,
+                               ThreadQoSClass jsThreadQoS,
+                               const Ref<ILogger>& logger,
+                               bool enableDebuggerService,
+                               bool disableHotReloader,
+                               bool isStandalone,
+                               std::optional<uint32_t> debuggerPort)
     : _initStopWatch(std::make_shared<MetricsStopWatch>()),
       _yogaConfig(Valdi::Yoga::createConfig(0)),
-      _debuggerService(createDebuggerService(
-          enableDebuggerService, disableHotReloader, isStandalone, platformType, runtimeMessageHandler, logger)),
+      _debuggerService(createDebuggerService(enableDebuggerService,
+                                             disableHotReloader,
+                                             isStandalone,
+                                             debuggerPort,
+                                             platformType,
+                                             runtimeMessageHandler,
+                                             logger)),
       _deferredGCTask(DispatchQueue::TaskIDNull),
       _mainThreadManager(makeShared<MainThreadManager>(mainThreadDispatcher)),
       _assetLoaderManager(makeShared<AssetLoaderManager>()),
@@ -120,7 +166,7 @@ RuntimeManager::RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispa
       _diskCache(diskCache),
       _keychain(std::move(keychain)),
       _runtimeMessageHandler(runtimeMessageHandler),
-      _colorPalette(makeShared<ColorPalette>()),
+      _colorPaletteManager(makeShared<ColorPaletteManager>()),
       _platformType(platformType),
       _jsThreadQoS(jsThreadQoS),
       _debuggerServiceEnabled(_debuggerService != nullptr) {
@@ -131,7 +177,7 @@ RuntimeManager::RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispa
         _anrDetector->setListener(makeShared<ANRDetectorListener>(runtimeMessageHandler));
     }
 
-    _colorPalette->setListener(this);
+    _colorPaletteManager->setListener(this);
 }
 
 RuntimeManager::~RuntimeManager() {
@@ -143,6 +189,8 @@ void RuntimeManager::postInit() {
 }
 
 void RuntimeManager::fullTeardown() {
+    _colorPaletteManager->setListener(nullptr);
+
     if (_anrDetector != nullptr) {
         _anrDetector->stop();
         _anrDetector = nullptr;
@@ -178,7 +226,7 @@ SharedRuntime RuntimeManager::createRuntime(const Shared<IResourceLoader>& resou
                                               resourceLoader,
                                               _assetLoaderManager,
                                               _requestManager,
-                                              _colorPalette,
+                                              _colorPaletteManager,
                                               _diskCache,
                                               _yogaConfig,
                                               _runtimeMessageHandler,
@@ -190,7 +238,6 @@ SharedRuntime RuntimeManager::createRuntime(const Shared<IResourceLoader>& resou
     std::vector<std::shared_ptr<::snap::valdi_core::ModuleFactory>> moduleFactories;
     std::vector<RegisteredTypeConverter> typeConverters;
     std::vector<Ref<IRuntimeManagerListener>> listeners;
-    Ref<ValdiRuntimeTweaks> runtimeTweaks;
     Ref<AttributionResolver> attributionResolver;
     Ref<Metrics> metrics;
 
@@ -204,13 +251,22 @@ SharedRuntime RuntimeManager::createRuntime(const Shared<IResourceLoader>& resou
         moduleFactories = _registeredModuleFactories;
         typeConverters = _registeredTypeConverters;
         listeners = _listeners;
-        runtimeTweaks = _runtimeTweaks;
         attributionResolver = _attributionResolver;
         metrics = _metrics;
         autoRenderDisabled = _loadOperationsCount > 0;
+        // Apply state that has a peer RuntimeManager::set*() iterating runtimes
+        // while still holding _mutex. If we read into a local and applied after
+        // releasing the lock, a concurrent setter could interleave: it would
+        // see the just-added runtime in its snapshot and apply the new value
+        // to it, and we would then overwrite with our stale local copy.
+        //
+        // Runtime::set*() below only takes the ResourceManager's mutex (a
+        // different one), so there is no lock-inversion risk. This mirrors how
+        // the peer setters (e.g. setMmapCacheDirectory, setTweakValueProvider)
+        // already operate on runtimes they iterate.
+        runtime->setMmapCacheDirectory(_mmapCacheDirectory);
+        runtime->setRuntimeTweaks(_runtimeTweaks);
     }
-
-    runtime->setRuntimeTweaks(runtimeTweaks);
     runtime->setAutoRenderDisabled(autoRenderDisabled);
     runtime->setMetrics(metrics);
     runtime->getContextManager().setAttributionResolver(attributionResolver);
@@ -245,13 +301,18 @@ Ref<ViewManagerContext> RuntimeManager::createViewManagerContext(
     auto viewManagerContext = makeShared<ViewManagerContext>(
         viewManager,
         _attributeIds,
-        _colorPalette,
+        _colorPaletteManager,
         _yogaConfig,
         enablePreloading,
         mainThreadManagerOverride != nullptr ? mainThreadManagerOverride : _mainThreadManager,
         *_logger);
 
     _viewManagerContexts.emplace_back(viewManagerContext);
+
+    // Seed the kill switch from the current tweaks so contexts created after the provider is set pick
+    // it up; the setTweakValueProvider loop handles contexts created before it arrives.
+    viewManagerContext->setApplyManagedChildFramePadding(
+        _runtimeTweaks != nullptr ? _runtimeTweaks->applyManagedChildFramePadding() : true);
 
     return viewManagerContext;
 }
@@ -316,6 +377,16 @@ void RuntimeManager::applicationDidResume() {
     _anrDetector->onEnterForeground();
     startDebuggerServices();
     cancelDeferredGCTask();
+
+    // Assets that failed a remote load while backgrounded (e.g. a transient CDN/DNS outage) stay
+    // failed until a new consumer subscribes. Re-resolve them now that we are foreground and the
+    // network has likely recovered, so button icons and other static assets repaint without a relaunch.
+    for (const auto& runtime : getAllRuntimes()) {
+        const auto& assetsManager = runtime->getResourceManager().getAssetsManager();
+        if (assetsManager != nullptr) {
+            assetsManager->retryFailedAssets();
+        }
+    }
 }
 
 void RuntimeManager::applicationWillPause() {
@@ -422,11 +493,32 @@ bool RuntimeManager::debuggerServiceEnabled() const {
     return _debuggerService != nullptr;
 }
 
+std::optional<uint32_t> RuntimeManager::getDebuggerServicePort() const {
+    if (_debuggerService == nullptr) {
+        return std::nullopt;
+    }
+    return _debuggerService->getConfiguredPort();
+}
+
 void RuntimeManager::setUserSession(const StringBox& userId) {
     if (userId.isEmpty()) {
         _userSession.set(nullptr);
     } else {
+        // Keep the existing UserSession instance for a same-user re-attach: downstream
+        // consumers (e.g. PersistentStore) dedupe session changes by pointer, so a fresh
+        // allocation for the same userId would read as a user switch and wipe their caches.
+        auto currentSession = _userSession.get();
+        if (currentSession != nullptr && currentSession->getUserId() == userId) {
+            return;
+        }
+        {
+            std::lock_guard<Mutex> guard(_mutex);
+            if (!_userSessionAttachLatency.has_value() && _initStopWatch != nullptr) {
+                _userSessionAttachLatency = _initStopWatch->elapsed();
+            }
+        }
         _userSession.set(Valdi::makeShared<UserSession>(userId));
+        emitUserSessionAttachMetricsIfNeeded();
     }
 }
 
@@ -444,38 +536,57 @@ void RuntimeManager::setApplicationId(const StringBox& applicationId) {
     }
 }
 
-void RuntimeManager::onColorPaletteUpdated(const ColorPalette& /*colorPalette*/) {
-    FlatSet<AttributeId> attributesToReapply;
-
-    // Clear the cache for all color attributes
-    for (const auto& viewManagerContext : _viewManagerContexts) {
-        for (const auto& it : viewManagerContext->getAttributesManager().getAllBoundAttributes()) {
-            for (const auto& handlerIt : it.second->getHandlers()) {
-                auto* handler = it.second->getAttributeHandlerForId(handlerIt.first);
-
-                if (handler->shouldReevaluateOnColorPaletteChange()) {
-                    handler->clearPreprocessorCache();
-                    attributesToReapply.insert(handlerIt.first);
-                }
-            }
-        }
-    }
-
-    // Reapply all the color attributes
-    auto allAttributes = makeShared<std::vector<AttributeId>>();
-    allAttributes->insert(allAttributes->end(), attributesToReapply.begin(), attributesToReapply.end());
+void RuntimeManager::onColorPaletteManagerUpdated(const ColorPaletteManager& colorPaletteManager,
+                                                  const ColorPalette& colorPalette,
+                                                  bool activeColorPaletteChanged) {
+#if VALDI_DEBUG_TREE_UPDATES
+    std::string applyTrigger = "apply_color_attributes";
 
     for (const auto& runtime : getAllRuntimes()) {
         for (const auto& tree : runtime->getViewNodeTreeManager().getAllRootViewNodeTrees()) {
-            tree->scheduleExclusiveUpdate([treePtr = tree.get(), allAttributes]() {
-                auto rootViewNode = treePtr->getRootViewNode();
-                if (rootViewNode != nullptr) {
-                    rootViewNode->reapplyAttributesRecursive(
-                        treePtr->getCurrentViewTransactionScope(), *allAttributes, false);
-                }
-            });
+            tree->scheduleExclusiveUpdate(
+                [treePtr = tree.get(),
+                 colorPaletteRef = activeColorPaletteChanged ? colorPaletteManager.getActiveColorPalette() : nullptr,
+                 colorPalettePtr = &colorPalette,
+                 activeColorPaletteChanged]() {
+                    auto rootViewNode = treePtr->getRootViewNode();
+                    if (rootViewNode != nullptr) {
+                        if (activeColorPaletteChanged) {
+                            rootViewNode->setInheritedColorPalette(treePtr->getCurrentViewTransactionScope(),
+                                                                   colorPaletteRef);
+                        } else {
+                            rootViewNode->onColorPaletteMutated(treePtr->getCurrentViewTransactionScope(),
+                                                                *colorPalettePtr);
+                        }
+                    }
+                },
+                Valdi::DispatchFunction(),
+                applyTrigger);
         }
     }
+#else
+    for (const auto& runtime : getAllRuntimes()) {
+        for (const auto& tree : runtime->getViewNodeTreeManager().getAllRootViewNodeTrees()) {
+            tree->scheduleExclusiveUpdate(
+                [treePtr = tree.get(),
+                 colorPaletteRef = activeColorPaletteChanged ? colorPaletteManager.getActiveColorPalette() : nullptr,
+                 colorPalettePtr = &colorPalette,
+                 activeColorPaletteChanged]() {
+                    auto rootViewNode = treePtr->getRootViewNode();
+                    if (rootViewNode != nullptr) {
+                        if (activeColorPaletteChanged) {
+                            rootViewNode->setInheritedColorPalette(treePtr->getCurrentViewTransactionScope(),
+                                                                   colorPaletteRef);
+                        } else {
+                            rootViewNode->onColorPaletteMutated(treePtr->getCurrentViewTransactionScope(),
+                                                                *colorPalettePtr);
+                        }
+                    }
+                },
+                Valdi::DispatchFunction());
+        }
+    }
+#endif
 }
 
 Valdi::ILogger& RuntimeManager::getLogger() const {
@@ -495,9 +606,14 @@ const Holder<Ref<UserSession>>& RuntimeManager::getUserSession() const {
 }
 
 void RuntimeManager::setMetrics(const Ref<Metrics>& metrics) {
-    std::lock_guard<Mutex> guard(_mutex);
-    _metrics = metrics;
-    _anrDetector->setMetrics(metrics);
+    {
+        std::lock_guard<Mutex> guard(_mutex);
+        _metrics = metrics;
+        _anrDetector->setMetrics(metrics);
+    }
+    // The user session can be attached before the metrics sink is installed
+    // (module factories are only injected when the first Runtime is created).
+    emitUserSessionAttachMetricsIfNeeded();
 }
 
 void RuntimeManager::setTweakValueProvider(const Shared<ITweakValueProvider>& tweakValueProvider) {
@@ -514,18 +630,21 @@ void RuntimeManager::setTweakValueProvider(const Shared<ITweakValueProvider>& tw
         runtimes = getAllRuntimes(guard);
     }
 
-    auto anrDetectorListener = castOrNull<ANRDetectorListener>(_anrDetector->getListener());
-
-    if (anrDetectorListener != nullptr) {
-        anrDetectorListener->setShouldCrashOnANR(runtimeTweaks != nullptr ? runtimeTweaks->shouldCrashOnANR() : false);
-    }
     _anrDetector->setNudgeEnabled(runtimeTweaks != nullptr ? runtimeTweaks->shouldNudgeJSThread() : false);
+
+    YGConfigSetExperimentalFeatureEnabled(_yogaConfig.get(),
+                                          YGExperimentalFeatureFixFlexBasisFitContent,
+                                          runtimeTweaks != nullptr ? runtimeTweaks->enableFixFlexBasisFitContent() :
+                                                                     false);
 
     auto disableAnimationRemoveOnCompleteIos =
         runtimeTweaks != nullptr ? runtimeTweaks->disableAnimationRemoveOnCompleteIos() : false;
+    auto applyManagedChildFramePadding =
+        runtimeTweaks != nullptr ? runtimeTweaks->applyManagedChildFramePadding() : true;
     for (const auto& viewManagerContext : _viewManagerContexts) {
         viewManagerContext->getViewManager().setDisableAnimationRemoveOnCompleteIos(
             disableAnimationRemoveOnCompleteIos);
+        viewManagerContext->setApplyManagedChildFramePadding(applyManagedChildFramePadding);
     }
 
     for (const auto& runtime : runtimes) {
@@ -673,6 +792,40 @@ JavaScriptContextMemoryStatistics RuntimeManager::dumpMemoryStatistics() {
     return stats;
 }
 
+void RuntimeManager::dumpMemoryStatisticsAsync(Function<void(JavaScriptContextMemoryStatistics)> completion) {
+    const auto runtimes = this->getAllRuntimes();
+    if (runtimes.empty()) {
+        completion(JavaScriptContextMemoryStatistics{});
+        return;
+    }
+
+    // Each runtime reports its stats asynchronously on its own JS thread; accumulate lock-free
+    // and invoke the caller's completion once the final runtime has reported. Using an
+    // acquire-release drop on `remaining` publishes every relaxed accumulation to the last thread.
+    struct AggregationState {
+        std::atomic<size_t> memoryUsageBytes{0};
+        std::atomic<size_t> objectsCount{0};
+        std::atomic<size_t> remaining;
+        Function<void(JavaScriptContextMemoryStatistics)> completion;
+    };
+    auto state = std::make_shared<AggregationState>();
+    state->remaining.store(runtimes.size(), std::memory_order_relaxed);
+    state->completion = std::move(completion);
+
+    for (const auto& runtime : runtimes) {
+        runtime->getJavaScriptRuntime()->dumpMemoryStatisticsAsync([state](JavaScriptContextMemoryStatistics stat) {
+            state->memoryUsageBytes.fetch_add(stat.memoryUsageBytes, std::memory_order_relaxed);
+            state->objectsCount.fetch_add(stat.objectsCount, std::memory_order_relaxed);
+            if (state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                JavaScriptContextMemoryStatistics stats;
+                stats.memoryUsageBytes = state->memoryUsageBytes.load(std::memory_order_relaxed);
+                stats.objectsCount = state->objectsCount.load(std::memory_order_relaxed);
+                state->completion(stats);
+            }
+        });
+    }
+}
+
 void RuntimeManager::emitMetrics(void (Metrics::*emitterFunc)(const MetricsDuration&)) {
     std::shared_ptr<MetricsStopWatch> initStopWatch;
     Ref<Metrics> metrics;
@@ -692,8 +845,33 @@ void RuntimeManager::emitInitMetrics() {
     emitMetrics(&Metrics::emitRuntimeManagerInitLatency);
 }
 
+void RuntimeManager::emitXpatCreateRuntimeMetrics() {
+    emitMetrics(&Metrics::emitRuntimeManagerXpatInitLatency);
+}
+
+void RuntimeManager::emitIosRuntimeCreateMetrics() {
+    emitMetrics(&Metrics::emitRuntimeManagerIosInitLatency);
+}
+
 void RuntimeManager::emitUserSessionReadyMetrics() {
     emitMetrics(&Metrics::emitUserSessionReadyLatency);
+}
+
+void RuntimeManager::emitUserSessionAttachMetricsIfNeeded() {
+    Ref<Metrics> metrics;
+    MetricsDuration latency;
+
+    {
+        std::lock_guard<Mutex> guard(_mutex);
+        if (_userSessionAttachLatencyEmitted || !_userSessionAttachLatency.has_value() || _metrics == nullptr) {
+            return;
+        }
+        _userSessionAttachLatencyEmitted = true;
+        metrics = _metrics;
+        latency = *_userSessionAttachLatency;
+    }
+
+    metrics->emitUserSessionAttachLatency(latency);
 }
 
 void RuntimeManager::setKeepDebuggerServiceOnPause(bool keepDebuggerServiceOnPause) {
@@ -706,6 +884,14 @@ PlatformType RuntimeManager::getPlatformType() const {
 
 const Ref<JavaScriptANRDetector>& RuntimeManager::getANRDetector() const {
     return _anrDetector;
+}
+
+void RuntimeManager::setMmapCacheDirectory(const Path& path) {
+    std::lock_guard<Mutex> guard(_mutex);
+    _mmapCacheDirectory = path;
+    for (const auto& runtime : getAllRuntimes(guard)) {
+        runtime->setMmapCacheDirectory(path);
+    }
 }
 
 VALDI_CLASS_IMPL(RuntimeManager)

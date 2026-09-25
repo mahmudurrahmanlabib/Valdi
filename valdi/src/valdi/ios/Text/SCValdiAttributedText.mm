@@ -6,9 +6,13 @@
 //
 
 #import "valdi/ios/Text/SCValdiAttributedText.h"
+#import "valdi/ios/Text/SCValdiImageAttachmentInfo.h"
+#import "valdi/ios/Text/SCValdiInlineViewAttachmentInfo.h"
+#import "valdi/ios/Text/SCValdiTextAnimationTransform.h"
 #import "valdi_core/cpp/Attributes/TextAttributeValue.hpp"
 #import "valdi_core/SCValdiObjCConversionUtils.h"
 #import "valdi_core/UIColor+Valdi.h"
+#import "valdi_core/SCValdiWrappedValue+Private.h"
 
 @implementation SCValdiAttributedText {
     Valdi::Ref<Valdi::TextAttributeValue> _cppInstance;
@@ -25,6 +29,18 @@
     return self;
 }
 
+- (instancetype)initWithWrappedValue:(SCValdiWrappedValue*)wrappedValue
+{
+    self = [super init];
+
+    if (self) {
+        _cppInstance = wrappedValue.value.getTypedRef<Valdi::TextAttributeValue>();
+        NSAssert(_cppInstance != nullptr, @"Wrapped value is not a TextAttributeValue");
+    }
+
+    return self;
+}
+
 - (void)dealloc
 {
     _cppInstance = nullptr;
@@ -33,6 +49,11 @@
 - (NSUInteger)partsCount
 {
     return (NSUInteger)_cppInstance->getPartsSize();
+}
+
+- (NSUInteger)animationTransformsCount
+{
+    return (NSUInteger)_cppInstance->getAnimationTransformsSize();
 }
 
 - (NSString *)contentAtIndex:(NSUInteger)index
@@ -62,6 +83,10 @@
             return SCValdiTextDecorationStrikethrough;
         case Valdi::TextDecoration::Underline:
             return SCValdiTextDecorationUnderline;
+        case Valdi::TextDecoration::DashedUnderline:
+            return SCValdiTextDecorationDashedUnderline;
+        case Valdi::TextDecoration::DottedUnderline:
+            return SCValdiTextDecorationDottedUnderline;
     }
 }
 
@@ -73,6 +98,16 @@
     }
 
     return UIColorFromValdiAttributeValue(style.color.value().value);
+}
+
+- (nullable UIColor *)backgroundColorAtIndex:(NSUInteger)index
+{
+    const auto &style = _cppInstance->getStyleAtIndex(index);
+    if (style.background == nullptr || !style.background->color) {
+        return nil;
+    }
+
+    return UIColorFromValdiAttributeValue(style.background->color.value().value);
 }
 
 - (nullable id<SCValdiFunction>)onTapAtIndex:(NSUInteger)index
@@ -136,5 +171,84 @@
     return @(style.outerOutlineWidth.value());
 }
 
+- (nullable SCValdiImageAttachmentInfo *)imageAttachmentAtIndex:(NSUInteger)index
+{
+    const auto &style = _cppInstance->getStyleAtIndex(index);
+    if (!style.imageAttachment) {
+        return nil;
+    }
+
+    const auto &attachment = style.imageAttachment.value();
+
+    NSString *attachmentId = ValdiIOS::NSStringFromString(attachment.attachmentId);
+    CGFloat width = attachment.width;
+    CGFloat height = attachment.height;
+
+    NSData *imageData = nil;
+    if (!attachment.imageData.empty()) {
+        imageData = ValdiIOS::NSDataFromBuffer(attachment.imageData);
+    }
+
+    return [[SCValdiImageAttachmentInfo alloc] initWithAttachmentId:attachmentId
+                                                              width:width
+                                                             height:height
+                                                          imageData:imageData];
+}
+
+- (nullable SCValdiInlineViewAttachmentInfo *)inlineViewAttachmentAtIndex:(NSUInteger)index
+{
+    const auto &style = _cppInstance->getStyleAtIndex(index);
+    if (style.inlineViewAttachment == nullptr) {
+        return nil;
+    }
+
+    auto verticalAlignment = SCValdiInlineViewVerticalAlignmentCenter;
+    switch (style.inlineViewAttachment->getVerticalAlignment()) {
+        case Valdi::InlineViewVerticalAlignment::Top:
+            verticalAlignment = SCValdiInlineViewVerticalAlignmentTop;
+            break;
+        case Valdi::InlineViewVerticalAlignment::Bottom:
+            verticalAlignment = SCValdiInlineViewVerticalAlignmentBottom;
+            break;
+        case Valdi::InlineViewVerticalAlignment::Baseline:
+            verticalAlignment = SCValdiInlineViewVerticalAlignmentBaseline;
+            break;
+        case Valdi::InlineViewVerticalAlignment::Center:
+            verticalAlignment = SCValdiInlineViewVerticalAlignmentCenter;
+            break;
+    }
+    auto inlineViewAttachment = style.inlineViewAttachment;
+    return [[SCValdiInlineViewAttachmentInfo alloc]
+        initWithChildIndex:(NSInteger)inlineViewAttachment->getChildIndex()
+         verticalAlignment:verticalAlignment
+              sizeProvider:^CGSize{
+                  auto size = inlineViewAttachment->getSize();
+                  return CGSizeMake(size.width, size.height);
+              }];
+}
+
+- (nullable SCValdiTextAnimationTransform *)animationTransformAtIndex:(NSUInteger)index
+{
+    const auto &style = _cppInstance->getStyleAtIndex(index);
+    if (!style.animationTransform) {
+        return nil;
+    }
+
+    const auto &animationTransform = style.animationTransform.value();
+    NSString *key = animationTransform.key ? ValdiIOS::NSStringFromString(animationTransform.key.value()) : nil;
+    NSString *partPattern = animationTransform.partPattern.isEmpty()
+        ? nil
+        : ValdiIOS::NSStringFromString(animationTransform.partPattern);
+    return [[SCValdiTextAnimationTransform alloc] initWithKey:key
+                                                    partIndex:index
+                                                 translationY:animationTransform.translationY
+                                                        scale:animationTransform.scale
+                                                      opacity:animationTransform.opacity
+                                                     duration:animationTransform.duration
+                                       timeOffsetBetweenParts:animationTransform.timeOffsetBetweenParts
+                                                   groupIndex:animationTransform.groupIndex
+                                             partIndexInGroup:animationTransform.partIndexInGroup
+                                                  partPattern:partPattern];
+}
 
 @end

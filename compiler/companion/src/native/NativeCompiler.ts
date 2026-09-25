@@ -2688,7 +2688,7 @@ export class NativeCompiler {
   processForStatement(context: NativeCompilerContext, builder: INativeCompilerBlockBuilder, node: ts.ForStatement) {
     this.appendNodeDebugInfo(builder, node);
 
-    const builderLoop = builder.buildLoop();
+    const builderLoop = builder.buildLoop(!!node.incrementor);
 
     if (node.initializer) {
       if (ts.isVariableDeclarationList(node.initializer)) {
@@ -2711,8 +2711,11 @@ export class NativeCompiler {
 
     this.processStatement(context, builderLoop.bodyJumpTargetBuilder.builder, node.statement);
 
+    // The incrementor runs after the body each iteration, in its own block so a
+    // `continue` in the body jumps here (and still advances the loop) rather
+    // than skipping straight to the condition.
     if (node.incrementor) {
-      this.processExpression(context, builderLoop.bodyJumpTargetBuilder.builder, node.incrementor);
+      this.processExpression(context, builderLoop.incrementorBuilder!, node.incrementor);
     }
   }
 
@@ -3296,7 +3299,11 @@ export class NativeCompiler {
     builder: INativeCompilerBlockBuilder,
     node: ts.EnumDeclaration,
   ) {
-    // TODO(simon): Const enum
+    // Const enums have no runtime representation, values are inlined at call sites
+    const isConstEnum = (ts.getCombinedModifierFlags(node) & ts.ModifierFlags.Const) !== 0;
+    if (isConstEnum) {
+      return;
+    }
     this.appendNodeDebugInfo(builder, node);
     const enumName = this.processIdentifierAsAtom(builder, node.name);
     const enumObject = builder.buildNewObject();

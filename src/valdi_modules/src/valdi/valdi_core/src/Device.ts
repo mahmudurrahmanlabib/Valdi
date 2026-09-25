@@ -8,6 +8,7 @@ import {
   getDisplayLeftInset,
   getDisplayRightInset,
   getDisplayScale,
+  getDynamicTypeScale as nativeGetDynamicTypeScale,
   getDisplayTopInset,
   getDisplayWidth,
   getLocaleUsesMetricSystem,
@@ -21,6 +22,7 @@ import {
   getWindowWidth,
   getTimeZoneDstSecondsFromGMT as nativeGetTimeZoneDstSecondsFromGMT,
   isDesktop,
+  isWeb,
   observeDarkMode as nativeObserveDarkMode,
   observeDisplaySizeChange as nativeObserveDisplaySizeChange,
   observeDisplayInsetChange as nativeObserveDisplayInsetChange,
@@ -65,6 +67,23 @@ const cacheDeviceLocales = new DeviceCache<string[]>(getDeviceLocales ?? (() => 
 const cacheLocaleUsesMetricSystem = new DeviceCache<boolean>(getLocaleUsesMetricSystem ?? (() => false));
 const cacheTimeZoneName = new DeviceCache<string>(getTimeZoneName ?? (() => 'unknown'));
 const cacheIsDesktop = new DeviceCache<boolean>(isDesktop ?? (() => false));
+const cacheIsWeb = new DeviceCache<boolean>(isWeb ?? (() => false));
+const cacheIsRTL = new DeviceCache<boolean>(computeIsRTL);
+
+/**
+ * ISO 639-1 language codes for right-to-left languages
+ */
+const RTL_LANGUAGES = ['ar', 'he', 'fa', 'ur', 'yi', 'ps', 'sd', 'ckb'];
+
+/**
+ * Computes whether the device's primary locale uses RTL layout
+ */
+function computeIsRTL(): boolean {
+  const locales = getDeviceLocales?.() ?? [];
+  if (locales.length === 0) return false;
+  const primaryLanguage = locales[0].split('-')[0].toLowerCase();
+  return RTL_LANGUAGES.includes(primaryLanguage);
+}
 
 /**
  * Dark mode last cached value
@@ -90,6 +109,17 @@ const observingInsets = nativeObserveDisplayInsetChange(() => {
   cacheDisplayRightInset.invalidate();
   cacheDisplayTopInset.invalidate();
   cacheDisplayBottomInset.invalidate();
+});
+
+// Registered at module load so it runs before any consumer's size observer: a window can
+// resize without any inset change (foldables, resizable windows), which would otherwise
+// leave these caches stale for consumers reacting to the size notification.
+const observingSize = nativeObserveDisplaySizeChange?.(() => {
+  cacheDisplayWidth.invalidate();
+  cacheDisplayHeight.invalidate();
+  cacheWindowWidth.invalidate();
+  cacheWindowHeight.invalidate();
+  cacheDisplayScale.invalidate();
 });
 
 const observingDarkMode = nativeObserveDarkMode((isDark: boolean) => {
@@ -132,6 +162,13 @@ export namespace Device {
    */
   export function isDesktop() {
     return cacheIsDesktop.get();
+  }
+
+  /**
+   * Check whether the Device is running on the Web platform.
+   */
+  export function isWeb(): boolean {
+    return cacheIsWeb.get();
   }
 
   /**
@@ -185,6 +222,16 @@ export namespace Device {
    */
   export function getDisplayScale(): number {
     return cacheDisplayScale.get();
+  }
+
+  /**
+   * The effective dynamic-type (font) scale for the current rendering context. 1.0 means no
+   * scaling. Android: the app-wide system font scale (scaledDensity / density). iOS: the current
+   * surface's eligibility-resolved scale (1.0 when the page isn't dynamic-type-eligible). Read
+   * fresh per call, since it depends on the current context and the system setting.
+   */
+  export function getDynamicTypeScale(): number {
+    return nativeGetDynamicTypeScale();
   }
 
   /**
@@ -275,6 +322,15 @@ export namespace Device {
    */
   export function getLocaleUsesMetricSystem(): boolean {
     return cacheLocaleUsesMetricSystem.get();
+  }
+
+  /**
+   * Check if the device's primary locale uses right-to-left (RTL) layout direction.
+   * This is determined by checking if the primary language code is in the list of
+   * known RTL languages (Arabic, Hebrew, Persian, Urdu, etc.)
+   */
+  export function isRTL(): boolean {
+    return cacheIsRTL.get();
   }
 
   /**

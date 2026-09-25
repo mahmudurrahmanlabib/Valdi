@@ -1,10 +1,23 @@
 # Valdi Command Line References
 
-The Valdi command line tools will be installed as part of the installation steps, and serves as a single point to getting started and managing existing projects.
+The Valdi command line tools serve as the primary interface for setting up your environment, creating projects, building applications, and managing your Valdi workflow.
 
 ## Installation
 
-See [INSTALL.md](../INSTALL.md).
+```bash
+npm install -g @snap/valdi
+valdi dev_setup  # Sets up your entire development environment
+```
+
+For detailed installation instructions, see the [Installation Guide](../INSTALL.md).
+
+> [!TIP]
+> If you're contributing to Valdi itself, install from source instead:
+> ```bash
+> git clone git@github.com:Snapchat/Valdi.git
+> cd Valdi/npm_modules/cli/
+> npm run cli:install
+> ```
 
 ## Basic Usage
 
@@ -27,9 +40,11 @@ Commands:
   valdi export <platform>                                      Build and export a Valdi library
   valdi hotreload [--module module_name] [--target             Starts the hotreloader for the application
   target_name]
+  valdi debugger                                               Starts the Valdi debugger web interface
   valdi test [--module module_name] [--target target_name]     Runs tests for given module(s) or target(s). Runs all
                                                                tests if no module or target is specified.
   valdi lint <command>                                         Checks and formats the code
+  valdi skills <command>                                       Manage AI assistant skills for Valdi development
   valdi doctor                                                 Check your Valdi development environment for common issues
   valdi log                                                    Streams Valdi logs from the connected device to console
 
@@ -65,7 +80,7 @@ Run this command to enable VS Code syntax highlighting for the current workspace
 - If `--target` is specified, synchronizes only the specified Bazel target.<br></br>
 
 `valdi new_module [module-name]`\
-Create a new Valdi module with boilerplate structure including BUILD.bazel, module.yaml, and basic source files.
+Create a new Valdi module with boilerplate structure including `BUILD.bazel` and basic source files.
 
 Options:
 - `module-name` (positional): Name of the Valdi module
@@ -137,12 +152,77 @@ Starts the Valdi [hotreloader](./start-about.md#prototype-quickly-with-hot-reloa
 - The `--target` option should be a valid Bazel target (ex: `//:hello_world_hotreload`).
 - The `--module` option will query and run targets in the current workspace which match the module_name.<br></br>
 
+`valdi debugger [--host host] [--port port] [--strict-port] [--json] [--web-preview-url url] [--chromium-debugging-port port]`\
+Starts a local browser-based Valdi debugger web interface. The debugger attaches
+to running Valdi daemon targets and exposes live view hierarchy, preview,
+inspector data, element snapshots, heap dumps, input dispatch, and runtime logs. CPU profiling
+uses a separate Hermes debugger connection.
+
+- The default host is `127.0.0.1`; the debugger rejects non-loopback bind
+  addresses because snapshots can contain application data.
+- The preferred port is `8765`; if it is busy, the command selects the next
+  available port so multiple local debugger sessions can run at once.
+- Use `--strict-port` to fail instead of auto-selecting another port.
+- Use `--json` to print one machine-readable startup object with the selected
+  `url`, `port`, `requestedPort`, and `portWasAutoSelected` fields.
+- Use `--web-preview-url` to attach the integrated Elements and Console panel
+  to one exact loopback web/Owl page. The command prints a temporary unpacked
+  extension directory, adds the explicit Valdi debugger query parameters to
+  the preview URL, and defaults Chromium CDP discovery to port `9222`.
+- Use `--chromium-debugging-port` when Owl/Chromium was launched with a
+  different loopback `--remote-debugging-port`. The target page must provide
+  the opt-in `window.__VALDI_WEB_DEBUGGER__` snapshot/highlight contract.<br></br>
+
+`valdi inspect input <capabilities|query|tap|focus|text|key|scroll> [contextId]`\
+Queries or controls a running debug `valdi_application` through the default,
+cross-platform debugger input contract.
+
+- Target an element with `--element-id`, `--accessibility-id`, or `--selector`.
+- Use `--client` to choose a connected target and `--port 13591` for a
+  standalone macOS app; the default port `13592` targets in-app mobile clients.
+- Action-specific values include `--text`, `--key`, `--focused`/`--no-focused`,
+  `--selection-start`, `--selection-end`, `--x`, `--y`, `--delta-x`, and
+  `--delta-y`.
+- Each successful command writes exactly one JSON object to standard output.
+- Start with `capabilities`, then use `query` to discover stable
+  `accessibilityId` selectors and available actions.<br></br>
+
 `valdi test [--module module_name] [--target target_name]`\
 Executes the test(s) for the provided targets. Note that multiple modules OR targets can be provided to execute all tests simultaneously. If no modules or targets are provided, ALL tests within the current workspace will be ran.<br></br>
 
 `valdi lint check [files...]`\
 `valdi lint format [files...]`\
 Runs the prettier linter on the provided files. The files given can be passed via wildcards. If a prettier config does not exist, a basic one will be created. Further customizations can be done via manually editing the created `.prettierrc.json`.<br></br>
+
+`valdi skills list [--category=framework|client]`\
+`valdi skills install [name] [--for=claude|cursor|copilot|all] [--category=framework|client]`\
+`valdi skills update`\
+`valdi skills remove <name>`\
+`valdi skills create`\
+Manage Valdi AI skills — context files that teach AI coding assistants (Claude Code, Cursor, GitHub Copilot) about Valdi-specific patterns so they generate correct code instead of React patterns. Skills are bundled in the npm package and work offline.
+
+- `list`: Shows all available skills with per-agent install status. Use `--category` to filter by `framework` (Valdi repo internals) or `client` (module development)
+- `install [name]`: Installs one skill or all skills. Without `--for`, auto-detects which AI tools are installed. Use `--category` to install only framework or client skills
+- `update`: Re-installs all already-installed skills from the bundled package
+- `remove <name>`: Removes a skill from all agents where it is installed
+- `create`: Interactive scaffold — must be run from within a Valdi framework checkout. Prompts for name, description, and category; creates `skill.md` in the correct location and registers it in `registry.json`
+
+Example:
+```sh
+# See all available skills and which are installed
+valdi skills list
+
+# Install all skills for all detected AI tools
+valdi skills install
+
+# Install only module-development skills for Cursor
+valdi skills install --category=client --for=cursor
+
+# Contribute a new skill (run from Valdi repo root)
+valdi skills create
+```
+
+Skills are stored in `ai-skills/` in the Valdi repository. See [Working with AI Assistants](./ai-tooling.md) for more information.<br></br>
 
 `valdi doctor [--verbose] [--fix] [--json] [--framework] [--project]`\
 Check your Valdi development environment for common issues. Performs comprehensive health checks on system requirements, tool installations, and workspace configuration.
@@ -151,7 +231,7 @@ Options:
 - `--verbose, -v`: Show detailed diagnostic information
 - `--fix, -f`: Attempt to automatically fix issues where possible
 - `--json, -j`: Output results in JSON format (useful for CI/CD)
-- `--framework, -F`: Include framework development checks (git-lfs, temurin, etc.)
+- `--framework, -F`: Include framework development checks (temurin, etc.)
 - `--project, -p`: Include project-specific checks (workspace structure, etc.)
 
 Example:

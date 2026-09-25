@@ -40,14 +40,15 @@ public:
  * Can create a Context from a loaded document and associate them with an id. It holds the shared pointers for all
  * contexts. The shared pointers get released when DestroyContext() is called.
  */
-class ContextManager {
+class ContextManager : public SimpleRefCountable {
 public:
     ContextManager(const Ref<ILogger>& logger, Runtime* runtime);
-    ~ContextManager();
+    ~ContextManager() override;
 
     SharedContext createContext(Ref<ContextHandler> handler,
                                 const Ref<ViewManagerContext>& viewManagerContext,
-                                bool deferRender);
+                                bool deferRender,
+                                const StringBox& scopeName = StringBox());
 
     SharedContext createContext(Ref<ContextHandler> handler,
                                 const Ref<ViewManagerContext>& viewManagerContext,
@@ -55,7 +56,8 @@ public:
                                 const Shared<ValueConvertible>& viewModel,
                                 const Shared<ValueConvertible>& componentContext,
                                 bool updateHandlerSynchronously,
-                                bool deferRender);
+                                bool deferRender,
+                                const StringBox& scopeName = StringBox());
     void destroyContext(const SharedContext& context);
     bool destroyContext(ContextId contextId);
 

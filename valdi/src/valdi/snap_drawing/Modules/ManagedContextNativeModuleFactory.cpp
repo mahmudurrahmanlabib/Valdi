@@ -11,6 +11,7 @@
 #include "snap_drawing/cpp/Drawing/DisplayList/DisplayList.hpp"
 #include "snap_drawing/cpp/Drawing/GraphicsContext/BitmapGraphicsContext.hpp"
 #include "snap_drawing/cpp/Drawing/Raster/RasterContext.hpp"
+#include "snap_drawing/cpp/Events/EventQueue.hpp"
 #include "snap_drawing/cpp/Layers/Interfaces/ILayerRoot.hpp"
 #include "snap_drawing/cpp/Resources.hpp"
 #include "snap_drawing/cpp/Text/FontManager.hpp"
@@ -22,28 +23,48 @@
 #include "valdi/snap_drawing/Utils/ValdiUtils.hpp"
 #include "valdi_core/cpp/Interfaces/IBitmap.hpp"
 #include "valdi_core/cpp/Utils/StringCache.hpp"
+#include "valdi_core/cpp/Utils/ValueArrayBuilder.hpp"
 #include "valdi_core/cpp/Utils/ValueFunctionWithMethod.hpp"
 #include "valdi_core/cpp/Utils/ValueTypedArray.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 
 namespace snap::drawing {
 
 class ManagedContextLayerRoot : public ILayerRoot {
 public:
     explicit ManagedContextLayerRoot(bool useNewExternalSurfaceRasterMethod)
-        : _useNewExternalSurfaceRasterMethod(useNewExternalSurfaceRasterMethod) {}
+        : _useNewExternalSurfaceRasterMethod(useNewExternalSurfaceRasterMethod), _eventQueue(TimePoint(0.0)) {}
     ~ManagedContextLayerRoot() override = default;
 
     EventId enqueueEvent(EventCallback&& eventCallback, Duration after) final {
-        return EventId();
+        return _eventQueue.enqueue(after, std::move(eventCallback));
     }
 
     bool cancelEvent(EventId eventId) final {
-        return false;
+        return _eventQueue.cancel(eventId);
+    }
+
+    void processFrame(Duration delta) {
+        _currentTime += delta;
+        _eventQueue.flush(_currentTime);
     }
 
     bool shouldRasterizeExternalSurface() const final {
         return !_useNewExternalSurfaceRasterMethod;
+    }
+
+    // Set on every draw call (drawFrame and drawFrameSync) right before rootLayer->draw(), from
+    // the same frame size used to construct that draw's DisplayList. Must stay set at every draw
+    // entrypoint -- a stale value here would cap (or fail to cap) ExternalLayer rasterization
+    // using a different frame's size.
+    void setOutputSize(OutputSize size) {
+        _outputSize = size;
+    }
+    OutputSize getOutputSize() const final {
+        return _outputSize;
     }
 
     void onInitialize() final {}
@@ -58,6 +79,9 @@ public:
 private:
     bool _useNewExternalSurfaceRasterMethod;
     uint64_t _layerIdSequence = 0;
+    EventQueue _eventQueue;
+    TimePoint _currentTime{0.0};
+    OutputSize _outputSize;
 };
 
 class SnapDrawingValdiContext : public Valdi::ContextAutoDestroy {
@@ -89,12 +113,17 @@ public:
     }
 
     void destroy() {
+        _destroyed.store(true);
         auto runtime = _runtime.lock();
         if (runtime != nullptr) {
             Valdi::ContextAutoDestroy::destroy();
 
             runtime->destroyViewNodeTree(*_viewNodeTree);
         }
+    }
+
+    bool isDestroyed() const {
+        return _destroyed.load();
     }
 
     const Ref<Valdi::ViewNodeTree>& getViewNodeTree() const {
@@ -109,7 +138,16 @@ public:
         return _rasterContext;
     }
 
+    Ref<Valdi::Runtime> getRuntime() const {
+        return _runtime.lock();
+    }
+
+    const Ref<ManagedContextLayerRoot>& getLayerRoot() const {
+        return _layerRoot;
+    }
+
 private:
+    std::atomic<bool> _destroyed{false};
     Valdi::Weak<Valdi::Runtime> _runtime;
     Ref<Valdi::ViewNodeTree> _viewNodeTree;
     Ref<ManagedContextLayerRoot> _layerRoot;
@@ -201,7 +239,11 @@ Valdi::Value ManagedContextNativeModuleFactory::loadModule() {
                 &ManagedContextNativeModuleFactory::createValdiContextWithSnapDrawing);
     binder.bind("destroyValdiContextWithSnapDrawing",
                 &ManagedContextNativeModuleFactory::destroyValdiContextWithSnapDrawing);
+    binder.bind("layoutAsync", &ManagedContextNativeModuleFactory::layoutAsync);
+    binder.bind("measureAsync", &ManagedContextNativeModuleFactory::measureAsync);
     binder.bind("drawFrame", &ManagedContextNativeModuleFactory::drawFrame);
+    binder.bind("drawFrameSync", &ManagedContextNativeModuleFactory::drawFrameSync);
+    binder.bind("processFrame", &ManagedContextNativeModuleFactory::processFrame);
     binder.bind("disposeFrame", &ManagedContextNativeModuleFactory::disposeFrame);
     binder.bind("rasterFrame", &ManagedContextNativeModuleFactory::rasterFrame);
     return out;
@@ -268,6 +310,158 @@ Valdi::Value ManagedContextNativeModuleFactory::destroyValdiContextWithSnapDrawi
     return Valdi::Value();
 }
 
+Valdi::Value ManagedContextNativeModuleFactory::layoutAsync(const Valdi::ValueFunctionCallContext& callContext) {
+    auto snapDrawingValdiContext = getSnapDrawingValdiContextFromCallContext(callContext);
+    if (snapDrawingValdiContext == nullptr) {
+        return Valdi::Value();
+    }
+
+    auto width = static_cast<float>(callContext.getParameterAsDouble(1));
+    auto height = static_cast<float>(callContext.getParameterAsDouble(2));
+    auto rtl = callContext.getParameterAsBool(3);
+    auto callback = callContext.getParameterAsFunction(4);
+    if (callback == nullptr) {
+        callContext.getExceptionTracker().onError("layoutAsync requires a callback parameter");
+        return Valdi::Value();
+    }
+
+    auto runtime = snapDrawingValdiContext->getRuntime();
+    if (runtime == nullptr) {
+        callContext.getExceptionTracker().onError("Runtime is no longer available");
+        return Valdi::Value();
+    }
+
+    auto context = Valdi::Context::currentRef();
+    auto layoutDirection = rtl ? Valdi::LayoutDirectionRTL : Valdi::LayoutDirectionLTR;
+
+    runtime->getMainThreadManager().dispatch(
+        context, [snapDrawingValdiContext, callback, width, height, layoutDirection] {
+            if (snapDrawingValdiContext->isDestroyed()) {
+                callback->call(Valdi::ValueFunctionFlagsNone, {});
+                return;
+            }
+            auto viewNodeTree = snapDrawingValdiContext->getViewNodeTree();
+            if (viewNodeTree != nullptr) {
+                viewNodeTree->setLayoutSpecs(Valdi::Size(width, height), layoutDirection);
+            }
+            callback->call(Valdi::ValueFunctionFlagsNone, {});
+        });
+
+    return Valdi::Value();
+}
+
+Valdi::Value ManagedContextNativeModuleFactory::measureAsync(const Valdi::ValueFunctionCallContext& callContext) {
+    auto snapDrawingValdiContext = getSnapDrawingValdiContextFromCallContext(callContext);
+    if (snapDrawingValdiContext == nullptr) {
+        return Valdi::Value();
+    }
+
+    auto maxWidth = static_cast<float>(callContext.getParameterAsDouble(1));
+    auto widthMode = static_cast<Valdi::MeasureMode>(callContext.getParameterAsInt(2));
+    auto maxHeight = static_cast<float>(callContext.getParameterAsDouble(3));
+    auto heightMode = static_cast<Valdi::MeasureMode>(callContext.getParameterAsInt(4));
+    auto rtl = callContext.getParameterAsBool(5);
+    auto callback = callContext.getParameterAsFunction(6);
+    if (callback == nullptr) {
+        callContext.getExceptionTracker().onError("measureAsync requires a callback parameter");
+        return Valdi::Value();
+    }
+
+    auto runtime = snapDrawingValdiContext->getRuntime();
+    if (runtime == nullptr) {
+        callContext.getExceptionTracker().onError("Runtime is no longer available");
+        return Valdi::Value();
+    }
+
+    auto context = Valdi::Context::currentRef();
+    auto layoutDirection = rtl ? Valdi::LayoutDirectionRTL : Valdi::LayoutDirectionLTR;
+
+    runtime->getMainThreadManager().dispatch(
+        context, [snapDrawingValdiContext, callback, maxWidth, widthMode, maxHeight, heightMode, layoutDirection] {
+            if (snapDrawingValdiContext->isDestroyed()) {
+                callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(0.0), Valdi::Value(0.0)});
+                return;
+            }
+            auto viewNodeTree = snapDrawingValdiContext->getViewNodeTree();
+            if (viewNodeTree == nullptr) {
+                callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(0.0), Valdi::Value(0.0)});
+                return;
+            }
+            auto size = viewNodeTree->measureLayout(maxWidth, widthMode, maxHeight, heightMode, layoutDirection);
+            callback->call(
+                Valdi::ValueFunctionFlagsNone,
+                {Valdi::Value(static_cast<double>(size.width)), Valdi::Value(static_cast<double>(size.height))});
+        });
+
+    return Valdi::Value();
+}
+
+Valdi::Value ManagedContextNativeModuleFactory::drawFrame(const Valdi::ValueFunctionCallContext& callContext) {
+    auto snapDrawingValdiContext = getSnapDrawingValdiContextFromCallContext(callContext);
+    if (snapDrawingValdiContext == nullptr) {
+        return Valdi::Value();
+    }
+
+    auto callback = callContext.getParameterAsFunction(1);
+    if (callback == nullptr) {
+        callContext.getExceptionTracker().onError("drawFrame requires a callback parameter");
+        return Valdi::Value();
+    }
+
+    auto runtime = snapDrawingValdiContext->getRuntime();
+    if (runtime == nullptr) {
+        callContext.getExceptionTracker().onError("Runtime is no longer available");
+        return Valdi::Value();
+    }
+
+    auto context = Valdi::Context::currentRef();
+
+    runtime->getMainThreadManager().dispatch(context, [snapDrawingValdiContext, callback] {
+        if (snapDrawingValdiContext->isDestroyed()) {
+            callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(), Valdi::Value(0.0)});
+            return;
+        }
+        auto start = std::chrono::steady_clock::now();
+
+        auto viewNodeTreeLock = snapDrawingValdiContext->getViewNodeTree()->lock();
+        auto rootViewNode = snapDrawingValdiContext->getViewNodeTree()->getRootViewNode();
+        if (rootViewNode == nullptr) {
+            callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(), Valdi::Value(0.0)});
+            return;
+        }
+
+        auto frame = rootViewNode->getCalculatedFrame();
+        if (frame.isEmpty()) {
+            callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(), Valdi::Value(0.0)});
+            return;
+        }
+
+        auto rootLayer = valdiViewToLayer(rootViewNode->getView());
+        if (rootLayer == nullptr) {
+            callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(), Valdi::Value(0.0)});
+            return;
+        }
+
+        rootLayer->setFrame(Rect::makeLTRB(frame.getLeft(), frame.getTop(), frame.getRight(), frame.getBottom()));
+        rootLayer->layoutIfNeeded();
+
+        snapDrawingValdiContext->getLayerRoot()->setOutputSize({frame.width, frame.height});
+
+        auto displayList = Valdi::makeShared<DisplayList>(Size(frame.width, frame.height), TimePoint(0.0));
+        DrawMetrics metrics;
+        rootLayer->draw(*displayList, metrics);
+
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        double mainThreadMs = std::chrono::duration<double, std::milli>(elapsed).count();
+
+        auto snapDrawingFrame =
+            Valdi::makeShared<SnapDrawingFrame>(snapDrawingValdiContext->getRasterContext(), displayList);
+        callback->call(Valdi::ValueFunctionFlagsNone, {Valdi::Value(snapDrawingFrame), Valdi::Value(mainThreadMs)});
+    });
+
+    return Valdi::Value();
+}
+
 static Valdi::Value onDrawError(const Valdi::ValueFunctionCallContext& callContext) {
     callContext.getExceptionTracker().onError(
         "SnapDrawing Context has no root view or frame size. Please make sure to render at least one view with a "
@@ -275,7 +469,7 @@ static Valdi::Value onDrawError(const Valdi::ValueFunctionCallContext& callConte
     return Valdi::Value();
 }
 
-Valdi::Value ManagedContextNativeModuleFactory::drawFrame(const Valdi::ValueFunctionCallContext& callContext) {
+Valdi::Value ManagedContextNativeModuleFactory::drawFrameSync(const Valdi::ValueFunctionCallContext& callContext) {
     auto snapDrawingValdiContext = getSnapDrawingValdiContextFromCallContext(callContext);
     if (snapDrawingValdiContext == nullptr) {
         return Valdi::Value();
@@ -300,11 +494,29 @@ Valdi::Value ManagedContextNativeModuleFactory::drawFrame(const Valdi::ValueFunc
     rootLayer->setFrame(Rect::makeLTRB(frame.getLeft(), frame.getTop(), frame.getRight(), frame.getBottom()));
     rootLayer->layoutIfNeeded();
 
+    snapDrawingValdiContext->getLayerRoot()->setOutputSize({frame.width, frame.height});
+
     auto displayList = Valdi::makeShared<DisplayList>(Size(frame.width, frame.height), TimePoint(0.0));
     DrawMetrics metrics;
     rootLayer->draw(*displayList, metrics);
 
     return Valdi::Value(Valdi::makeShared<SnapDrawingFrame>(snapDrawingValdiContext->getRasterContext(), displayList));
+}
+
+Valdi::Value ManagedContextNativeModuleFactory::processFrame(const Valdi::ValueFunctionCallContext& callContext) {
+    auto snapDrawingValdiContext = getSnapDrawingValdiContextFromCallContext(callContext);
+    if (snapDrawingValdiContext == nullptr) {
+        return Valdi::Value();
+    }
+
+    auto deltaMs = callContext.getParameterAsDouble(1);
+    if (!callContext.getExceptionTracker()) {
+        return Valdi::Value();
+    }
+
+    snapDrawingValdiContext->getLayerRoot()->processFrame(Duration::fromMilliseconds(deltaMs));
+
+    return Valdi::Value();
 }
 
 static Ref<SnapDrawingFrame> getSnapDrawingFrameFromCallContext(const Valdi::ValueFunctionCallContext& callContext) {
@@ -359,7 +571,18 @@ Valdi::Value ManagedContextNativeModuleFactory::rasterFrame(const Valdi::ValueFu
         return Valdi::Value();
     }
 
-    return Valdi::Value();
+    // Convert damage rects to JavaScript array
+    Valdi::ValueArrayBuilder damageRectsArray;
+    for (const auto& rect : result.value().damageRects) {
+        Valdi::Value rectObject;
+        rectObject.setMapValue("x", Valdi::Value(rect.x()));
+        rectObject.setMapValue("y", Valdi::Value(rect.y()));
+        rectObject.setMapValue("width", Valdi::Value(rect.width()));
+        rectObject.setMapValue("height", Valdi::Value(rect.height()));
+        damageRectsArray.append(std::move(rectObject));
+    }
+
+    return Valdi::Value(damageRectsArray.build());
 }
 
 } // namespace snap::drawing

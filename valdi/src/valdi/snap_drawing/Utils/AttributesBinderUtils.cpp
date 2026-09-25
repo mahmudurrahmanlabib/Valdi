@@ -16,7 +16,14 @@ AttributeContext::AttributeContext(const Valdi::Ref<Valdi::Animator>& animator, 
     : animator(Valdi::castOrNull<ValdiAnimator>(animator != nullptr ? animator->getNativeAnimator() : nullptr)),
       attributeName(attributeName) {}
 
+AttributeContext::AttributeContext(const Valdi::Shared<ValdiAnimator>& animator, const Valdi::StringBox& attributeName)
+    : animator(animator), attributeName(attributeName) {}
+
 AttributeContext::~AttributeContext() = default;
+
+AttributeContext AttributeContext::withAttributeName(const Valdi::StringBox& attributeName) const {
+    return AttributeContext(animator, attributeName);
+}
 
 class SnapDrawingAttributeHandlerDelegate : public Valdi::ViewAttributeHandlerDelegate {
 public:
@@ -28,14 +35,22 @@ protected:
                                            const Valdi::Value& value,
                                            const Valdi::Ref<Valdi::Animator>& animator) override {
         AttributeContext context(animator, name);
-        return onLayerApply(valdiViewToLayer(view), value, context);
+        auto layer = valdiViewToLayer(view);
+        if (layer == nullptr) {
+            return Valdi::Void();
+        }
+        return onLayerApply(layer, value, context);
     }
 
     void onViewReset(const Valdi::Ref<Valdi::View>& view,
                      const Valdi::StringBox& name,
                      const Valdi::Ref<Valdi::Animator>& animator) override {
         AttributeContext context(animator, name);
-        _resetter(valdiViewToLayer(view), context);
+        auto layer = valdiViewToLayer(view);
+        if (layer == nullptr) {
+            return;
+        }
+        _resetter(layer, context);
     }
 
     virtual Valdi::Result<Valdi::Void> onLayerApply(const Valdi::Ref<Layer>& view,

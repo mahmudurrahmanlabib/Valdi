@@ -2,10 +2,11 @@ import XCTest
 import Foundation
 @testable import Compiler
 
-func extractAnnotations(_ content: String) throws -> [ValdiTypeScriptAnnotation] {
+func extractAnnotations(_ content: String, dropUnrecognized: Bool = false) throws -> [ValdiTypeScriptAnnotation] {
     let comments = TS.AST.Comments(text: content, start: 0, end: content.nsrange.length)
     let extracted = try ValdiTypeScriptAnnotation.extractAnnotations(comments: comments,
-                                                                        fileContent: content)
+                                                                        fileContent: content,
+                                                                        dropUnrecognized: dropUnrecognized)
     return extracted
 }
 
@@ -94,6 +95,54 @@ final class ValdiAnnotationTests: XCTestCase {
         XCTAssertEqual(result.first?.parameters, ["ios": "blah"])
     }
 
+    func testVersionAnnotationWithNumericPayload() throws {
+        let content = """
+/**
+ * Native model docs.
+ * @Version( 42 )
+ * @ExportModel
+ */
+"""
+        let annotations = try extractAnnotations(content)
+
+        XCTAssertEqual(annotations.map(\.name), ["Version", "ExportModel"])
+        XCTAssertEqual(annotations.first?.content, "@Version( 42 )")
+        XCTAssertEqual(annotations.first?.positionalPayload, "42")
+        XCTAssertEqual(nativeApiDeclaredVersion(annotations: annotations), "42")
+        XCTAssertEqual(
+            TypeScriptAnnotatedSymbol.mergedCommentsWithoutAnnotations(
+                fullComments: content,
+                annotations: annotations
+            ),
+            "Native model docs."
+        )
+    }
+
+    func testVersionAnnotationWithPlaceholderPayload() throws {
+        let content = """
+/**
+ * @Version(__PLACEHOLDER__)
+ * @NativeClass
+ */
+"""
+        let annotations = try extractAnnotations(content)
+
+        XCTAssertEqual(annotations.map(\.name), ["Version", "NativeClass"])
+        XCTAssertEqual(annotations.first?.content, "@Version(__PLACEHOLDER__)")
+        XCTAssertEqual(annotations.first?.positionalPayload, "__PLACEHOLDER__")
+        XCTAssertEqual(nativeApiDeclaredVersion(annotations: annotations), "__PLACEHOLDER__")
+        XCTAssertEqual(
+            TypeScriptAnnotatedSymbol.mergedCommentsWithoutAnnotations(
+                fullComments: content,
+                annotations: annotations
+            ),
+            ""
+        )
+    }
+
+    // XCTExpectFailure is only in Apple's XCTest, not swift-corelibs-xctest on Linux, so this
+    // expected-failure test builds and runs on macOS only.
+    #if !os(Linux)
     func testBadCases() throws {
         var content: String = ""
 
@@ -125,6 +174,7 @@ final class ValdiAnnotationTests: XCTestCase {
             _ = try extractAnnotations(content)
         }
     }
+    #endif
 
     func testiOSTypeNameValidation() throws {
         XCTAssertTrue(ObjCValidation.isValidIOSTypeName(iosTypeName: "SCCSomeType"))
@@ -146,5 +196,69 @@ final class ValdiAnnotationTests: XCTestCase {
         XCTAssertFalse(KotlinValidation.isValidAndroidTypeName(androidTypeName: ""))
         XCTAssertFalse(KotlinValidation.isValidAndroidTypeName(androidTypeName: "com.snap.packagepath.cant.have/slashes"))
         XCTAssertFalse(KotlinValidation.isValidAndroidTypeName(androidTypeName: "com.snap.package.Cool"))
+    }
+
+    /// Regression: When a property has @WorkerThread, parsePropertyLike reconstructs the function type with
+    /// shouldCallOnWorkerThread: true. The parsed allowSyncCall (e.g. from @AllowSyncCall on the function type)
+    /// must be preserved, not hardcoded to false.
+    func testWorkerThreadReconstructionPreservesAllowSyncCall() {
+        let returnType = ValdiModelPropertyType.void
+        let params = [ValdiModelProperty]()
+
+        let parsedWithAllowSyncCall = ValdiModelPropertyType.function(
+            parameters: params,
+            returnType: returnType,
+            isSingleCall: false,
+            shouldCallOnWorkerThread: false,
+            allowSyncCall: true
+        )
+
+        // Simulate what parsePropertyLike does when property has @WorkerThread: destructure and rebuild
+        guard case let .function(parameters, returnType, isSingleCall, _, allowSyncCall) = parsedWithAllowSyncCall.unwrappingOptional else {
+            XCTFail("Expected function type")
+            return
+        }
+        let reconstructed = ValdiModelPropertyType.function(
+            parameters: parameters,
+            returnType: returnType,
+            isSingleCall: isSingleCall,
+            shouldCallOnWorkerThread: true,
+            allowSyncCall: allowSyncCall
+        )
+
+        guard case let .function(_, _, _, _, reconstructedAllowSyncCall) = reconstructed.unwrappingOptional else {
+            XCTFail("Expected function type")
+            return
+        }
+        XCTAssertTrue(reconstructedAllowSyncCall, "allowSyncCall must be preserved when reconstructing a function type for @WorkerThread")
+    }
+
+    func testDropUnrecognizedSkipsStrayTokens() throws {
+        // Freeform prose on an enum case must not become annotations when dropUnrecognized is set.
+        XCTAssertTrue(try extractAnnotations("// @Deprecated", dropUnrecognized: true).isEmpty)
+        XCTAssertTrue(try extractAnnotations("// TODO @handle2 Cleanup those UI state", dropUnrecognized: true).isEmpty)
+    }
+
+    func testDropUnrecognizedSkipsStrayTokensWithPayloads() throws {
+        // Payload-shaped stray tokens must be skipped before payload parsing, which would
+        // otherwise throw ("Only @Version supports a positional annotation payload" / brace parse).
+        XCTAssertTrue(try extractAnnotations("// @issue(1234)", dropUnrecognized: true).isEmpty)
+        XCTAssertTrue(try extractAnnotations("// @TODO({foo})", dropUnrecognized: true).isEmpty)
+    }
+
+    func testDropUnrecognizedKeepsKnownAnnotations() throws {
+        XCTAssertEqual(try extractAnnotations("// @Version(3)", dropUnrecognized: true).map { $0.name }, ["Version"])
+
+        // Mixed: known survives, stray is dropped.
+        let mixed = try extractAnnotations("""
+// @Deprecated
+// @Version(3)
+""", dropUnrecognized: true)
+        XCTAssertEqual(mixed.map { $0.name }, ["Version"])
+    }
+
+    func testStrayPayloadTokensStillThrowWithoutDropFlag() throws {
+        // Strict path (interface/class members, top-level symbols) is unchanged.
+        XCTAssertThrowsError(try extractAnnotations("// @issue(1234)"))
     }
 }

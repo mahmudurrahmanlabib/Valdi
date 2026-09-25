@@ -66,7 +66,7 @@ class RenderViewNodeRequest;
 using SharedRuntime = Ref<Runtime>;
 
 class ViewManagerContext;
-class ColorPalette;
+class ColorPaletteManager;
 class AssetLoaderManager;
 class ITweakValueProvider;
 class JavaScriptANRDetector;
@@ -89,7 +89,7 @@ public:
             const Shared<IResourceLoader>& resourceLoader,
             const Ref<AssetLoaderManager>& assetLoaderManager,
             const Holder<Shared<snap::valdi_core::HTTPRequestManager>>& requestManager,
-            const Ref<ColorPalette>& colorPalette,
+            const Ref<ColorPaletteManager>& colorPaletteManager,
             const Ref<IDiskCache>& diskCache,
             const std::shared_ptr<YGConfig>& yogaConfig,
             const Shared<snap::valdi::RuntimeMessageHandler>& runtimeMessageHandler,
@@ -246,6 +246,8 @@ public:
 
     void setRuntimeTweaks(const Ref<ValdiRuntimeTweaks>& runtimeTweaks);
 
+    void setMmapCacheDirectory(const Path& path);
+
     void setMetrics(const Ref<Metrics>& metrics);
     const Ref<Metrics>& getMetrics() const;
 
@@ -264,8 +266,9 @@ public:
 
     void emitInitMetrics();
 
-    void updateColorPalette(const Value& colorPaletteMap) override;
-    Value getColorPalette();
+    const Ref<ColorPaletteManager>& getColorPaletteManager() const;
+    void configureColorPalette(const StringBox& name, const Value& colorPaletteMap) override;
+    void setActiveColorPalette(const StringBox& name) override;
 
     const Ref<IDiskCache>& getDiskCache() const;
 
@@ -275,6 +278,12 @@ public:
      * Return the runtime that is active in the current thread
      */
     static Ref<Runtime> currentRuntime();
+
+    /**
+     * Returns whether the hit test sync deadline should be disabled,
+     * as controlled by the VALDI_DISABLE_HIT_TEST_SYNC_DEADLINE runtime tweak.
+     */
+    bool disableHitTestSyncDeadline() const;
 
 protected:
     void receivedRenderRequest(const Ref<RenderRequest>& renderRequest) override;
@@ -303,10 +312,10 @@ private:
     PlatformType _platformType;
     Ref<ResourceManager> _resourceManager;
     ResourceReloaderThrottler _reloaderThrottler;
-    ContextManager _contextManager;
+    Ref<ContextManager> _contextManager;
     ViewNodeTreeManager _viewNodeManager;
     Ref<MainThreadManager> _mainThreadManager;
-    Ref<ColorPalette> _colorPalette;
+    Ref<ColorPaletteManager> _colorPaletteManager;
     Ref<IDiskCache> _diskCache;
     SharedAtomicObject<UserSession> _userSession;
     const Holder<Shared<snap::valdi_core::HTTPRequestManager>> _requestManager;
@@ -345,7 +354,7 @@ private:
     void doDestroyContext(const SharedContext& context);
 
     void runWithExclusiveJsThreadLock(DispatchFunction&& cb);
-    bool disablePersistentStoreEncryption();
+    bool enableANRDiagnostics();
 };
 
 } // namespace Valdi

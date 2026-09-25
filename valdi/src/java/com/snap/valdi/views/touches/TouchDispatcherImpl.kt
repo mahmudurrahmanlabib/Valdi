@@ -29,6 +29,11 @@ internal class TouchDispatcherImpl(
 
     private val candidateViews = mutableListOf<View>()
 
+    // True for the duration of a touch-down capture once a ValdiTouchTarget opting into
+    // allowSiblingCaptureBelow is hit, so lower-z siblings (e.g. an entity occluded by the
+    // carousel) are still captured instead of being shadowed by the topmost target.
+    private var passThroughSiblingCapture = false
+
     private var gestureRecognizersToStart = mutableListOf<ValdiGestureRecognizer>()
 
     private var lastEvent: MotionEvent? = null
@@ -149,7 +154,13 @@ internal class TouchDispatcherImpl(
             if (debugTouchEvents) {
                 logger?.debug("Valdi touch target ${view::class.java.simpleName}-${System.identityHashCode(view)} wants to handle touch event")
             }
+            if (view.allowSiblingCaptureBelow) {
+                passThroughSiblingCapture = true
+            }
             candidateViews.add(view)
+            if (view.allowsSameViewGestureRecognizers()) {
+                captureGestureRecognizers(view, pointerIndex, event.actionMasked)
+            }
             return true
         }
 
@@ -161,32 +172,46 @@ internal class TouchDispatcherImpl(
                 child ?: continue
 
                 // TODO - actually fix hitTest for gestures for all events
+                // Scope the pass-through to this level: a child subtree keeps normal topmost-wins
+                // capture, but an opted-in hit still suppresses the break for lower-z siblings here.
+                val savedPassThroughSiblingCapture = passThroughSiblingCapture
+                passThroughSiblingCapture = false
                 val didHit = adjustEventCoordinatesToView(view, child, event)
                 { _, adjustedEvent ->
                     captureCandidates(child, adjustedEvent, pointerIndex)
                 }
+                // Only restore the opt-in on a miss: a hitting solid sibling keeps its own (false)
+                // state so it breaks and resumes topmost-wins, rather than leaking capture to
+                // even-lower siblings.
+                if (!didHit) {
+                    passThroughSiblingCapture = savedPassThroughSiblingCapture
+                }
 
-                if (didHit && !captureAllHitTargets) {
+                if (didHit && !captureAllHitTargets && !passThroughSiblingCapture) {
                     break
                 }
             }
         }
 
-        val gestureRecognizer = ViewUtils.getGestureRecognizers(view, false) ?: return true
+        captureGestureRecognizers(view, pointerIndex, event.actionMasked)
+
+        return true
+    }
+
+    private fun captureGestureRecognizers(view: View, pointerIndex: Int, eventActionMasked: Int) {
+        val gestureRecognizer = ViewUtils.getGestureRecognizers(view, false) ?: return
 
         gestureRecognizer.gestureRecognizers.forEach {
             // TODO(2951) for now - we choose to only add touch gesture recognizers for subsequent pointer downs
             if (pointerIndex == 0 || it is TouchGestureRecognizer) {
                 if (!candidateGestureRecognizers.contains(it)) {
                     if (debugTouchEvents) {
-                        logger?.debug("Adding candidate gesture recognizer $it to TouchDispatcher-${System.identityHashCode(this)} for event ${event.actionMasked}")
+                        logger?.debug("Adding candidate gesture recognizer $it to TouchDispatcher-${System.identityHashCode(this)} for event $eventActionMasked")
                     }
                     candidateGestureRecognizers.add(it)
                 }
             }
         }
-
-        return true
     }
 
     private inline fun <T> adjustEventCoordinatesToView(
@@ -523,15 +548,20 @@ internal class TouchDispatcherImpl(
             if (isPointerDown || isDown) {
                 // Step 1, we capture all the views and their gesture recognizers which are within the event's target.
                 // We only do this on touch down, or for new pointers, we capture all their potential gesture recognizers as well
+                // Reset per pointer so a prior pointer's sibling-capture opt-in can't leak into this capture.
+                passThroughSiblingCapture = false
                 captureCandidates(rootView, event, event.actionIndex)
             }
 
             // Step 2, we go over all the touch targets which want to handle touch,
             // if one of them consumed the touch event, we skip the gesture recognizers
-            for (candidateView in candidateViews) {
+            var candidateViewIndex = 0
+            while (candidateViewIndex < candidateViews.size) {
+                val candidateView = candidateViews.getOrNull(candidateViewIndex) ?: break
 
                 val touchTarget = candidateView as? ValdiTouchTarget
                 if (touchTarget == null) {
+                    candidateViewIndex++
                     continue
                 }
 
@@ -577,6 +607,7 @@ internal class TouchDispatcherImpl(
                     removeAllGestureRecognizers()
                     return true
                 }
+                candidateViewIndex++
             }
 
             processGestureRecognizers()
@@ -658,6 +689,7 @@ internal class TouchDispatcherImpl(
         //              dismissal. This means some gestures can be removed while we're iterating
         //              over the function, and the the last event isn't super reliable.
         candidateViews.clear()
+        passThroughSiblingCapture = false
         val storedLastEvent = lastEvent
 
         var index = candidateGestureRecognizers.size
@@ -671,8 +703,9 @@ internal class TouchDispatcherImpl(
         }
 
         if (storedLastEvent != null) {
-            gestureRecognizersToCancel.forEach {
-                it.cancel(storedLastEvent)
+            while (gestureRecognizersToCancel.isNotEmpty()) {
+                val recognizer = gestureRecognizersToCancel.removeAt(gestureRecognizersToCancel.size - 1)
+                recognizer.cancel(storedLastEvent)
             }
         }
         gestureRecognizersToCancel.clear()
@@ -680,10 +713,11 @@ internal class TouchDispatcherImpl(
 
     private fun removeAllGestureRecognizers() {
         lastEvent?.let { event ->
-            candidateGestureRecognizers.forEach {
-                it.cancel(event)
+            while (candidateGestureRecognizers.isNotEmpty()) {
+                val recognizer = candidateGestureRecognizers.removeAt(candidateGestureRecognizers.size - 1)
+                recognizer.cancel(event)
                 if (debugTouchEvents) {
-                    logger?.debug("Candidate gesture recognizer ${it::class.java.simpleName}-${System.identityHashCode(it)} removed from TouchDispatcher-${System.identityHashCode(this)}")
+                    logger?.debug("Candidate gesture recognizer ${recognizer::class.java.simpleName}-${System.identityHashCode(recognizer)} removed from TouchDispatcher-${System.identityHashCode(this)}")
                 }
             }
         }

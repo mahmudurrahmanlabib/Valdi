@@ -59,6 +59,10 @@ int32_t JSFunctionNativeCallContext::getParameterAsInt(size_t index) {
     return _context.valueToInt(getParameter(index), _exceptionTracker);
 }
 
+int64_t JSFunctionNativeCallContext::getParameterAsLong(size_t index) {
+    return _context.valueToLong(getParameter(index), _exceptionTracker).toInt64();
+}
+
 Ref<ValueFunction> JSFunctionNativeCallContext::getParameterAsFunction(size_t index) {
     return jsValueToFunction(
         _context, getParameter(index), ReferenceInfoBuilder(_referenceInfo).withParameter(index), _exceptionTracker);
@@ -74,6 +78,10 @@ Ref<StaticString> JSFunctionNativeCallContext::getParameterAsStaticString(size_t
 
 JSTypedArray JSFunctionNativeCallContext::getParameterAsTypedArray(size_t index) {
     return _context.valueToTypedArray(getParameter(index), _exceptionTracker);
+}
+
+Ref<RefCountable> JSFunctionNativeCallContext::getParameterAsWrappedObject(size_t index) {
+    return _context.valueToWrappedObject(getParameter(index), _exceptionTracker);
 }
 
 BytesView JSFunctionNativeCallContext::getParameterAsBytesView(size_t index) {

@@ -37,6 +37,7 @@ class ES6SetSchema;
 class OutcomeSchema;
 class ProtoSchema;
 class ValueFunctionSchemaAttributes;
+class ValueSchemaRegistry;
 struct EnumCaseSchema;
 
 enum class ValueSchemaPrintFormat {
@@ -48,12 +49,18 @@ class ValueFunctionSchemaAttributes {
 public:
     ValueFunctionSchemaAttributes();
     ValueFunctionSchemaAttributes(bool isMethod, bool isSingleCall, bool shouldDispatchToWorkerThread);
+    ValueFunctionSchemaAttributes(bool isMethod,
+                                  bool isSingleCall,
+                                  bool shouldDispatchToWorkerThread,
+                                  bool allowSyncCall);
 
     bool empty() const;
 
     bool isMethod() const;
     bool isSingleCall() const;
     bool shouldDispatchToWorkerThread() const;
+    /** True if sync call is allowed (either module is not async-strict, or function has @AllowSyncCall). */
+    bool allowSyncCall() const;
 
     bool operator==(const ValueFunctionSchemaAttributes& other) const;
     bool operator!=(const ValueFunctionSchemaAttributes& other) const;
@@ -62,6 +69,8 @@ private:
     bool _isMethod = false;
     bool _isSingleCall = false;
     bool _shouldDispatchToWorkerThread = false;
+    /** Default true to limit impact on existing code; set false only when async_strict_mode and no @AllowSyncCall. */
+    bool _allowSyncCall = true;
 };
 
 /**
@@ -400,6 +409,13 @@ class ValueSchemaReference : public SimpleRefCountable {
 public:
     virtual ValueSchema getKey() const = 0;
     virtual ValueSchema getSchema() const = 0;
+    /**
+     The ValueSchemaRegistry that owns the referenced entry, or null if the reference is not
+     backed by a registry. Named type references inside the referenced schema are only
+     resolvable against this registry, so consumers whose own type resolver has no registry
+     (e.g. the JS-side ValueMarshallerRegistry) must resolve through it.
+     */
+    virtual Ref<ValueSchemaRegistry> getOwningRegistry() const;
 };
 
 class ArraySchema : public SimpleRefCountable {

@@ -16,7 +16,10 @@
 
 #include "djinni_valdi.hpp"
 
+#include "valdi_core/cpp/Utils/ConsoleLogger.hpp"
 #include "valdi_core/cpp/Utils/ValueTypedArray.hpp"
+
+#include <atomic>
 
 namespace djinni::valdi {
 
@@ -26,6 +29,26 @@ std::unordered_map<ValdiProxyId, std::weak_ptr<ValdiProxyBase>> jsProxyCache;
 std::unordered_map<void*, CppProxyCacheEntry> cppProxyCache;
 std::mutex jsProxyCacheMutex;
 std::mutex cppProxyCacheMutex;
+
+namespace {
+std::atomic<bool> gGlobalOneWayCalls{false};
+} // namespace
+
+void setGlobalOneWayCalls(bool enabled) noexcept {
+    gGlobalOneWayCalls.store(enabled, std::memory_order_relaxed);
+}
+
+bool globalOneWayCallsEnabled() noexcept {
+    return gGlobalOneWayCalls.load(std::memory_order_relaxed);
+}
+
+void logDroppedExpiredProxyCall(const Valdi::ValueTypedProxyObject& proxy, size_t methodIndex) noexcept {
+    // Only reached for one-way-eligible methods, whose void-ness was read from a present schema.
+    VALDI_WARN(ConsoleLogger::getLogger(),
+               "Dropped one-way call to expired proxy: {}.{}",
+               proxy.getTypedObject()->getClassName().toStringView(),
+               proxy.getTypedObject()->getSchema()->getProperty(methodIndex).name.toStringView());
+}
 
 void checkForNull(void* ptr, const char* context) {
     if (!ptr) {

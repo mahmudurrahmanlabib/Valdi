@@ -9,11 +9,11 @@
 #include "valdi/runtime/JavaScript/JavaScriptRuntime.hpp"
 
 #include <boost/algorithm/string.hpp>
+#include <cstdint>
 #include <fmt/ostream.h>
 
 #include "utils/platform/BuildOptions.hpp"
 #include "utils/time/StopWatch.hpp"
-#include "valdi/JSRuntimeNativeObjectsManager.hpp"
 #include "valdi/runtime/Attributes/AttributeIds.hpp"
 #include "valdi/runtime/JavaScript/JSFunctionWithCallable.hpp"
 #include "valdi/runtime/JavaScript/JSFunctionWithMethod.hpp"
@@ -22,6 +22,7 @@
 #include "valdi/runtime/JavaScript/JavaScriptContextEntryPoint.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptErrorStackTrace.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptFunctionCallContext.hpp"
+#include "valdi/runtime/JavaScript/JavaScriptMessagePort.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptModuleContainer.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptUtils.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptValueMarshaller.hpp"
@@ -29,8 +30,12 @@
 #include "valdi/runtime/JavaScript/ValueFunctionWithJSValue.hpp"
 #include "valdi/runtime/Resources/DirectionalAsset.hpp"
 #include "valdi/runtime/Resources/PlatformSpecificAsset.hpp"
+#include "valdi/runtime/Resources/ThemableAsset.hpp"
+#include "valdi/runtime/Utils/MainThreadManager.hpp"
 #include "valdi/runtime/ValdiRuntimeTweaks.hpp"
+#include "valdi_core/JSRuntimeNativeObjectsManager.hpp"
 #include "valdi_core/cpp/Constants.hpp"
+#include "valdi_core/cpp/Resources/LoadedAsset.hpp"
 #include "valdi_core/cpp/Resources/ResourceId.hpp"
 #include "valdi_core/cpp/Utils/ConsoleLogger.hpp"
 #include "valdi_core/cpp/Utils/LoggerUtils.hpp"
@@ -97,7 +102,21 @@
 namespace Valdi {
 
 // static const long long kJsGarbageCollectionDelaySeconds = 2;
-constexpr int kTraceRecordingTimeoutSeconds = 20;
+// Debugger-driven recordings are stopped and retained by the TypeScript handler after 20 seconds.
+// Keep a separate native leak guard with enough margin that it cannot discard a handler-owned result.
+constexpr int kTraceRecordingTimeoutSeconds = 30;
+constexpr uint64_t kMaxJavaScriptSafeInteger = 9007199254740991ULL;
+
+static StringBox dispatchReasonName(JsThreadDispatchReason reason);
+
+constexpr uint64_t clampTraceDroppedEventCountForJavaScript(uint64_t value) {
+    return value > kMaxJavaScriptSafeInteger ? kMaxJavaScriptSafeInteger : value;
+}
+
+static_assert(clampTraceDroppedEventCountForJavaScript(kMaxJavaScriptSafeInteger) == kMaxJavaScriptSafeInteger,
+              "Exact JavaScript-safe trace drop counts must be preserved");
+static_assert(clampTraceDroppedEventCountForJavaScript(kMaxJavaScriptSafeInteger + 1) == kMaxJavaScriptSafeInteger,
+              "Oversized trace drop counts must be clamped before double conversion");
 
 constexpr size_t kLoadPropertyName = 0;
 constexpr size_t kUnloadAllUnusedPropertyName = 1;
@@ -105,6 +124,7 @@ constexpr size_t kIsLoadedPropertyName = 2;
 constexpr size_t kUnloadPropertyName = 3;
 constexpr size_t kRegisterModulePropertyName = 4;
 constexpr size_t kPreloadModulePropertyName = 5;
+constexpr size_t kPreloadBatchPropertyName = 6;
 
 const ResourceId& valdiModuleResourceId() {
     static auto kValdiModuleResourceId =
@@ -122,20 +142,36 @@ static ContextId getParameterAsContextId(JSFunctionNativeCallContext& callContex
     return static_cast<ContextId>(callContext.getParameterAsInt(index));
 }
 
-static ptrdiff_t getMemoryUsageBytes() {
+static int64_t getMemoryUsageBytes() {
 #if defined(__ANDROID__)
-    auto mi = mallinfo();
-    return ptrdiff_t(mi.uordblks);
+    // mallinfo2 is available from API 33 (Android 13) onwards.
+    // __ANDROID_API__ is provided by the NDK.
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 33
+    struct mallinfo2 mi = mallinfo2();
+    return static_cast<int64_t>(mi.uordblks);
+#else
+    // Fallback for older Android versions
+    struct mallinfo mi = mallinfo();
+    // In mallinfo, uordblks is an int (32-bit), so this may overflow at 2GB
+    return static_cast<int64_t>(mi.uordblks);
+#endif
+
 #elif defined(__APPLE__)
     task_basic_info info;
     mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
-        return ptrdiff_t(info.resident_size);
+        return static_cast<int64_t>(info.resident_size);
     }
     return 0;
+
 #else
     return 0;
 #endif
+}
+
+static int64_t getCurrentTimestampMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 STRING_CONST(callActionMessageName, "callAction")
@@ -144,9 +180,25 @@ STRING_CONST(callActionParameterParametersKey, "parameters")
 
 class JavaScriptRuntimeCallable : public JSFunctionWithMethod<JavaScriptRuntime> {
 public:
-    using JSFunctionWithMethod<JavaScriptRuntime>::JSFunctionWithMethod;
+    JavaScriptRuntimeCallable(JavaScriptRuntime& self,
+                              JSValueRef (JavaScriptRuntime::*function)(JSFunctionNativeCallContext&),
+                              const ReferenceInfo& referenceInfo)
+        : JSFunctionWithMethod<JavaScriptRuntime>(self, function, referenceInfo),
+          _runtime(self),
+          _functionName(referenceInfo.toFunctionIdentifier()) {}
 
     ~JavaScriptRuntimeCallable() override = default;
+
+    JSValueRef operator()(JSFunctionNativeCallContext& callContext) noexcept override {
+        // Runtime builtins run native work on the JS thread without going through
+        // JSFunctionWithValueFunction, so record them for ANR attribution here.
+        ScopedNativeCallActivity nativeCallActivity(&_runtime, _functionName);
+        return JSFunctionWithMethod<JavaScriptRuntime>::operator()(callContext);
+    }
+
+private:
+    JavaScriptRuntime& _runtime;
+    StringBox _functionName;
 };
 
 class JavaScriptRuntimeTraceProxyCallable : public JSFunction {
@@ -156,7 +208,7 @@ public:
                                         const JSValue& callback)
         : _traceName(traceName),
           _referenceInfo(ReferenceInfoBuilder().withObject(nameFromJSFunction(jsContext, callback)).build()),
-          _callback(callback) {}
+          _callback(JSValueRef::makeRetained(jsContext, callback)) {}
 
     ~JavaScriptRuntimeTraceProxyCallable() override = default;
 
@@ -166,16 +218,16 @@ public:
 
     JSValueRef operator()(JSFunctionNativeCallContext& callContext) noexcept override {
         VALDI_TRACE(_traceName);
-        return callContext.getContext().callObjectAsFunction(_callback, callContext);
+        return callContext.getContext().callObjectAsFunction(_callback.get(), callContext);
     }
 
 private:
     StringBox _traceName;
     ReferenceInfo _referenceInfo;
-    JSValue _callback;
+    JSValueRef _callback;
 };
 
-class JSRuntimeNativeObjectsManagerImpl : public snap::valdi::JSRuntimeNativeObjectsManager {
+class JSRuntimeNativeObjectsManagerImpl : public snap::valdi_core::JSRuntimeNativeObjectsManager {
 public:
     JSRuntimeNativeObjectsManagerImpl(ContextManager& contextManager, Ref<Context>&& context)
         : _contextManager(contextManager), _context(context) {}
@@ -245,7 +297,7 @@ std::optional<JavaScriptCapturedStacktrace> JavaScriptStacktraceCaptureSession::
 
 JavaScriptRuntime::JavaScriptRuntime(IJavaScriptBridge& jsBridge,
                                      ResourceManager& resourceManager,
-                                     ContextManager& contextManager,
+                                     const Ref<ContextManager>& contextManager,
                                      MainThreadManager& mainThreadManager,
                                      AttributeIds& attributeIds,
                                      PlatformType platformType,
@@ -264,10 +316,9 @@ JavaScriptRuntime::JavaScriptRuntime(IJavaScriptBridge& jsBridge,
       _anrDetector(anrDetector),
       _isDisposed(false),
       _enableDebugger(enableDebugger),
-      _enableStackTraceCapture(enableDebugger),
       _platformType(platformType),
       _isWorker(isWorker) {
-    VALDI_DEBUG(*_logger, "++JavaScriptRuntime({})", static_cast<void*>(this));
+    VALDI_DEBUG(*_logger, "Creating JavaScriptRuntime (instance ptr {})", static_cast<void*>(this));
 
     auto queueName = STRING_LITERAL(isWorker ? "Valdi JS Worker Thread" : "Valdi JS Thread");
     if (jsBridge.requiresDedicatedThread()) {
@@ -282,6 +333,7 @@ JavaScriptRuntime::JavaScriptRuntime(IJavaScriptBridge& jsBridge,
     _propertyNameIndex.set(kUnloadPropertyName, "unload");
     _propertyNameIndex.set(kRegisterModulePropertyName, "registerModule");
     _propertyNameIndex.set(kPreloadModulePropertyName, "preload");
+    _propertyNameIndex.set(kPreloadBatchPropertyName, "preloadBatch");
 
     _upTime.start();
     _initLock.enter();
@@ -290,7 +342,7 @@ JavaScriptRuntime::JavaScriptRuntime(IJavaScriptBridge& jsBridge,
         this->doInitialize();
     });
 
-    _globalContext = _contextManager.createContext(nullptr, nullptr, /* deferRender */ true);
+    _globalContext = _contextManager->createContext(nullptr, nullptr, /* deferRender */ true);
     // Keep a +1 disposable until we complete the teardown
     _globalContext->retainDisposables();
 }
@@ -303,17 +355,38 @@ void JavaScriptRuntime::postInit() {
     _contextHandler = makeShared<JavaScriptComponentContextHandler>(*this, this, *_logger);
     _initLock.leaveIfNotCompleted();
 
-    if (_listener != nullptr) {
-        auto runtimeTweaks = _listener->getRuntimeTweaks();
+    if (auto listener = getListener()) {
+        auto runtimeTweaks = listener->getRuntimeTweaks();
         if (runtimeTweaks != nullptr) {
             _dispatchQueue->setDisableSyncCallsInCallingThread(runtimeTweaks->disableSyncCallsInCallingThread());
+            // Pull the termination mode here too: worker runtimes are created fresh (runtimeCreateWorker)
+            // and only inherit the host's listener, not its pushed tweaks, so Runtime::setRuntimeTweaks
+            // (which targets the host runtime) never reaches them. Reading it at postInit — after the
+            // worker's listener is set — lets a worker honor an aggressive-termination override.
+            setCooperativeTermination(runtimeTweaks->useCooperativeTermination());
+            setJoinJsThreadOnTeardown(runtimeTweaks->joinJsThreadOnTeardown());
         }
     }
 }
 
 JavaScriptRuntime::~JavaScriptRuntime() {
-    VALDI_DEBUG(*_logger, "--JavaScriptRuntime({})", static_cast<void*>(this));
+    VALDI_DEBUG(*_logger, "Destroying JavaScriptRuntime (instance ptr {})", static_cast<void*>(this));
     fullTeardown();
+
+    // fullTeardown() -> teardown() early-returns without draining when the runtime is already
+    // disposed, trusting a prior disposer to have quiesced the JS thread. That trust is unsafe:
+    // dispatched JS-thread tasks hold the runtime only by raw pointer, so an in-flight loadJsModule can
+    // still be mutating members (e.g. the lock-free _moduleResourceTracker) when the last ref drops on
+    // another thread. The only off-thread join would otherwise be the _dispatchQueue member destructor,
+    // which runs AFTER _moduleResourceTracker is freed (member order) -- too late. Force the (idempotent)
+    // drain+join here, before any member is destroyed. Off the JS thread this joins; on it, it is a no-op.
+    //
+    // Gated by VALDI_JOIN_JS_THREAD_ON_TEARDOWN (default on): the join replaces the prior member-order
+    // crash with a wait, so a frozen JS thread turns it into a hang instead. The flag lets that trade be
+    // flipped off without a build if a frozen-JS population shows up.
+    if (_joinJsThreadOnTeardown) {
+        _dispatchQueue->fullTeardown();
+    }
 }
 
 void JavaScriptRuntime::doInitialize() {
@@ -340,6 +413,12 @@ void JavaScriptRuntime::doInitialize() {
             return;
         }
     })();
+
+    // onInitError() clears _running, so reaching here with it still set means the core bundles
+    // evaluated successfully and ANR accounting can begin.
+    if (_running) {
+        _bootstrapCompleted = true;
+    }
 }
 
 void JavaScriptRuntime::fullTeardown() {
@@ -348,6 +427,31 @@ void JavaScriptRuntime::fullTeardown() {
 
 void JavaScriptRuntime::partialTeardown() {
     teardown(false);
+}
+
+void JavaScriptRuntime::requestFullTeardown() {
+    auto wasDisposed = _isDisposed.exchange(true);
+    if (wasDisposed) {
+        return;
+    }
+
+    // Just in case postInit() was never called
+    _initLock.leaveIfNotCompleted();
+
+    _dispatchQueue->async([self = strongSmallRef(this)]() { self->teardownOnJsThread(true); });
+}
+
+void JavaScriptRuntime::requestExecutionTermination() {
+    // requestExecutionTermination() on the context only sets a sticky atomic flag (Hermes also triggers a
+    // non-blocking async break), so it is safe to call while holding _mutex. Doing so keeps it mutually
+    // exclusive with teardownOnJsThread(), which clears _javaScriptContext under the same lock: we never
+    // hold a strong context reference past the lock, avoiding both the teardown SC_ASSERT race and a
+    // wrong-thread context destruction if the dispatch queue is already torn down.
+    std::lock_guard<Mutex> lock(_mutex);
+    if (_isDisposed || _javaScriptContext == nullptr) {
+        return;
+    }
+    _javaScriptContext->requestExecutionTermination();
 }
 
 void JavaScriptRuntime::teardown(bool destroyContext) {
@@ -359,62 +463,87 @@ void JavaScriptRuntime::teardown(bool destroyContext) {
     // Just in case postInit() was never called
     _initLock.leaveIfNotCompleted();
 
-    if (destroyContext) {
-        _dispatchQueue->sync([&]() {
-            if (_anrDetector != nullptr) {
-                _anrDetector->removeTaskScheduler(this);
-            }
-            // Prevent further dispatches to run
-            _listener = nullptr;
-            _dispatchQueue->fullTeardown();
-
-            if (!destroyContext) {
-                return;
-            }
-
-            // Bridged objects should be deallocated immediately
-            auto nonDeferredPool = Valdi::RefCountableAutoreleasePool::makeNonDeferred();
-
-            _globalContext->releaseDisposables();
-            _contextManager.destroyContext(_globalContext);
-
-            _modules.clear();
-            _daemonClients.clear();
-            _moduleLoader = JSValueRef();
-            _symbolicateFunction = Result<JSValueRef>();
-            _onDaemonClientEventFunction = Result<JSValueRef>();
-            _uncaughtExceptionHandler = nullptr;
-            _unhandledRejectionHandler = nullptr;
-            if (_contextHandler != nullptr) {
-                _contextHandler->clear();
-                _contextHandler = nullptr;
-            }
-            _runtimeDeserializers = nullptr;
-            _propertyNameIndex.setContext(nullptr);
-            auto weakJavaScriptContext = weakRef(_javaScriptContext.get());
-            _javaScriptContext = nullptr;
-
-            SC_ASSERT(weakJavaScriptContext.expired());
-        });
-    } else {
-        if (_anrDetector != nullptr) {
-            _anrDetector->removeTaskScheduler(this);
-        }
-        _dispatchQueue->fullTeardown();
-        _listener = nullptr;
+    // Workers share this runtime's listener (see createWorker); detach them so a worker
+    // outliving this runtime does not keep a dangling reference. A worker task holding a
+    // RetainedListener keeps the listener's owner alive until the call completes.
+    for (const auto& jsWorker : getAllWorkers()) {
+        jsWorker->setListener(nullptr, {});
     }
+
+    if (destroyContext) {
+        _dispatchQueue->safeSync([&]() { teardownOnJsThread(true); });
+    } else {
+        teardownOnJsThread(false);
+    }
+}
+
+void JavaScriptRuntime::teardownOnJsThread(bool destroyContext) {
+    if (_anrDetector != nullptr) {
+        _anrDetector->removeTaskScheduler(this);
+    }
+
+    // Do not clear _running here. fullTeardown() below drains work that was queued before teardown,
+    // and that work must run while the context is still alive (destroyed further down). Liveness is
+    // gated on _javaScriptContext in makeJsThreadDispatchFunction, not on _running, so the drain
+    // completes instead of silently skipping and handing callers an undefined result.
+    setListener(nullptr, {});
+    _dispatchQueue->fullTeardown();
+
+    if (!destroyContext) {
+        return;
+    }
+
+    // Bridged objects should be deallocated immediately
+    auto nonDeferredPool = Valdi::RefCountableAutoreleasePool::makeNonDeferred();
+
+    _globalContext->releaseDisposables();
+    _contextManager->destroyContext(_globalContext);
+
+    _modules.clear();
+    _daemonClients.clear();
+    _moduleLoader = JSValueRef();
+    _symbolicateFunction = Result<JSValueRef>();
+    _onDaemonClientEventFunction = Result<JSValueRef>();
+    _uncaughtExceptionHandler = nullptr;
+    _unhandledRejectionHandler = nullptr;
+    if (_contextHandler != nullptr) {
+        _contextHandler->clear();
+        _contextHandler = nullptr;
+    }
+    _runtimeDeserializers = nullptr;
+    _propertyNameIndex.setContext(nullptr);
+
+    Weak<IJavaScriptContext> weakJavaScriptContext;
+    {
+        std::lock_guard<Mutex> lock(_mutex);
+        weakJavaScriptContext = weakRef(_javaScriptContext.get());
+        _javaScriptContext = nullptr;
+    }
+
+    SC_ASSERT(weakJavaScriptContext.expired());
 }
 
 void JavaScriptRuntime::setThreadQoS(ThreadQoSClass threadQoS) {
     _dispatchQueue->setQoSClass(threadQoS);
 }
 
-void JavaScriptRuntime::setListener(Valdi::IJavaScriptRuntimeListener* listener) {
+void JavaScriptRuntime::setListener(Valdi::IJavaScriptRuntimeListener* listener,
+                                    const Weak<SharedPtrRefCountable>& listenerOwner) {
+    std::lock_guard<Mutex> guard(_listenerMutex);
     _listener = listener;
+    _listenerOwner = listenerOwner;
 }
 
-IJavaScriptRuntimeListener* JavaScriptRuntime::getListener() const {
-    return _listener;
+JavaScriptRuntime::RetainedListener JavaScriptRuntime::getListener() const {
+    std::lock_guard<Mutex> guard(_listenerMutex);
+    if (_listener == nullptr) {
+        return {};
+    }
+    auto owner = _listenerOwner.lock();
+    if (owner == nullptr) {
+        return {};
+    }
+    return {_listener, std::move(owner)};
 }
 
 void JavaScriptRuntime::bindRuntimeFunction(IJavaScriptContext& jsContext,
@@ -444,8 +573,14 @@ void JavaScriptRuntime::bindRuntimeFunction(IJavaScriptContext& jsContext,
 Result<Void> JavaScriptRuntime::initializeContext() {
     VALDI_TRACE("Valdi.createJsContext");
     Ref<ValdiRuntimeTweaks> runtimeTweaks;
-    if (_listener != nullptr) {
-        runtimeTweaks = _listener->getRuntimeTweaks();
+    if (auto listener = getListener()) {
+        runtimeTweaks = listener->getRuntimeTweaks();
+    }
+
+    if (runtimeTweaks != nullptr) {
+        Context::setDestroyedContextFixEnabled(runtimeTweaks->enableRenderRequestContextFix());
+        MainThreadManager::setPreRasterFenceDisabled(runtimeTweaks->disablePreRasterFence());
+        ValueFunctionWithJSValue::setDeadlineCircuitBreakerDisabled(runtimeTweaks->disableSyncDeadlineCircuitBreaker());
     }
 
     VALDI_INFO(*_logger, "Creating JSContext from engine '{}'", _javaScriptBridge.getName());
@@ -468,7 +603,10 @@ Result<Void> JavaScriptRuntime::initializeContext() {
     }
 
     if (exceptionTracker) {
-        _javaScriptContext = std::move(jsContext);
+        {
+            std::lock_guard<Mutex> lock(_mutex);
+            _javaScriptContext = std::move(jsContext);
+        }
         _runtimeDeserializers = std::move(runtimeDeserializers);
         _propertyNameIndex.setContext(_javaScriptContext.get());
         return Void();
@@ -482,7 +620,8 @@ const Ref<DispatchQueue>& JavaScriptRuntime::getJsDispatchQueue() const {
 }
 
 void JavaScriptRuntime::setValueToGlobalObject(const StringBox& name, const Value& value) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::SetValueToGlobalObject;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         auto globalKey = STRING_LITERAL("global");
         auto jsValueResult = valueToJSValue(entry.jsContext,
                                             value,
@@ -573,8 +712,8 @@ JSValueRef JavaScriptRuntime::runtimePostMessage(JSFunctionNativeCallContext& ca
 
         if (actionParameters.getArray() != nullptr) {
             dispatchOnMainThread([=]() {
-                if (_listener != nullptr) {
-                    _listener->receivedCallActionMessage(contextId, actionName, actionParameters.getArrayRef());
+                if (auto listener = getListener()) {
+                    listener->receivedCallActionMessage(contextId, actionName, actionParameters.getArrayRef());
                 }
             });
         } else {
@@ -584,8 +723,8 @@ JSValueRef JavaScriptRuntime::runtimePostMessage(JSFunctionNativeCallContext& ca
                                         Valdi::valueTypeToString(actionParameters.getType()))));
             }
             dispatchOnMainThread([=]() {
-                if (_listener != nullptr) {
-                    _listener->receivedCallActionMessage(contextId, actionName, nullptr);
+                if (auto listener = getListener()) {
+                    listener->receivedCallActionMessage(contextId, actionName, nullptr);
                 }
             });
         }
@@ -652,6 +791,12 @@ JSValueRef JavaScriptRuntime::runtimeGetCurrentPlatform(JSFunctionNativeCallCont
             return callContext.getContext().newNumber(static_cast<int32_t>(1));
         case PlatformTypeIOS:
             return callContext.getContext().newNumber(static_cast<int32_t>(2));
+        case PlatformTypeMacOS:
+            return callContext.getContext().newNumber(static_cast<int32_t>(3));
+        case PlatformTypeWeb:
+            return callContext.getContext().newNumber(static_cast<int32_t>(4));
+        case PlatformTypeLinux:
+            return callContext.getContext().newNumber(static_cast<int32_t>(5));
     }
 }
 
@@ -682,6 +827,9 @@ JSValueRef JavaScriptRuntime::runtimeGetBackendRenderingTypeForContextId(JSFunct
                 result = kBackendRenderingTypeAndroid;
                 break;
             case PlatformTypeIOS:
+            case PlatformTypeMacOS:
+            case PlatformTypeWeb:
+            case PlatformTypeLinux:
                 result = kBackendRenderingTypeIOS;
                 break;
         }
@@ -711,7 +859,7 @@ JSValueRef JavaScriptRuntime::runtimeCreateContext(JSFunctionNativeCallContext& 
 
     Ref<Context> context;
     if (callContext.getContext().isValueUndefined(jsContextHandler)) {
-        context = _contextManager.createContext(nullptr, nullptr, /* deferRender */ true);
+        context = _contextManager->createContext(nullptr, nullptr, /* deferRender */ true);
     } else {
         if (_defaultViewManagerContext == nullptr) {
             return callContext.throwError(Error("Cannot create context without a default ViewManagerContext"));
@@ -726,7 +874,7 @@ JSValueRef JavaScriptRuntime::runtimeCreateContext(JSFunctionNativeCallContext& 
                                          true);
         handler->setJsContextHandler(globalRef);
 
-        context = _contextManager.createContext(handler, _defaultViewManagerContext, /* deferRender */ true);
+        context = _contextManager->createContext(handler, _defaultViewManagerContext, /* deferRender */ true);
     }
 
     context->onCreate();
@@ -735,10 +883,16 @@ JSValueRef JavaScriptRuntime::runtimeCreateContext(JSFunctionNativeCallContext& 
     auto callerContextId = static_cast<int32_t>(callerContextRef->getContextId());
     auto newContextId = static_cast<int32_t>(context->getContextId());
     if (context->getParent() == nullptr && callerContextId != 1 /* Ignore root context */) {
-        VALDI_DEBUG(*_logger, "Setting context {}'s parent context to {}", newContextId, callerContextId);
-
-        context->setParent(callerContextRef);
-        callerContextRef->getRoot()->retainDisposables();
+        if (callerContextRef->getRoot()->isDestroyed() && Context::isDestroyedContextFixEnabled()) {
+            VALDI_WARN(*_logger,
+                       "Skipping destroyed caller root context {} when creating context {}",
+                       callerContextRef->getRoot()->getContextId(),
+                       newContextId);
+        } else {
+            VALDI_DEBUG(*_logger, "Setting context {}'s parent context to {}", newContextId, callerContextId);
+            context->setParent(callerContextRef);
+            callerContextRef->getRoot()->retainDisposables();
+        }
     }
 
     return callContext.getContext().newNumber(newContextId);
@@ -748,12 +902,12 @@ JSValueRef JavaScriptRuntime::runtimeDestroyContext(JSFunctionNativeCallContext&
     auto contextId = getParameterAsContextId(callContext, 0);
     CHECK_CALL_CONTEXT(callContext);
 
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         return callContext.getContext().newUndefined();
     }
 
-    _contextManager.destroyContext(context);
+    _contextManager->destroyContext(context);
     return callContext.getContext().newUndefined();
 }
 
@@ -761,7 +915,7 @@ JSValueRef JavaScriptRuntime::runtimeSetLayoutSpecs(JSFunctionNativeCallContext&
     auto contextId = getParameterAsContextId(callContext, 0);
     CHECK_CALL_CONTEXT(callContext);
 
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         return callContext.getContext().newUndefined();
     }
@@ -773,7 +927,12 @@ JSValueRef JavaScriptRuntime::runtimeSetLayoutSpecs(JSFunctionNativeCallContext&
     auto isRTL = callContext.getParameterAsBool(3);
     CHECK_CALL_CONTEXT(callContext);
 
-    _listener->resolveViewNodeTree(context, true, true, [=](const SharedViewNodeTree& viewNodeTree) {
+    auto listener = getListener();
+    if (!listener) {
+        return callContext.getContext().newUndefined();
+    }
+
+    listener->resolveViewNodeTree(context, true, true, [=](const SharedViewNodeTree& viewNodeTree) {
         if (viewNodeTree == nullptr) {
             return;
         }
@@ -803,7 +962,7 @@ JSValueRef JavaScriptRuntime::runtimeMeasureContext(JSFunctionNativeCallContext&
     auto contextId = getParameterAsContextId(callContext, 0);
     CHECK_CALL_CONTEXT(callContext);
 
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         return callContext.getContext().newUndefined();
     }
@@ -819,9 +978,14 @@ JSValueRef JavaScriptRuntime::runtimeMeasureContext(JSFunctionNativeCallContext&
     auto isRTL = callContext.getParameterAsBool(5);
     CHECK_CALL_CONTEXT(callContext);
 
+    auto listener = getListener();
+    if (!listener) {
+        return callContext.getContext().newUndefined();
+    }
+
     Size measuredSize;
 
-    _listener->resolveViewNodeTree(context, false, false, [&](const SharedViewNodeTree& viewNodeTree) {
+    listener->resolveViewNodeTree(context, false, false, [&](const SharedViewNodeTree& viewNodeTree) {
         if (viewNodeTree == nullptr) {
             return;
         }
@@ -849,9 +1013,54 @@ JSValueRef JavaScriptRuntime::runtimeSubmitRenderRequest(JSFunctionNativeCallCon
     CHECK_CALL_CONTEXT(callContext);
     auto callback = callContext.getParameterAsFunction(1);
     CHECK_CALL_CONTEXT(callContext);
+
+    // JS code can execute under a context that has already been destroyed (eg. a
+    // callback firing after a modal is dismissed or a component is torn down).
+    // Native function bridges created in that state capture the destroyed context,
+    // causing all subsequent calls through those bridges to be silently dropped.
+    // This typically manifests as unresponsive UI (tap, dismiss, etc. stop working).
+    //
+    // The destroyed context may be either the root (Context::currentRoot()) or a
+    // leaf with a living root (Context::current() is destroyed, but currentRoot()
+    // is alive).
+    //
+    // Fix: if the current context is destroyed, temporarily override it with the
+    // render request's owning component context (treeId), which is still alive.
+    //
+    // Gated by COF VALDI_ENABLE_RENDER_REQUEST_CONTEXT_FIX (default: on)
+    std::unique_ptr<ContextEntry> contextOverride;
+    auto* currentCtx = Context::current();
+    auto* currentRoot = Context::currentRoot();
+    bool isCurrentContextDestroyed =
+        (currentCtx != nullptr && currentCtx->isDestroyed()) || (currentRoot != nullptr && currentRoot->isDestroyed());
+    if (isCurrentContextDestroyed && Context::isDestroyedContextFixEnabled()) {
+        auto& jsContext = callContext.getContext();
+        auto treeIdValue = jsContext.getObjectProperty(rawRequest, std::string_view("treeId"), exceptionTracker);
+        CHECK_CALL_CONTEXT(callContext);
+        auto treeId = static_cast<ContextId>(jsContext.valueToInt(treeIdValue.get(), exceptionTracker));
+        CHECK_CALL_CONTEXT(callContext);
+        auto treeContext = _contextManager->getContext(treeId);
+        if (treeContext != nullptr && !treeContext->isDestroyed()) {
+            VALDI_INFO(*_logger,
+                       "Render request context fix: overriding destroyed context (current={}, root={}) with treeCtx={}",
+                       currentCtx != nullptr ? static_cast<int>(currentCtx->getContextId()) : -1,
+                       currentRoot != nullptr ? static_cast<int>(currentRoot->getContextId()) : -1,
+                       treeId);
+            contextOverride = std::make_unique<ContextEntry>(treeContext);
+        } else {
+            VALDI_WARN(*_logger,
+                       "Render request context fix: destroyed context (current={}, root={}) but tree context {} is {}",
+                       currentCtx != nullptr ? static_cast<int>(currentCtx->getContextId()) : -1,
+                       currentRoot != nullptr ? static_cast<int>(currentRoot->getContextId()) : -1,
+                       treeId,
+                       treeContext == nullptr ? "null" : "also destroyed");
+        }
+    }
+
     auto renderRequest = _runtimeDeserializers->deserializeRenderRequest(rawRequest, referenceInfo, exceptionTracker);
-    if (exceptionTracker && _listener != nullptr) {
-        _listener->receivedRenderRequest(renderRequest);
+    auto listener = getListener();
+    if (exceptionTracker && listener) {
+        listener->receivedRenderRequest(renderRequest);
     }
     if (callback != nullptr) {
         (*callback)();
@@ -859,12 +1068,19 @@ JSValueRef JavaScriptRuntime::runtimeSubmitRenderRequest(JSFunctionNativeCallCon
     return callContext.getContext().newUndefined();
 }
 
-// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 JSValueRef JavaScriptRuntime::runtimeTrace(JSFunctionNativeCallContext& callContext) {
     auto traceName = callContext.getParameterAsString(0);
     CHECK_CALL_CONTEXT(callContext);
 
     VALDI_TRACE_META("Valdi.jsTrace", traceName);
+
+    StringBox nativeCallName;
+    if (anrDiagnosticsActiveOnJsThread()) {
+        nativeCallName = anrNativeCallNameForTraceSpan(traceName);
+    }
+    // Nested inside the generic builtin activity so an ANR inside the traced callback names the
+    // span rather than "runtime.trace".
+    ScopedNativeCallActivity spanActivity(this, nativeCallName);
 
     auto subCallContext = callContext.makeSubContext(nullptr, 0);
 
@@ -901,19 +1117,28 @@ static double traceTimePointToEpochMicroseconds(const TraceTimePoint& timePoint)
     return static_cast<double>(asMicroseconds.count());
 }
 
-// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-JSValueRef JavaScriptRuntime::runtimeStopTraceRecording(JSFunctionNativeCallContext& callContext) {
+static JSValueRef stopTraceRecording(JSFunctionNativeCallContext& callContext, bool includeDroppedTraceEventCount) {
     auto id = static_cast<size_t>(callContext.getParameterAsInt(0));
     CHECK_CALL_CONTEXT(callContext);
 
-    auto traces = Tracer::shared().stopRecording(static_cast<size_t>(id));
-    std::sort(traces.begin(), traces.end(), [](const RecordedTrace& left, const RecordedTrace& right) -> bool {
-        return left.start < right.start;
-    });
+    TraceRecordingResult result;
+    if (includeDroppedTraceEventCount) {
+        result = Tracer::shared().stopRecordingWithStats(static_cast<size_t>(id));
+    } else {
+        result.traces = Tracer::shared().stopRecording(static_cast<size_t>(id));
+    }
+    std::sort(result.traces.begin(),
+              result.traces.end(),
+              [](const RecordedTrace& left, const RecordedTrace& right) -> bool { return left.start < right.start; });
 
     ValueArrayBuilder output;
+    if (includeDroppedTraceEventCount) {
+        const auto droppedTraceEventCount =
+            clampTraceDroppedEventCountForJavaScript(static_cast<uint64_t>(result.droppedTraceEventCount));
+        output.append(Value(static_cast<double>(droppedTraceEventCount)));
+    }
 
-    for (auto& trace : traces) {
+    for (auto& trace : result.traces) {
         output.append(Value(StringCache::getGlobal().makeString(std::move(trace.trace))));
 
         output.append(Value(traceTimePointToEpochMicroseconds(trace.start)));
@@ -928,14 +1153,24 @@ JSValueRef JavaScriptRuntime::runtimeStopTraceRecording(JSFunctionNativeCallCont
                           callContext.getExceptionTracker());
 }
 
+// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+JSValueRef JavaScriptRuntime::runtimeStopTraceRecording(JSFunctionNativeCallContext& callContext) {
+    return stopTraceRecording(callContext, false);
+}
+
+// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+JSValueRef JavaScriptRuntime::runtimeStopTraceRecordingWithStats(JSFunctionNativeCallContext& callContext) {
+    return stopTraceRecording(callContext, true);
+}
+
 JSValueRef JavaScriptRuntime::runtimeSubmitDebugMessage(JSFunctionNativeCallContext& callContext) {
     auto debugLevel = static_cast<int32_t>(callContext.getParameterAsInt(0));
     CHECK_CALL_CONTEXT(callContext);
     auto message = callContext.getParameterAsString(1);
     CHECK_CALL_CONTEXT(callContext);
 
-    if (_listener != nullptr) {
-        _listener->onDebugMessage(debugLevel, message);
+    if (auto listener = getListener()) {
+        listener->onDebugMessage(debugLevel, message);
     }
     return callContext.getContext().newUndefined();
 }
@@ -1002,14 +1237,19 @@ JSValueRef JavaScriptRuntime::runtimeGetNativeNodeForElementId(JSFunctionNativeC
     auto nodeId = static_cast<RawViewNodeId>(callContext.getParameterAsInt(1));
     CHECK_CALL_CONTEXT(callContext);
 
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
+        return callContext.getContext().newUndefined();
+    }
+
+    auto listener = getListener();
+    if (!listener) {
         return callContext.getContext().newUndefined();
     }
 
     auto output = Value::undefined();
 
-    _listener->resolveViewNodeTree(context, false, false, [&](const SharedViewNodeTree& viewNodeTree) {
+    listener->resolveViewNodeTree(context, false, false, [&](const SharedViewNodeTree& viewNodeTree) {
         auto viewNode = viewNodeTree->getViewNode(nodeId);
         if (viewNode != nullptr) {
             output = viewNode->toPlaformRepresentation(false);
@@ -1083,12 +1323,18 @@ JSValueRef JavaScriptRuntime::handleViewNodeSpecificAction(
         ReferenceInfoBuilder(callContext.getReferenceInfo()).withParameter(callbackParameterIndex),
         callContext.getExceptionTracker());
 
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         return callContext.throwError(Valdi::Error(STRING_FORMAT("Could not resolve Context {}", contextId)));
     }
 
-    _listener->resolveViewNodeTree(
+    auto listener = getListener();
+    if (!listener) {
+        return callContext.throwError(
+            Valdi::Error(STRING_FORMAT("No runtime listener to resolve ViewNodeTree of Context {}", contextId)));
+    }
+
+    listener->resolveViewNodeTree(
         context,
         true,
         true,
@@ -1290,6 +1536,15 @@ JSValueRef JavaScriptRuntime::loadJsModule(IJavaScriptContext& jsContext,
     snap::utils::time::StopWatch sw;
     sw.start();
 
+    StringBox nativeCallName;
+    if (anrDiagnosticsActiveOnJsThread()) {
+        nativeCallName =
+            StringCache::getGlobal().makeString(fmt::format("runtime.loadJsModule({})", importPath.toStringView()));
+    }
+    // Nested inside the generic builtin activity so a stall during module evaluation names the
+    // module being loaded rather than just "runtime.loadJsModule".
+    ScopedNativeCallActivity moduleLoadActivity(this, nativeCallName);
+
     auto resourceIdResult = JavaScriptPathResolver::resolveResourceId(importPath);
     if (!resourceIdResult) {
         exceptionTracker.onError(resourceIdResult.moveError());
@@ -1302,8 +1557,11 @@ JSValueRef JavaScriptRuntime::loadJsModule(IJavaScriptContext& jsContext,
     auto importPathStringView = importPath.toStringView();
     auto nativeModuleInfo = jsContext.getNativeModuleInfo(importPathStringView);
 
-    ptrdiff_t moduleMemoryUsage = 0;
-    ptrdiff_t childrenMemoryUsage = 0;
+    int64_t moduleDuration = 0;
+    int64_t childrenDuration = 0;
+
+    int64_t moduleMemoryUsage = 0;
+    int64_t childrenMemoryUsage = 0;
 
     if (nativeModuleInfo && _resourceManager.enableTSN() &&
         _resourceManager.enableTSNForModule(nativeModuleInfo.value().name)) {
@@ -1331,31 +1589,38 @@ JSValueRef JavaScriptRuntime::loadJsModule(IJavaScriptContext& jsContext,
             return jsContext.newUndefined();
         }
 
-        // Record memory watermark before load
-        auto waterMarkBefore = getMemoryUsageBytes();
+        // Record memory watermark and timestamp mark before load
+        auto memoryWaterMarkBefore = getMemoryUsageBytes();
+        auto timestampBefore = getCurrentTimestampMs();
+
         // 0 if the platform does not support querying memory usage
-        if (waterMarkBefore != 0) {
-            _moduleMemoryTracker.push_back({waterMarkBefore, 0});
+        if (memoryWaterMarkBefore != 0) {
+            _moduleResourceTracker.push_back({memoryWaterMarkBefore, 0, timestampBefore, 0});
         }
 
         result = loadJsModuleFromBytes(
             jsContext, jsFileContent.value().content, importPath, parameters, parametersLength, exceptionTracker);
 
-        if (waterMarkBefore != 0) {
-            // Compuete the memory usage: watermark_after - watermark_before
-            moduleMemoryUsage = getMemoryUsageBytes() - _moduleMemoryTracker.back().waterMark;
+        if (memoryWaterMarkBefore != 0) {
+            // Compute the memory usage: watermark_after - watermark_before
+            moduleMemoryUsage = getMemoryUsageBytes() - _moduleResourceTracker.back().memoryWaterMark;
+
+            // Compute the duration: timestamp_mark_after - timestamp_mark_before
+            moduleDuration = getCurrentTimestampMs() - _moduleResourceTracker.back().timestamp;
+
             // This module's children total (0 if no children)
-            childrenMemoryUsage = _moduleMemoryTracker.back().childrenConsumption;
-            _moduleMemoryTracker.pop_back();
-            if (!_moduleMemoryTracker.empty()) {
+            childrenMemoryUsage = _moduleResourceTracker.back().childrenMemoryUsage;
+            childrenDuration = _moduleResourceTracker.back().childrenDuration;
+            _moduleResourceTracker.pop_back();
+            if (!_moduleResourceTracker.empty()) {
                 // If we are not a top-level module, add usage to the parent module's children total
-                _moduleMemoryTracker.back().childrenConsumption += moduleMemoryUsage;
+                _moduleResourceTracker.back().childrenMemoryUsage += moduleMemoryUsage;
+                _moduleResourceTracker.back().childrenDuration += moduleDuration;
             }
             const auto& metrics = getMetrics();
             if (metrics != nullptr) {
-                metrics->emitLoadModuleMemory(importPath,
-                                              static_cast<int64_t>(moduleMemoryUsage),
-                                              static_cast<int64_t>(moduleMemoryUsage - childrenMemoryUsage));
+                metrics->emitLoadModuleMemory(importPath, moduleMemoryUsage, moduleMemoryUsage - childrenMemoryUsage);
+                metrics->emitLoadModuleDuration(importPath, moduleDuration, moduleDuration - childrenDuration);
             }
         }
     }
@@ -1368,12 +1633,15 @@ JSValueRef JavaScriptRuntime::loadJsModule(IJavaScriptContext& jsContext,
 
     if (Valdi::traceLoadModules) {
         VALDI_INFO(*_logger,
-                   "Loaded JS module {} in {} (load mode: {}) own memory usage: {} total memory usage: {}",
+                   "Loaded JS module {} in {} (load mode: {}) own memory usage: {} total memory usage: {} own "
+                   "duration: {} total duration: {}",
                    importPath,
                    sw.elapsed(),
                    moduleLoadModeToString(result.second),
                    moduleMemoryUsage - childrenMemoryUsage,
-                   moduleMemoryUsage);
+                   moduleMemoryUsage,
+                   moduleDuration - childrenDuration,
+                   moduleDuration);
     }
 
     return std::move(result.first);
@@ -1640,6 +1908,44 @@ JSValueRef JavaScriptRuntime::runtimeMakePlatformSpecificAsset(JSFunctionNativeC
     return makeWrappedObject(callContext.getContext(), asset, callContext.getExceptionTracker(), false);
 }
 
+JSValueRef JavaScriptRuntime::runtimeMakeThemableAsset(JSFunctionNativeCallContext& callContext) {
+    auto assetsByColorPaletteValue = callContext.getParameterAsValue(0);
+    CHECK_CALL_CONTEXT(callContext);
+
+    auto assetsByColorPaletteMap = assetsByColorPaletteValue.getMapRef();
+    if (assetsByColorPaletteMap == nullptr || assetsByColorPaletteMap->empty()) {
+        return callContext.throwError(Error("Invalid themable assets object specified"));
+    }
+
+    FlatMap<StringBox, Ref<Asset>> assetsByColorPalette;
+    for (const auto& assetByColorPalette : *assetsByColorPaletteMap) {
+        auto asset = AssetResolver::resolve(_resourceManager, assetByColorPalette.second);
+        if (asset == nullptr) {
+            return callContext.throwError(Error("Themable assets can only be created from URL or Valdi assets"));
+        }
+
+        assetsByColorPalette[assetByColorPalette.first] = asset;
+    }
+
+    auto asset = makeShared<ThemableAsset>(std::move(assetsByColorPalette));
+
+    return makeWrappedObject(callContext.getContext(), asset, callContext.getExceptionTracker(), false);
+}
+
+JSValueRef JavaScriptRuntime::runtimeGetLoadedAssetMetadata(JSFunctionNativeCallContext& callContext) {
+    auto loadedAsset = castOrNull<LoadedAsset>(callContext.getParameterAsWrappedObject(0));
+    CHECK_CALL_CONTEXT(callContext);
+
+    if (loadedAsset == nullptr) {
+        return callContext.throwError(Error("Invalid loaded asset"));
+    }
+
+    auto metadata = loadedAsset->getMetadata();
+
+    return valueToJSValue(
+        callContext.getContext(), metadata, ReferenceInfoBuilder(), callContext.getExceptionTracker());
+}
+
 JSValueRef JavaScriptRuntime::runtimeAddAssetLoadObserver(JSFunctionNativeCallContext& callContext) {
     auto assetValue = callContext.getParameterAsValue(0);
     CHECK_CALL_CONTEXT(callContext);
@@ -1750,15 +2056,36 @@ JSValueRef JavaScriptRuntime::runtimeGetAssets(JSFunctionNativeCallContext& call
     return assetsArray;
 }
 
-JSValueRef JavaScriptRuntime::runtimeSetColorPalette(JSFunctionNativeCallContext& callContext) {
+JSValueRef JavaScriptRuntime::runtimeConfigureColorPalette(JSFunctionNativeCallContext& callContext) {
     if (!_isWorker) {
-        auto colorPaletteMap = callContext.getParameterAsValue(0);
+        auto name = callContext.getParameterAsString(0);
+        CHECK_CALL_CONTEXT(callContext);
+        auto colorPaletteMap = callContext.getParameterAsValue(1);
         CHECK_CALL_CONTEXT(callContext);
 
-        dispatchOnMainThread([weakSelf = weakRef(this), colorPaletteMap = std::move(colorPaletteMap)]() {
+        dispatchOnMainThread([weakSelf = weakRef(this), name, colorPaletteMap = std::move(colorPaletteMap)]() {
             auto self = weakSelf.lock();
-            if (self && self->_listener != nullptr) {
-                self->_listener->updateColorPalette(colorPaletteMap);
+            if (self != nullptr) {
+                if (auto listener = self->getListener()) {
+                    listener->configureColorPalette(name, colorPaletteMap);
+                }
+            }
+        });
+    }
+    return callContext.getContext().newUndefined();
+}
+
+JSValueRef JavaScriptRuntime::runtimeSetActiveColorPalette(JSFunctionNativeCallContext& callContext) {
+    if (!_isWorker) {
+        auto name = callContext.getParameterAsString(0);
+        CHECK_CALL_CONTEXT(callContext);
+
+        dispatchOnMainThread([weakSelf = weakRef(this), name]() {
+            auto self = weakSelf.lock();
+            if (self != nullptr) {
+                if (auto listener = self->getListener()) {
+                    listener->setActiveColorPalette(name);
+                }
             }
         });
     }
@@ -1794,8 +2121,11 @@ JSValueRef JavaScriptRuntime::runtimeScheduleWorkItem(JSFunctionNativeCallContex
     auto delayMs = std::chrono::milliseconds(static_cast<int64_t>(delayResult));
 
     auto funcContext = func->getContext();
+    auto dispatchAttribution =
+        anrDiagnosticsEnabled() ? dispatchReasonName(JsThreadDispatchReason::ScheduleWorkItem) : StringBox();
     auto dispatchFunc = makeJsThreadDispatchFunction(
-        Ref(std::move(funcContext)), [func = std::move(func), interruptible](JavaScriptEntryParameters& jsEntry) {
+        Ref(std::move(funcContext)),
+        [func = std::move(func), interruptible](JavaScriptEntryParameters& jsEntry) {
             auto jsValue = func->getJsValue(jsEntry.jsContext, jsEntry.exceptionTracker);
             if (!jsEntry.exceptionTracker) {
                 if (interruptible) {
@@ -1806,7 +2136,8 @@ JSValueRef JavaScriptRuntime::runtimeScheduleWorkItem(JSFunctionNativeCallContex
 
             JSFunctionCallContext callContext(jsEntry.jsContext, nullptr, 0, jsEntry.exceptionTracker);
             jsEntry.jsContext.callObjectAsFunction(jsValue, callContext);
-        });
+        },
+        std::move(dispatchAttribution));
 
     task_id_t taskId = _dispatchQueue->asyncAfter(std::move(dispatchFunc), delayMs);
 
@@ -1907,6 +2238,17 @@ JSValueRef JavaScriptRuntime::runtimePerformGC(JSFunctionNativeCallContext& call
     dispatchPerformGcToWorkers();
     performGcNow(callContext.getContext());
     return callContext.getContext().newUndefined();
+}
+
+JSValueRef JavaScriptRuntime::runtimeNewWeakRef(JSFunctionNativeCallContext& callContext) {
+    // Engine-independent weak reference to a JS object (backs the standard WeakRef global
+    // installed by PostInit on engines without native support). Returns an opaque handle.
+    return callContext.getContext().newWeakRef(callContext.getParameter(0), callContext.getExceptionTracker());
+}
+
+JSValueRef JavaScriptRuntime::runtimeDerefWeakRef(JSFunctionNativeCallContext& callContext) {
+    // Returns the referenced object, or undefined once it has been collected.
+    return callContext.getContext().derefWeakRef(callContext.getParameter(0), callContext.getExceptionTracker());
 }
 
 JSValueRef JavaScriptRuntime::runtimeHeapDump(JSFunctionNativeCallContext& callContext) {
@@ -2010,6 +2352,13 @@ JSValueRef JavaScriptRuntime::runtimeCreateWorker(JSFunctionNativeCallContext& c
                                                        _anrDetector,
                                                        _logger,
                                                        true);
+    {
+        // Workers share the runtime listener so contexts created from a worker (e.g. managed
+        // context rendering) can resolve view node trees and submit render requests. Set before
+        // postInit so listener-backed runtime tweaks apply during initialization.
+        std::lock_guard<Mutex> guard(_listenerMutex);
+        workerRuntime->setListener(_listener, _listenerOwner);
+    }
     workerRuntime->postInit();
     for (const auto& moduleFactory : _moduleFactories) {
         workerRuntime->registerJavaScriptModuleFactory(moduleFactory);
@@ -2017,7 +2366,8 @@ JSValueRef JavaScriptRuntime::runtimeCreateWorker(JSFunctionNativeCallContext& c
     for (const auto& typeConverter : _typeConverters) {
         workerRuntime->registerTypeConverter(typeConverter.typeName, typeConverter.functionPath);
     }
-    auto worker = makeShared<JavaScriptWorker>(workerRuntime, callContext.getParameterAsString(0));
+    auto worker =
+        makeShared<JavaScriptWorker>(strongSmallRef(this), workerRuntime, callContext.getParameterAsString(0));
     worker->postInit();
     CHECK_CALL_CONTEXT(callContext);
     // worker->init(); // call outside of ctor so that shared_from_this() is available
@@ -2041,7 +2391,10 @@ JSValueRef JavaScriptRuntime::runtimeCreateWorker(JSFunctionNativeCallContext& c
                         "terminate",
                         &JavaScriptRuntime::workerTerminate);
     CHECK_CALL_CONTEXT(callContext);
-    _jsWorkers.emplace_back(weakRef(workerRuntime.get()));
+    {
+        std::lock_guard<Mutex> guard(_jsWorkersMutex);
+        _jsWorkers.emplace_back(weakRef(workerRuntime.get()));
+    }
     return workerJSValue;
 }
 
@@ -2065,18 +2418,34 @@ Ref<T> thisFromCallContext(JSFunctionNativeCallContext& callContext) {
 JSValueRef JavaScriptRuntime::workerSetOnMessage(JSFunctionNativeCallContext& callContext) {
     auto worker = thisFromCallContext<JavaScriptWorker>(callContext);
     if (worker != nullptr) {
-        worker->setHostOnMessage(callContext.getParameterAsFunction(0));
+        auto callbackValue = callContext.getParameter(0);
+        if (!callContext.getContext().isValueFunction(callbackValue)) {
+            return callContext.throwError(Error("Expecting Worker onmessage function"));
+        }
+        auto callback =
+            JSValueRefHolder::makeRetainedCallback(callContext.getContext(),
+                                                   callbackValue,
+                                                   ReferenceInfoBuilder().withProperty(STRING_LITERAL("onmessage")),
+                                                   callContext.getExceptionTracker());
         CHECK_CALL_CONTEXT(callContext);
+        worker->setHostOnMessage(std::move(callback));
     }
     return callContext.getContext().newUndefined();
 }
 
-// worker.postMessage(any)
+// worker.postMessage(any, MessagePort[] | undefined)
 JSValueRef JavaScriptRuntime::workerPostMessage(JSFunctionNativeCallContext& callContext) {
     auto worker = thisFromCallContext<JavaScriptWorker>(callContext);
     if (worker != nullptr) {
-        worker->postMessage(callContext.getParameterAsValue(0));
+        auto data = callContext.getParameterAsValue(0);
         CHECK_CALL_CONTEXT(callContext);
+        auto transfer = callContext.getParameterSize() > 1 ? callContext.getParameterAsValue(1) : Value::undefined();
+        CHECK_CALL_CONTEXT(callContext);
+        auto message = JavaScriptMessage::make(data, transfer, nullptr);
+        if (!message) {
+            return callContext.throwError(message.moveError());
+        }
+        worker->postMessage(message.moveValue());
     }
     return callContext.getContext().newUndefined();
 }
@@ -2085,7 +2454,7 @@ JSValueRef JavaScriptRuntime::workerPostMessage(JSFunctionNativeCallContext& cal
 JSValueRef JavaScriptRuntime::workerTerminate(JSFunctionNativeCallContext& callContext) {
     auto worker = thisFromCallContext<JavaScriptWorker>(callContext);
     if (worker != nullptr) {
-        worker->close();
+        worker->terminate();
     }
     return callContext.getContext().newUndefined();
 }
@@ -2142,6 +2511,13 @@ void JavaScriptRuntime::buildContext(Valdi::IJavaScriptContext& context,
         return;
     }
 
+    auto jsApiVersion = context.newNumber(_resourceManager.getApiVersion());
+
+    context.setObjectProperty(runtimeObject.get(), "apiVersion", jsApiVersion.get(), exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+
     auto jsEnableDebugger = context.newBool(_enableDebugger);
 
     context.setObjectProperty(runtimeObject.get(), "isDebugEnabled", jsEnableDebugger.get(), exceptionTracker);
@@ -2154,6 +2530,23 @@ void JavaScriptRuntime::buildContext(Valdi::IJavaScriptContext& context,
     }
 
     context.setObjectProperty(runtimeObject.get(), "buildType", buildType.get(), exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+
+    // Expose isLoggingEnabled to JS. Disabled in appstore builds, always enabled otherwise.
+    bool isLoggingEnabled = !snap::kIsAppstoreBuild;
+    auto jsIsLoggingEnabled = context.newBool(isLoggingEnabled);
+    context.setObjectProperty(runtimeObject.get(), "isLoggingEnabled", jsIsLoggingEnabled.get(), exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+
+    // Gate top-down move order behind VALDI_MAX_VIEW_OPERATIONS_PROCESSING_TIME (same as view-op throttling).
+    bool useTopDownMoveOrder = tweaks != nullptr && tweaks->useTopDownMoveOrder();
+    auto jsUseTopDownMoveOrder = context.newBool(useTopDownMoveOrder);
+    context.setObjectProperty(
+        runtimeObject.get(), "useTopDownMoveOrder", jsUseTopDownMoveOrder.get(), exceptionTracker);
     if (!exceptionTracker) {
         return;
     }
@@ -2202,7 +2595,10 @@ void JavaScriptRuntime::buildContext(Valdi::IJavaScriptContext& context,
 
     JS_BIND(context, exceptionTracker, runtimeObject, "makeDirectionalAsset", runtimeMakeDirectionalAsset);
     JS_BIND(context, exceptionTracker, runtimeObject, "makePlatformSpecificAsset", runtimeMakePlatformSpecificAsset);
-    JS_BIND(context, exceptionTracker, runtimeObject, "setColorPalette", runtimeSetColorPalette);
+    JS_BIND(context, exceptionTracker, runtimeObject, "makeThemableAsset", runtimeMakeThemableAsset);
+    JS_BIND(context, exceptionTracker, runtimeObject, "getLoadedAssetMetadata", runtimeGetLoadedAssetMetadata);
+    JS_BIND(context, exceptionTracker, runtimeObject, "configureColorPalette", runtimeConfigureColorPalette);
+    JS_BIND(context, exceptionTracker, runtimeObject, "setActiveColorPalette", runtimeSetActiveColorPalette);
     JS_BIND(context, exceptionTracker, runtimeObject, "onMainThreadIdle", runtimeOnMainThreadIdle);
     JS_BIND(context, exceptionTracker, runtimeObject, "createWorker", runtimeCreateWorker);
 
@@ -2241,12 +2637,16 @@ void JavaScriptRuntime::buildContext(Valdi::IJavaScriptContext& context,
 
     JS_BIND(context, exceptionTracker, runtimeObject, "startTraceRecording", runtimeStartTraceRecording);
     JS_BIND(context, exceptionTracker, runtimeObject, "stopTraceRecording", runtimeStopTraceRecording);
+    JS_BIND(
+        context, exceptionTracker, runtimeObject, "stopTraceRecordingWithStats", runtimeStopTraceRecordingWithStats);
 
     JS_BIND(context, exceptionTracker, runtimeObject, "scheduleWorkItem", runtimeScheduleWorkItem);
     JS_BIND(context, exceptionTracker, runtimeObject, "unscheduleWorkItem", runtimeUnscheduleWorkItem);
 
     JS_BIND(context, exceptionTracker, runtimeObject, "dumpMemoryStatistics", runtimeDumpMemoryStatistics);
     JS_BIND(context, exceptionTracker, runtimeObject, "performGC", runtimePerformGC);
+    JS_BIND(context, exceptionTracker, runtimeObject, "newWeakRef", runtimeNewWeakRef);
+    JS_BIND(context, exceptionTracker, runtimeObject, "derefWeakRef", runtimeDerefWeakRef);
 
     JS_BIND(
         context, exceptionTracker, runtimeObject, "setUncaughtExceptionHandler", runtimeSetUncaughtExceptionHandler);
@@ -2258,6 +2658,23 @@ void JavaScriptRuntime::buildContext(Valdi::IJavaScriptContext& context,
     }
 
     context.setObjectProperty(globalObject.get(), "runtime", runtimeObject.get(), exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+
+    auto messagePortClass = JavaScriptMessagePort::makeClass(context, exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+    context.setObjectProperty(globalObject.get(), "MessagePort", messagePortClass.get(), exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+    auto messageChannelClass = JavaScriptMessageChannel::makeClass(context, exceptionTracker);
+    if (!exceptionTracker) {
+        return;
+    }
+    context.setObjectProperty(globalObject.get(), "MessageChannel", messageChannelClass.get(), exceptionTracker);
     if (!exceptionTracker) {
         return;
     }
@@ -2316,13 +2733,14 @@ void JavaScriptRuntime::requestUpdateJsContextHandler(JavaScriptEntryParameters&
 }
 
 std::vector<Ref<JavaScriptRuntime>> JavaScriptRuntime::getAllWorkers() {
+    std::lock_guard<Mutex> guard(_jsWorkersMutex);
     std::vector<Ref<JavaScriptRuntime>> out;
     out.reserve(_jsWorkers.size());
 
     auto it = _jsWorkers.begin();
     while (it != _jsWorkers.end()) {
         auto jsWorker = it->lock();
-        if (jsWorker != nullptr) {
+        if (jsWorker != nullptr && !jsWorker->isDisposed()) {
             out.emplace_back(std::move(jsWorker));
             it++;
         } else {
@@ -2340,7 +2758,8 @@ void JavaScriptRuntime::dispatchPerformGcToWorkers() {
 }
 
 void JavaScriptRuntime::performGc() {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::PerformGc;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         dispatchPerformGcToWorkers();
         performGcNow(entry.jsContext);
     });
@@ -2349,8 +2768,16 @@ void JavaScriptRuntime::performGc() {
 JavaScriptContextMemoryStatistics JavaScriptRuntime::dumpMemoryStatistics() {
     JavaScriptContextMemoryStatistics stats;
     dispatchSynchronouslyOnJsThread(
+        JsThreadDispatchReason::DumpMemoryStatistics,
         [=, &stats](JavaScriptEntryParameters& entry) { stats = this->dumpMemoryStatistics(entry.jsContext); });
     return stats;
+}
+
+void JavaScriptRuntime::dumpMemoryStatisticsAsync(Function<void(JavaScriptContextMemoryStatistics)> completion) {
+    constexpr auto reason = JsThreadDispatchReason::DumpMemoryStatistics;
+    dispatchOnJsThreadAsync(reason, [this, completion](JavaScriptEntryParameters& entry) {
+        completion(this->dumpMemoryStatistics(entry.jsContext));
+    });
 }
 
 Shared<JavaScriptModuleContainer> JavaScriptRuntime::getValdiModule(JavaScriptEntryParameters& jsEntry) {
@@ -2364,7 +2791,7 @@ void JavaScriptRuntime::ensureValdiModuleIsLoaded(JavaScriptEntryParameters& jsE
 bool JavaScriptRuntime::callComponentFunction(ContextId contextId,
                                               const StringBox& functionName,
                                               const Ref<ValueArray>& additionalParameters) {
-    auto context = _contextManager.getContext(contextId);
+    auto context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         return false;
     }
@@ -2387,7 +2814,8 @@ void JavaScriptRuntime::callComponentFunction(const Ref<Context>& context,
 void JavaScriptRuntime::callModuleFunction(const StringBox& module,
                                            const StringBox& functionName,
                                            const Ref<ValueArray>& parameters) {
-    dispatchOnJsThreadAsync(nullptr, [this, module, functionName, parameters](auto& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::CallModuleFunction;
+    dispatchOnJsThreadAsync(reason, [this, module, functionName, parameters](auto& jsEntry) {
         auto importResult = this->importModule(module, jsEntry);
         if (!jsEntry.exceptionTracker) {
             return;
@@ -2576,7 +3004,8 @@ void JavaScriptRuntime::onModuleUnloaded(const ResourceId& resourceId, JavaScrip
 }
 
 void JavaScriptRuntime::unloadAllModules() {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::UnloadAllModules;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         if (!_modules.empty()) {
             std::vector<ResourceId> resourceIds;
             for (const auto& it : _modules) {
@@ -2593,7 +3022,8 @@ void JavaScriptRuntime::unloadAllModules() {
 void JavaScriptRuntime::unloadUnusedModules(const Ref<AsyncGroup>& completionGroup) {
     completionGroup->enter();
 
-    dispatchOnJsThreadUnattributed([this, completionGroup = completionGroup](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::UnloadUnusedModules;
+    dispatchOnJsThreadAsync(reason, [this, completionGroup = completionGroup](JavaScriptEntryParameters& entry) {
         for (const auto& jsWorker : getAllWorkers()) {
             jsWorker->unloadUnusedModules(completionGroup);
         }
@@ -2630,7 +3060,7 @@ void JavaScriptRuntime::unloadUnusedModules(DispatchFunction completion) {
 
 FlatSet<ResourceId> JavaScriptRuntime::getAllUsedModules() const {
     FlatSet<ResourceId> allUsedModules;
-    for (const auto& context : _contextManager.getAllContexts()) {
+    for (const auto& context : _contextManager->getAllContexts()) {
         allUsedModules.insert(context->getPath().getResourceId());
     }
     for (const auto& it : _modules) {
@@ -2674,7 +3104,8 @@ bool JavaScriptRuntime::isInEvalMode() const {
 }
 
 void JavaScriptRuntime::reevalUnloadedModulesIfNeeded() {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::ReevalUnloadedModules;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         auto it = _pendingModulesToReload.begin();
         while (it != _pendingModulesToReload.end()) {
             importModule(*it, entry);
@@ -2689,7 +3120,8 @@ void JavaScriptRuntime::reevalUnloadedModulesIfNeeded() {
 
 void JavaScriptRuntime::unloadModulesAndDependentModules(const std::vector<ResourceId>& resourceIds,
                                                          bool isHotReloading) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::UnloadModulesAndDependents;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         for (const auto& jsWorker : getAllWorkers()) {
             jsWorker->unloadModulesAndDependentModules(resourceIds, isHotReloading);
         }
@@ -2704,7 +3136,7 @@ void JavaScriptRuntime::unloadModulesAndDependentModules(const std::vector<Resou
 bool JavaScriptRuntime::isJsModuleLoaded(const ResourceId& resourceId) {
     bool loaded = false;
 
-    dispatchSynchronouslyOnJsThread([&](JavaScriptEntryParameters& entry) {
+    dispatchSynchronouslyOnJsThread(JsThreadDispatchReason::IsJsModuleLoaded, [&](JavaScriptEntryParameters& entry) {
         auto pathResult = entry.jsContext.newStringUTF8(resourceId.toAbsolutePath(), entry.exceptionTracker);
         if (!entry.exceptionTracker) {
             onRecoverableError("isJsModuleLoaded", entry.exceptionTracker);
@@ -2741,8 +3173,9 @@ void JavaScriptRuntime::doUnloadModulesAndDependentModules(const std::vector<Res
     }
 
     bool disableHotReloaderLazyDenylist = false;
-    if (isHotReloading && _listener != nullptr) {
-        auto runtimeTweaks = _listener->getRuntimeTweaks();
+    auto listener = getListener();
+    if (isHotReloading && listener) {
+        auto runtimeTweaks = listener->getRuntimeTweaks();
         if (runtimeTweaks != nullptr) {
             disableHotReloaderLazyDenylist = runtimeTweaks->disableHotReloaderLazyDenylist();
         }
@@ -2819,7 +3252,8 @@ void JavaScriptRuntime::onModulesUnloaded(const JSValue& value,
 }
 
 void JavaScriptRuntime::registerJavaScriptModuleFactory(const Ref<JavaScriptModuleFactory>& moduleFactory) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::RegisterModuleFactory;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         _moduleFactories.push_back(moduleFactory);
         auto modulePath = moduleFactory->getModulePath();
         auto pathResult = entry.jsContext.newStringUTF8(modulePath.toStringView(), entry.exceptionTracker);
@@ -2856,7 +3290,8 @@ void JavaScriptRuntime::registerJavaScriptModuleFactory(const Ref<JavaScriptModu
 }
 
 void JavaScriptRuntime::registerTypeConverter(const StringBox& typeName, const StringBox& functionPath) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::RegisterTypeConverter;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& jsEntry) {
         auto parsedPath = ComponentPath::parse(functionPath);
 
         auto importResult = this->importModule(parsedPath.getResourceId(), jsEntry);
@@ -2966,11 +3401,31 @@ void JavaScriptRuntime::onUnhandledRejectedPromise(IJavaScriptContext& jsContext
 }
 
 Ref<JSStackTraceProvider> JavaScriptRuntime::captureCurrentStackTrace() {
-    if (_javaScriptContext == nullptr || !_enableStackTraceCapture) {
+    if (_javaScriptContext == nullptr) {
+        return nullptr;
+    }
+
+    // Debugger and force flags always enable stack trace capture
+    bool shouldCapture = _forceStackTraceCapture || _enableDebugger;
+
+    auto listener = getListener();
+    if (!shouldCapture && listener && isInJsThread()) {
+        auto currentContext = Context::currentRef();
+        if (currentContext != nullptr && !currentContext->getScopeName().isEmpty()) {
+            auto runtimeTweaks = listener->getRuntimeTweaks();
+            shouldCapture = runtimeTweaks != nullptr && runtimeTweaks->enableScopedContextStackTraceCapture();
+        }
+    }
+
+    if (!shouldCapture) {
         return nullptr;
     }
 
     return doCaptureCurrentStackTrace(*_javaScriptContext);
+}
+
+void JavaScriptRuntime::setForceStackTraceCapture(bool force) {
+    _forceStackTraceCapture = force;
 }
 
 Ref<JSStackTraceProvider> JavaScriptRuntime::doCaptureCurrentStackTrace(IJavaScriptContext& jsContext) {
@@ -2998,7 +3453,7 @@ JavaScriptContextMemoryStatistics JavaScriptRuntime::dumpMemoryStatistics(IJavaS
 
 Result<Value> JavaScriptRuntime::evaluateScript(const BytesView& script, const StringBox& sourceFilename) {
     Result<Value> result;
-    dispatchSynchronouslyOnJsThread([&](JavaScriptEntryParameters& jsEntry) {
+    dispatchSynchronouslyOnJsThread(JsThreadDispatchReason::EvaluateScript, [&](JavaScriptEntryParameters& jsEntry) {
         auto loadResult =
             loadJsModuleFromBytes(jsEntry.jsContext, script, sourceFilename, nullptr, 0, jsEntry.exceptionTracker);
 
@@ -3029,7 +3484,7 @@ Result<Void> JavaScriptRuntime::evalModuleSync(const StringBox& path, bool reeva
 
     Result<Void> result = Void();
 
-    dispatchSynchronouslyOnJsThread([&](JavaScriptEntryParameters& jsEntry) {
+    dispatchSynchronouslyOnJsThread(JsThreadDispatchReason::EvalModuleSync, [&](JavaScriptEntryParameters& jsEntry) {
         if (reevalOnReload) {
             _modulesToAutoReload.insert(resourceIdResult.value());
         }
@@ -3048,7 +3503,7 @@ Result<Void> JavaScriptRuntime::evalModuleSync(const StringBox& path, bool reeva
 }
 
 int32_t JavaScriptRuntime::pushModuleToMarshaller(
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     const Valdi::StringBox& path,
     int64_t marshallerHandle) {
     auto marshaller = reinterpret_cast<Marshaller*>(marshallerHandle);
@@ -3056,11 +3511,14 @@ int32_t JavaScriptRuntime::pushModuleToMarshaller(
 }
 
 int32_t JavaScriptRuntime::pushModuleToMarshaller(
-    const /*not-null*/ std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const /*not-null*/ std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     const Valdi::StringBox& path,
     Marshaller& marshaller) {
     int32_t retValue = 0;
-    dispatchOnJsThreadSync(nullptr, [&](JavaScriptEntryParameters& jsEntry) {
+    bool taskRan = false;
+    constexpr auto reason = JsThreadDispatchReason::PushModuleToMarshaller;
+    dispatchOnJsThreadSync(reason, [&](JavaScriptEntryParameters& jsEntry) {
+        taskRan = true;
         auto importResult = this->importModule(path, jsEntry);
         if (!jsEntry.exceptionTracker) {
             marshaller.getExceptionTracker().onError(jsEntry.exceptionTracker.extractError());
@@ -3087,11 +3545,28 @@ int32_t JavaScriptRuntime::pushModuleToMarshaller(
         }
     });
 
+    if (!taskRan) {
+        // JS-thread tasks are dropped once the runtime is disposed/torn down (e.g. logout). Report
+        // that as a module-resolution error instead of leaving the slot empty: an empty slot
+        // unmarshals as 'undefined' and surfaces as a misleading conversion failure at the call
+        // site.
+        //
+        // The distinguishable teardown code lets a marshalling boundary degrade gracefully rather
+        // than raise. The kill switch omits the code (reverting to the plain raising behavior) so the
+        // degrade can be disabled remotely without a rebuild. It reads _resolutionTeardownDegradeEnabled,
+        // which Runtime::setRuntimeTweaks keeps in sync with the COF-backed tweak — the listener is
+        // already detached by the time this branch runs, so it can't be read through it here.
+        int32_t errorCode = _resolutionTeardownDegradeEnabled ? kResolutionSkippedDuringTeardownErrorCode : 0;
+        marshaller.getExceptionTracker().onError(
+            Error(STRING_FORMAT("Cannot load module '{}': the JS runtime has been destroyed", path), errorCode));
+    }
+
     return retValue;
 }
 
 void JavaScriptRuntime::addModuleUnloadObserver(const Valdi::StringBox& path, const Valdi::Value& observer) {
-    dispatchOnJsThreadAsync(nullptr, [this, path, observer](JavaScriptEntryParameters& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::AddModuleUnloadObserver;
+    dispatchOnJsThreadAsync(reason, [this, path, observer](JavaScriptEntryParameters& jsEntry) {
         auto importResult = this->importModule(path, jsEntry);
         if (!jsEntry.exceptionTracker) {
             onRecoverableError("getModule", jsEntry.exceptionTracker);
@@ -3103,7 +3578,8 @@ void JavaScriptRuntime::addModuleUnloadObserver(const Valdi::StringBox& path, co
 }
 
 void JavaScriptRuntime::preloadModule(const StringBox& path, int32_t maxDepth) {
-    dispatchOnJsThreadAsync(nullptr, [=](JavaScriptEntryParameters& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::PreloadModule;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& jsEntry) {
         VALDI_TRACE_META("Valdi.preloadModule", path);
 
         std::initializer_list<JSValueRef> params = {
@@ -3121,14 +3597,63 @@ void JavaScriptRuntime::preloadModule(const StringBox& path, int32_t maxDepth) {
     });
 }
 
-std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager> JavaScriptRuntime::createNativeObjectsManager() {
-    auto context = _contextManager.createContext(nullptr, nullptr, /* deferRender */ true);
+void JavaScriptRuntime::preloadModules(const std::vector<StringBox>& paths, int32_t maxDepth) {
+    _resourceManager.warmUpBundles(paths);
 
-    return makeShared<JSRuntimeNativeObjectsManagerImpl>(_contextManager, std::move(context));
+    // Read the yield chunk size live (not an init-time snapshot) so a COF ramp takes effect on the
+    // next capture without an app restart, and so it is unaffected by runtime-init vs
+    // config-availability ordering. 0 = evaluate the batch as a single uninterrupted task (default).
+    int32_t chunkSize = 0;
+    if (auto listener = getListener()) {
+        auto runtimeTweaks = listener->getRuntimeTweaks();
+        if (runtimeTweaks != nullptr) {
+            chunkSize = runtimeTweaks->preloadYieldChunkSize();
+        }
+    }
+
+    constexpr auto reason = JsThreadDispatchReason::PreloadModules;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& jsEntry) {
+        VALDI_TRACE("Valdi.preloadModules");
+
+        auto pathsArray =
+            jsEntry.jsContext.newArrayWithValues(paths.size(), jsEntry.exceptionTracker, [&](size_t i) -> JSValueRef {
+                return jsEntry.jsContext.newStringUTF8(paths[i].toStringView(), jsEntry.exceptionTracker);
+            });
+
+        if (!jsEntry.exceptionTracker) {
+            return;
+        }
+
+        // Third arg (chunkSize) is optional in ModuleLoader.preloadBatch; 0 preserves the original
+        // single-task evaluation. > 0 makes it yield between chunks so the watchdog ack can run.
+        std::initializer_list<JSValueRef> params = {
+            pathsArray, jsEntry.jsContext.newNumber(maxDepth), jsEntry.jsContext.newNumber(chunkSize)};
+
+        JSFunctionCallContext callContext(jsEntry.jsContext, params.begin(), params.size(), jsEntry.exceptionTracker);
+
+        jsEntry.jsContext.callObjectProperty(
+            _moduleLoader.get(), _propertyNameIndex.getJsName(kPreloadBatchPropertyName), callContext);
+    });
+}
+
+void JavaScriptRuntime::warmUpValueMarshaller(const Value& value) {
+    constexpr auto reason = JsThreadDispatchReason::WarmUpValueMarshaller;
+    dispatchOnJsThreadAsync(reason, [value](JavaScriptEntryParameters& jsEntry) {
+        VALDI_TRACE("Valdi.warmUpValueMarshaller");
+        valueToJSValue(jsEntry.jsContext, value, ReferenceInfoBuilder(), jsEntry.exceptionTracker);
+    });
+}
+
+std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager> JavaScriptRuntime::createNativeObjectsManager(
+    const std::string& scopeName) {
+    auto scopeNameBox = scopeName.empty() ? StringBox() : StringCache::getGlobal().makeString(scopeName);
+    auto context = _contextManager->createContext(nullptr, nullptr, /* deferRender */ true, scopeNameBox);
+
+    return makeShared<JSRuntimeNativeObjectsManagerImpl>(*_contextManager, std::move(context));
 }
 
 void JavaScriptRuntime::destroyNativeObjectsManager(
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager) {
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager) {
     auto* impl = dynamic_cast<JSRuntimeNativeObjectsManagerImpl*>(nativeObjectsManager.get());
     dispatchOnJsThread(
         impl->getContext(), JavaScriptTaskScheduleTypeDefault, 0, [nativeObjectsManager](auto& /*jsEntry*/) {
@@ -3137,7 +3662,7 @@ void JavaScriptRuntime::destroyNativeObjectsManager(
         });
 }
 
-std::shared_ptr<snap::valdi::JSRuntime> JavaScriptRuntime::createWorker() {
+std::shared_ptr<snap::valdi_core::JSRuntime> JavaScriptRuntime::createWorker() {
     auto workerRuntime = makeShared<JavaScriptRuntime>(_javaScriptBridge,
                                                        _resourceManager,
                                                        _contextManager,
@@ -3149,6 +3674,13 @@ std::shared_ptr<snap::valdi::JSRuntime> JavaScriptRuntime::createWorker() {
                                                        _anrDetector,
                                                        _logger,
                                                        true);
+    {
+        // Workers share the runtime listener so contexts created from a worker (e.g. managed
+        // context rendering) can resolve view node trees and submit render requests. Set before
+        // postInit so listener-backed runtime tweaks apply during initialization.
+        std::lock_guard<Mutex> guard(_listenerMutex);
+        workerRuntime->setListener(_listener, _listenerOwner);
+    }
     workerRuntime->postInit();
     for (const auto& moduleFactory : _moduleFactories) {
         workerRuntime->registerJavaScriptModuleFactory(moduleFactory);
@@ -3156,12 +3688,15 @@ std::shared_ptr<snap::valdi::JSRuntime> JavaScriptRuntime::createWorker() {
     for (const auto& typeConverter : _typeConverters) {
         workerRuntime->registerTypeConverter(typeConverter.typeName, typeConverter.functionPath);
     }
-    _jsWorkers.emplace_back(weakRef(workerRuntime.get()));
-    return std::dynamic_pointer_cast<snap::valdi::JSRuntime>(*workerRuntime->getInnerSharedPtr());
+    {
+        std::lock_guard<Mutex> guard(_jsWorkersMutex);
+        _jsWorkers.emplace_back(weakRef(workerRuntime.get()));
+    }
+    return std::dynamic_pointer_cast<snap::valdi_core::JSRuntime>(*workerRuntime->getInnerSharedPtr());
 }
 
 void JavaScriptRuntime::runOnJsThread(const Value& runnable) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    dispatchOnJsThreadAsync(STRING_LITERAL("runtime.runOnJsThread"), [=](JavaScriptEntryParameters& entry) {
         auto* func = runnable.getFunction();
         if (func != nullptr) {
             (*func)();
@@ -3170,7 +3705,8 @@ void JavaScriptRuntime::runOnJsThread(const Value& runnable) {
 }
 
 void JavaScriptRuntime::daemonClientConnected(const Shared<IDaemonClient>& daemonClient) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::DaemonClientConnected;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& jsEntry) {
         Value wrappedDaemonClient;
 
         wrappedDaemonClient.setMapValue("connectionId", Value(daemonClient->getConnectionId()));
@@ -3218,7 +3754,8 @@ void JavaScriptRuntime::daemonClientConnected(const Shared<IDaemonClient>& daemo
 }
 
 void JavaScriptRuntime::daemonClientDisconnected(const Shared<IDaemonClient>& daemonClient) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::DaemonClientDisconnected;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& jsEntry) {
         const auto& it = _daemonClients.find(daemonClient->getConnectionId());
         if (it != _daemonClients.end()) {
             auto daemonClientJs = it->second;
@@ -3236,7 +3773,8 @@ void JavaScriptRuntime::daemonClientDisconnected(const Shared<IDaemonClient>& da
 void JavaScriptRuntime::daemonClientDidReceiveClientPayload(const Shared<IDaemonClient>& daemonClient,
                                                             int senderClientId,
                                                             const BytesView& payload) {
-    dispatchOnJsThreadUnattributed([=](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::DaemonClientPayload;
+    dispatchOnJsThreadAsync(reason, [=](JavaScriptEntryParameters& entry) {
         const auto& it = _daemonClients.find(daemonClient->getConnectionId());
         if (it != _daemonClients.end()) {
             auto payloadString = entry.jsContext.newStringUTF8(payload.asStringView(), entry.exceptionTracker);
@@ -3313,15 +3851,16 @@ void JavaScriptRuntime::notifyDaemonClientEvent(IJavaScriptContext& jsContext,
 }
 
 void JavaScriptRuntime::setDefaultViewManagerContext(const Ref<ViewManagerContext>& viewManagerContext) {
-    dispatchOnJsThreadUnattributed([=](auto& /*entry*/) { _defaultViewManagerContext = viewManagerContext; });
+    constexpr auto reason = JsThreadDispatchReason::SetDefaultViewManagerContext;
+    dispatchOnJsThreadAsync(reason, [=](auto& /*entry*/) { _defaultViewManagerContext = viewManagerContext; });
 }
 
 std::future<Result<DumpedLogs>> JavaScriptRuntime::dumpLogs(bool includeMetadata, bool includeVerbose) {
     auto promise = Valdi::makeShared<std::promise<Result<DumpedLogs>>>();
     auto future = promise->get_future();
 
-    dispatchOnJsThreadUnattributed([promise, this, includeMetadata, includeVerbose](
-                                       JavaScriptEntryParameters& jsEntry) {
+    constexpr auto reason = JsThreadDispatchReason::DumpLogs;
+    JavaScriptThreadTask task = [promise, this, includeMetadata, includeVerbose](JavaScriptEntryParameters& jsEntry) {
         auto bugReportModule = importModule(STRING_LITERAL("valdi_core/src/BugReporter"), jsEntry);
         if (!jsEntry.exceptionTracker) {
             promise->set_value(jsEntry.exceptionTracker.extractError());
@@ -3385,7 +3924,8 @@ std::future<Result<DumpedLogs>> JavaScriptRuntime::dumpLogs(bool includeMetadata
             }
         }
         promise->set_value(std::move(logs));
-    });
+    };
+    dispatchOnJsThreadAsync(reason, std::move(task));
 
     return future;
 }
@@ -3473,7 +4013,7 @@ void JavaScriptRuntime::lockNextWorker(std::vector<IJavaScriptContext*>& jsConte
 
 void JavaScriptRuntime::lockAllJSContexts(std::vector<IJavaScriptContext*>& jsContexts,
                                           const DispatchFunction& onDone) {
-    dispatchSynchronouslyOnJsThread([&](JavaScriptEntryParameters& jsEntry) {
+    dispatchSynchronouslyOnJsThread(JsThreadDispatchReason::LockAllJSContexts, [&](JavaScriptEntryParameters& jsEntry) {
         jsContexts.emplace_back(&jsEntry.jsContext);
 
         auto jsWorkers = getAllWorkers();
@@ -3482,16 +4022,127 @@ void JavaScriptRuntime::lockAllJSContexts(std::vector<IJavaScriptContext*>& jsCo
     });
 }
 
-void JavaScriptRuntime::dispatchOnJsThreadUnattributed(JavaScriptThreadTask&& function) {
-    dispatchOnJsThread(nullptr, JavaScriptTaskScheduleTypeDefault, 0, std::move(function));
+static StringBox dispatchReasonName(JsThreadDispatchReason reason) {
+    switch (reason) {
+        case JsThreadDispatchReason::SetValueToGlobalObject:
+            return STRING_LITERAL("runtime.setValueToGlobalObject");
+        case JsThreadDispatchReason::PerformGc:
+            return STRING_LITERAL("runtime.performGc");
+        case JsThreadDispatchReason::DumpMemoryStatistics:
+            return STRING_LITERAL("runtime.dumpMemoryStatistics");
+        case JsThreadDispatchReason::UnloadAllModules:
+            return STRING_LITERAL("runtime.unloadAllModules");
+        case JsThreadDispatchReason::UnloadUnusedModules:
+            return STRING_LITERAL("runtime.unloadUnusedModules");
+        case JsThreadDispatchReason::ReevalUnloadedModules:
+            return STRING_LITERAL("runtime.reevalUnloadedModulesIfNeeded");
+        case JsThreadDispatchReason::UnloadModulesAndDependents:
+            return STRING_LITERAL("runtime.unloadModulesAndDependentModules");
+        case JsThreadDispatchReason::IsJsModuleLoaded:
+            return STRING_LITERAL("runtime.isJsModuleLoaded");
+        case JsThreadDispatchReason::EvaluateScript:
+            return STRING_LITERAL("runtime.evaluateScript");
+        case JsThreadDispatchReason::EvalModuleSync:
+            return STRING_LITERAL("runtime.evalModuleSync");
+        case JsThreadDispatchReason::RegisterModuleFactory:
+            return STRING_LITERAL("runtime.registerJavaScriptModuleFactory");
+        case JsThreadDispatchReason::RegisterTypeConverter:
+            return STRING_LITERAL("runtime.registerTypeConverter");
+        case JsThreadDispatchReason::CallModuleFunction:
+            return STRING_LITERAL("runtime.callModuleFunction");
+        case JsThreadDispatchReason::PushModuleToMarshaller:
+            return STRING_LITERAL("runtime.pushModuleToMarshaller");
+        case JsThreadDispatchReason::AddModuleUnloadObserver:
+            return STRING_LITERAL("runtime.addModuleUnloadObserver");
+        case JsThreadDispatchReason::PreloadModule:
+            return STRING_LITERAL("runtime.preloadModule");
+        case JsThreadDispatchReason::PreloadModules:
+            return STRING_LITERAL("runtime.preloadModules");
+        case JsThreadDispatchReason::ScheduleWorkItem:
+            return STRING_LITERAL("runtime.scheduleWorkItem");
+        case JsThreadDispatchReason::WarmUpValueMarshaller:
+            return STRING_LITERAL("runtime.warmUpValueMarshaller");
+        case JsThreadDispatchReason::ExclusiveJsThreadLock:
+            return STRING_LITERAL("runtime.runWithExclusiveJsThreadLock");
+        case JsThreadDispatchReason::WorkerPostInit:
+            return STRING_LITERAL("runtime.workerPostInit");
+        case JsThreadDispatchReason::WorkerPostMessage:
+            return STRING_LITERAL("runtime.workerPostMessage");
+        case JsThreadDispatchReason::MessagePortReleaseHandle:
+            return STRING_LITERAL("runtime.messagePortReleaseHandle");
+        case JsThreadDispatchReason::MessagePortDispatch:
+            return STRING_LITERAL("runtime.messagePortDispatch");
+        case JsThreadDispatchReason::ErrorStackTrace:
+            return STRING_LITERAL("runtime.errorStackTrace");
+        case JsThreadDispatchReason::TypedArrayConversion:
+            return STRING_LITERAL("runtime.typedArrayConversion");
+        case JsThreadDispatchReason::JavaScriptRunLoopFlush:
+            return STRING_LITERAL("runtime.javaScriptRunLoopFlush");
+        case JsThreadDispatchReason::DebuggerTickle:
+            return STRING_LITERAL("runtime.debuggerTickle");
+        case JsThreadDispatchReason::ANRDetectorAcknowledgement:
+            return STRING_LITERAL("runtime.anrDetectorAcknowledgement");
+        case JsThreadDispatchReason::ANRDetectorNudge:
+            return STRING_LITERAL("runtime.anrDetectorNudge");
+        case JsThreadDispatchReason::HotReloadStashData:
+            return STRING_LITERAL("runtime.hotReloadStashData");
+        case JsThreadDispatchReason::HotReloadRestoreData:
+            return STRING_LITERAL("runtime.hotReloadRestoreData");
+        case JsThreadDispatchReason::LockAllJSContexts:
+            return STRING_LITERAL("runtime.lockAllJSContexts");
+        case JsThreadDispatchReason::DaemonClientConnected:
+            return STRING_LITERAL("runtime.daemonClientConnected");
+        case JsThreadDispatchReason::DaemonClientDisconnected:
+            return STRING_LITERAL("runtime.daemonClientDisconnected");
+        case JsThreadDispatchReason::DaemonClientPayload:
+            return STRING_LITERAL("runtime.daemonClientDidReceiveClientPayload");
+        case JsThreadDispatchReason::SetDefaultViewManagerContext:
+            return STRING_LITERAL("runtime.setDefaultViewManagerContext");
+        case JsThreadDispatchReason::DumpLogs:
+            return STRING_LITERAL("runtime.dumpLogs");
+        case JsThreadDispatchReason::DumpHeap:
+            return STRING_LITERAL("runtime.dumpHeap");
+        case JsThreadDispatchReason::StartProfiling:
+            return STRING_LITERAL("runtime.startProfiling");
+        case JsThreadDispatchReason::StopProfiling:
+            return STRING_LITERAL("runtime.stopProfiling");
+    }
+    return STRING_LITERAL("runtime.dispatch");
 }
 
 void JavaScriptRuntime::dispatchOnJsThread(Ref<Context> ownerContext,
                                            JavaScriptTaskScheduleType scheduleType,
                                            uint32_t delayMs,
                                            JavaScriptThreadTask&& function) {
-    auto dispatchFunc = makeJsThreadDispatchFunction(
-        ownerContext != nullptr ? std::move(ownerContext) : Ref(_globalContext), std::move(function));
+    dispatchOnJsThreadImpl(std::move(ownerContext), scheduleType, delayMs, StringBox(), std::move(function));
+}
+
+void JavaScriptRuntime::dispatchOnJsThread(JsThreadDispatchReason reason,
+                                           JavaScriptTaskScheduleType scheduleType,
+                                           uint32_t delayMs,
+                                           JavaScriptThreadTask&& function) {
+    auto attribution = anrDiagnosticsEnabled() ? dispatchReasonName(reason) : StringBox();
+    dispatchOnJsThreadImpl(nullptr, scheduleType, delayMs, std::move(attribution), std::move(function));
+}
+
+void JavaScriptRuntime::dispatchOnJsThread(const StringBox& attribution,
+                                           JavaScriptTaskScheduleType scheduleType,
+                                           uint32_t delayMs,
+                                           JavaScriptThreadTask&& function) {
+    SC_ASSERT(!anrDiagnosticsEnabled() || !attribution.isEmpty());
+    auto dispatchAttribution = anrDiagnosticsEnabled() ? attribution : StringBox();
+    dispatchOnJsThreadImpl(nullptr, scheduleType, delayMs, std::move(dispatchAttribution), std::move(function));
+}
+
+void JavaScriptRuntime::dispatchOnJsThreadImpl(Ref<Context> ownerContext,
+                                               JavaScriptTaskScheduleType scheduleType,
+                                               uint32_t delayMs,
+                                               StringBox dispatchAttribution,
+                                               JavaScriptThreadTask&& function) {
+    auto dispatchFunc =
+        makeJsThreadDispatchFunction(ownerContext != nullptr ? std::move(ownerContext) : Ref(_globalContext),
+                                     std::move(function),
+                                     std::move(dispatchAttribution));
 
     if (scheduleType == JavaScriptTaskScheduleTypeAlwaysAsync) {
         _dispatchQueue->asyncAfter(std::move(dispatchFunc), std::chrono::milliseconds(delayMs));
@@ -3504,6 +4155,11 @@ void JavaScriptRuntime::dispatchOnJsThread(Ref<Context> ownerContext,
     }
 
     if (scheduleType == JavaScriptTaskScheduleTypeAlwaysSync) {
+        // A worker's JS thread is allowed to block on the platform main thread (e.g. external
+        // surface rasterization), which stays deadlock-free only as long as the main thread
+        // never blocks on a worker's JS thread. Keep that edge out of the wait graph.
+        SC_ASSERT(!(_isWorker && _mainThreadManager.currentThreadIsMainThread()),
+                  "The main thread must never dispatch synchronously into a worker runtime");
         _dispatchQueue->sync(dispatchFunc);
     } else {
         _dispatchQueue->async(std::move(dispatchFunc));
@@ -3511,7 +4167,17 @@ void JavaScriptRuntime::dispatchOnJsThread(Ref<Context> ownerContext,
 }
 
 void JavaScriptRuntime::dispatchSynchronouslyOnJsThread(JavaScriptThreadTask&& function) {
-    dispatchOnJsThread(nullptr, JavaScriptTaskScheduleTypeAlwaysSync, 0, std::move(function));
+    dispatchOnJsThreadImpl(
+        nullptr, JavaScriptTaskScheduleTypeAlwaysSync, 0, StringBox(), std::move(function));
+}
+
+void JavaScriptRuntime::dispatchSynchronouslyOnJsThread(JsThreadDispatchReason reason,
+                                                        JavaScriptThreadTask&& function) {
+    dispatchOnJsThread(reason, JavaScriptTaskScheduleTypeAlwaysSync, 0, std::move(function));
+}
+
+void JavaScriptRuntime::dispatchSynchronouslyOnJsThread(const StringBox& attribution, JavaScriptThreadTask&& function) {
+    dispatchOnJsThread(attribution, JavaScriptTaskScheduleTypeAlwaysSync, 0, std::move(function));
 }
 
 void JavaScriptRuntime::dispatchOnMainThread(DispatchFunction func) {
@@ -3523,14 +4189,102 @@ bool JavaScriptRuntime::isInJsThread() {
 }
 
 Ref<Context> JavaScriptRuntime::getLastDispatchedContext() const {
-    return _contextManager.getContext(_lastDispatchedContextId.load());
+    return _contextManager->getContext(_lastDispatchedContextId.load());
+}
+
+void JavaScriptRuntime::setANRDiagnosticsEnabled(bool enabled) {
+    _anrDiagnosticsEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool JavaScriptRuntime::anrDiagnosticsEnabled() const {
+    return _anrDiagnosticsEnabled.load(std::memory_order_relaxed);
+}
+
+bool JavaScriptRuntime::anrDiagnosticsActiveOnJsThread() {
+    return anrDiagnosticsEnabled() && isInJsThread();
+}
+
+StringBox JavaScriptRuntime::anrNativeCallNameForTraceSpan(const StringBox& traceName) {
+    static constexpr size_t kMaxLength = 128;
+    auto end = traceName.indexOf(':').value_or(traceName.length());
+    if (end > kMaxLength) {
+        end = kMaxLength;
+    }
+    if (end == traceName.length()) {
+        return traceName;
+    }
+    return traceName.substring(0, end).trimmed();
+}
+
+StringBox JavaScriptRuntime::swapCurrentNativeCallName(StringBox name) {
+    std::lock_guard<Mutex> lock(_nativeCallActivityMutex);
+    std::swap(_currentNativeCallName, name);
+    return name;
+}
+
+bool JavaScriptRuntime::isReadyForANRDetection() const {
+    return _bootstrapCompleted;
+}
+
+std::string JavaScriptRuntime::getANRAttributionInfo() const {
+    if (!anrDiagnosticsEnabled()) {
+        return {};
+    }
+
+    std::string info;
+
+    StringBox nativeCallName;
+    {
+        std::lock_guard<Mutex> lock(_nativeCallActivityMutex);
+        nativeCallName = _currentNativeCallName;
+    }
+    if (!nativeCallName.isEmpty()) {
+        info += " [stuck-in: " + nativeCallName.slowToString() + "]";
+    }
+
+    // The JS queue is serial, so the last dispatched context belongs to the task that is currently
+    // running (the stuck one when this is read during an ANR).
+    auto lastDispatchedContext = getLastDispatchedContext();
+    if (lastDispatchedContext != nullptr) {
+        const auto& module = lastDispatchedContext->getPath().getResourceId().bundleName;
+        if (!module.isEmpty()) {
+            info += " [module: " + module.slowToString() + "]";
+        }
+    }
+
+    return info;
 }
 
 DispatchFunction JavaScriptRuntime::makeJsThreadDispatchFunction(Ref<Context>&& ownerContext,
-                                                                 JavaScriptThreadTask&& jsTask) {
+                                                                 JavaScriptThreadTask&& jsTask,
+                                                                 StringBox dispatchAttribution) {
     SC_ASSERT(ownerContext != nullptr);
-    return [this, retainedContext = RetainedContext(std::move(ownerContext)), jsTask = std::move(jsTask)]() {
+    return [this,
+            // Retain the runtime for the task's lifetime so an in-flight JS-thread task can't have a
+            // member freed under it by a runtime whose last external ref was dropped on another thread.
+            // With this held, the final ref is released here on the JS thread when the task completes,
+            // so ~JavaScriptRuntime runs on the JS thread and its teardown join is a no-op self-join --
+            // never a cross-thread block that could deadlock against a task synchronously waiting on the
+            // dropping thread. Gated by the same kill switch as the destructor join.
+            retainedSelf = (_joinJsThreadOnTeardown ? strongSmallRef(this) : Ref<JavaScriptRuntime>()),
+            retainedContext = RetainedContext(std::move(ownerContext)),
+            jsTask = std::move(jsTask),
+            dispatchAttribution = std::move(dispatchAttribution)]() {
+        // _running is cleared only by onInitError (teardownOnJsThread no longer clears it), so
+        // !_running here uniquely means module-loader init failed while the context is still
+        // non-null. Refuse: queued work must not run against a runtime that never finished
+        // initializing, even under cooperative termination. A normal teardown drain keeps _running
+        // true, so this does not block the drain -- liveness for that path is gated on the context.
         if (_javaScriptContext == nullptr || !_running) {
+            return;
+        }
+        // Aggressive teardown flips _isDisposed from another thread and only queues teardownOnJsThread,
+        // so skipping disposed work here can silently drop an in-flight bridge call and crash its caller
+        // on the undefined result. Cooperative mode instead drains: in-flight and already-queued work
+        // runs (the context is still alive, since teardownOnJsThread is serialized after it on this
+        // serial queue), then teardown destroys the context and later calls are refused by the check
+        // above.
+        if (_isDisposed && !_cooperativeTermination) {
             return;
         }
 
@@ -3550,7 +4304,12 @@ DispatchFunction JavaScriptRuntime::makeJsThreadDispatchFunction(Ref<Context>&& 
             {
                 JavaScriptEntryParameters jsEntry(jsContext, exceptionTracker, ownerContext);
 
-                jsTask(jsEntry);
+                if (!dispatchAttribution.isEmpty()) {
+                    ScopedNativeCallActivity nativeCallActivity(this, dispatchAttribution);
+                    jsTask(jsEntry);
+                } else {
+                    jsTask(jsEntry);
+                }
             }
 
             if (!exceptionTracker) {
@@ -3562,6 +4321,10 @@ DispatchFunction JavaScriptRuntime::makeJsThreadDispatchFunction(Ref<Context>&& 
 
 void JavaScriptRuntime::onInitError(std::string_view failingAction, const Error& error) {
     _running = false;
+    if (_isDisposed || (_javaScriptContext != nullptr && _javaScriptContext->executionTerminationRequested())) {
+        return;
+    }
+
     handleUncaughtJsErrorNoHandler(
         nullptr,
         error.rethrow(STRING_FORMAT("Fatal init error with performing action '{}'", failingAction)),
@@ -3661,11 +4424,11 @@ void JavaScriptRuntime::handleUncaughtJsErrorNoHandler(const Ref<Context>& owner
 
     _logger->log(LogTypeError, errorMessageStr);
 
-    if (_listener != nullptr) {
+    if (auto listener = getListener()) {
         if (error.hasStack() || snap::kIsDevBuild) {
-            _listener->onDebugMessage(LogTypeError, errorMessage);
+            listener->onDebugMessage(LogTypeError, errorMessage);
         }
-        _listener->onUncaughtJsError(moduleName, error);
+        listener->onUncaughtJsError(moduleName, error);
     }
 
     if (shouldCrash) {
@@ -3681,16 +4444,14 @@ const Ref<Metrics>& JavaScriptRuntime::getMetrics() const {
     return _resourceManager.getMetrics();
 }
 
-void JavaScriptRuntime::setEnableStackTraceCapture(bool enableStackTraceCapture) {
-    _enableStackTraceCapture = enableStackTraceCapture;
-}
-
 void JavaScriptRuntime::startProfiling() {
-    dispatchOnJsThreadUnattributed([](JavaScriptEntryParameters& entry) { entry.jsContext.startProfiling(); });
+    constexpr auto reason = JsThreadDispatchReason::StartProfiling;
+    dispatchOnJsThreadAsync(reason, [](JavaScriptEntryParameters& entry) { entry.jsContext.startProfiling(); });
 }
 
 void JavaScriptRuntime::stopProfiling(Function<void(const Result<std::vector<std::string>>&)> onComplete) {
-    dispatchOnJsThreadUnattributed([completion = std::move(onComplete)](JavaScriptEntryParameters& entry) {
+    constexpr auto reason = JsThreadDispatchReason::StopProfiling;
+    dispatchOnJsThreadAsync(reason, [completion = std::move(onComplete)](JavaScriptEntryParameters& entry) {
         completion(entry.jsContext.stopProfiling());
     });
 }
@@ -3706,7 +4467,8 @@ TimePoint JavaScriptRuntime::getPerformanceTimeOrigin() const {
 Result<BytesView> JavaScriptRuntime::dumpHeap() {
     if constexpr (Valdi::shouldEnableJsHeapDump()) {
         Result<BytesView> result;
-        dispatchSynchronouslyOnJsThread([this, &result](JavaScriptEntryParameters& entry) {
+        constexpr auto reason = JsThreadDispatchReason::DumpHeap;
+        dispatchSynchronouslyOnJsThread(reason, [this, &result](JavaScriptEntryParameters& entry) {
             std::vector<IJavaScriptContext*> jsContexts;
 
             lockAllJSContexts(jsContexts, [&]() {
@@ -3728,7 +4490,7 @@ Result<BytesView> JavaScriptRuntime::dumpHeap() {
 Result<Ref<Context>> JavaScriptRuntime::getContextForId(ContextId contextId) const {
     // We lookup in the ContextManager first, to handle both contexts that are created externally
     // and contexts that are created directly in JS (which happens when running tests)
-    Ref<Context> context = _contextManager.getContext(contextId);
+    Ref<Context> context = _contextManager->getContext(contextId);
     if (context == nullptr) {
         // Fallback on a lookup on our contextHandler, in case the context was destroyed outside of the js thread
         return _contextHandler->getContextForId(contextId);

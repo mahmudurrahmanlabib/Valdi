@@ -4,6 +4,7 @@ import com.snap.valdi.callable.ValdiFunction;
 
 public class NativeBridge {
     public static native int getBuildOptions();
+    public static native void setDebuggerPortEnvironment(int debuggerPort);
     public static native long createRuntimeManager(Object mainThreadDispatcher,
                                                       Object snapDrawingFrameScheduler,
                                                       Object viewManager,
@@ -76,6 +77,10 @@ public class NativeBridge {
 
     public static native String getViewClassName(long viewNodeHandle);
 
+    public static native Object getStoredObjectForViewNode(long viewNodeHandle, long key);
+
+    public static native void setStoredObjectForViewNode(long viewNodeHandle, long key, Object object);
+
     public static native void callJSFunction(long runtimeHandle, long contextHandle, String functionName, Object[] parameters);
 
     public static native Object getViewInContextForId(long contextHandle, String viewId);
@@ -102,6 +107,7 @@ public class NativeBridge {
     public static native void enqueueWorkerTask(long runtimeManagerHandle, Object runnable);
 
     public static native void performCallback(long nativePayloadHandle);
+    public static native void discardCallback(long nativePayloadHandle);
 
     public static native void deleteNativeHandle(long actionHandle);
     public static native void releaseNativeRef(long nativeHandle);
@@ -111,7 +117,6 @@ public class NativeBridge {
     public static native void registerModuleFactoriesProvider(long runtimeManagerHandle, Object moduleFactoriesProvider);
     public static native long getViewNodePoint(long runtimeHandle, long viewNodeHandle, int x, int y, int mode, boolean fromBoundsOrigin);
     public static native long getViewNodeSize(long runtimeHandle, long viewNodeHandle, int mode);
-
     public static native boolean canViewNodeScroll(long runtimeHandle, long viewNodeHandler, int x, int y, int direction);
 
     public static native boolean isViewNodeScrollingOrAnimating(long viewNodeHandle);
@@ -152,6 +157,8 @@ public class NativeBridge {
 
     public static native void applicationSetConfiguration(long runtimeManagerHandle, float dynamicTypeScale);
 
+    public static native void setPointScale(long runtimeManagerHandle, float pointScale);
+
     public static native void applicationDidResume(long runtimeManagerHandle);
 
     public static native void applicationWillPause(long runtimeManagerHandle);
@@ -163,6 +170,14 @@ public class NativeBridge {
     public static native void valueChangedForAttribute(long runtimeHandle, long viewNodeHandle, long attributePtr, Object value);
 
     public static native void setValueForAttribute(long viewNodeHandle, String attribute, Object value, boolean keepAsOverride);
+
+    public static native void setInlineTextAnimationAttributesForViewNode(
+        long viewNodeHandle,
+        boolean hasOpacity,
+        double opacity,
+        boolean hasTransform,
+        double translationY,
+        double scale);
 
     public static native Object getValueForAttribute(long viewNodeHandle, String attribute);
 
@@ -196,6 +211,7 @@ public class NativeBridge {
                                            boolean invalidateLayoutOnChange,
                                            Object delegate,
                                            Object compositeParts);
+    public static native void bindTransformAttributes(long bindingContextHandle, Object delegate);
     public static native void bindScrollAttributes(long bindingContextHandle);
     public static native void bindAssetAttributes(long bindingContextHandle, int outputType);
     public static native void setMeasureDelegate(long bindingContextHandle, Object measureDelegate);
@@ -236,6 +252,10 @@ public class NativeBridge {
     public static native void stopProfiling(long runtimeHandle, ValdiFunction completion);
 
     public static native Object wrapAndroidBitmap(Object androidBitmap);
+
+    public static native Object rasterizeSVG(byte[] svgData, int preferredWidth, int preferredHeight, float displayScale);
+
+    public static native Object rasterizeSVGFromFilePath(String filePath, float displayScale);
 
     public static native long getSnapDrawingRuntimeHandle(long runtimeManagerHandle);
     public static native long createSnapDrawingRoot(long snapDrawingRuntimeHandle, boolean disallowSynchronousDraw);

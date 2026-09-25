@@ -30,8 +30,8 @@
 
 #include "valdi_core/cpp/Resources/ResourceId.hpp"
 
-#include "valdi/JSRuntime.hpp"
 #include "valdi_core/AnimationType.hpp"
+#include "valdi_core/JSRuntime.hpp"
 
 #include "valdi/runtime/JavaScript/JSPropertyNameIndex.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptComponentContextHandler.hpp"
@@ -43,7 +43,9 @@
 #include "utils/time/StopWatch.hpp"
 
 #include "valdi_core/cpp/Utils/Function.hpp"
+#include <atomic>
 #include <future>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -83,6 +85,7 @@ enum DaemonClientEventType {
 class ValdiRuntimeTweaks;
 
 class JavaScriptRuntime;
+
 class IJavaScriptRuntimeListener {
 public:
     IJavaScriptRuntimeListener() = default;
@@ -99,7 +102,9 @@ public:
                                      bool createIfNeeded,
                                      Function<void(const Ref<ViewNodeTree>&)>&& function) = 0;
 
-    virtual void updateColorPalette(const Value& colorPaletteMap) = 0;
+    virtual void configureColorPalette(const StringBox& name, const Value& colorPaletteMap) = 0;
+
+    virtual void setActiveColorPalette(const StringBox& name) = 0;
 
     virtual void onUncaughtJsError(const StringBox& moduleName, const Error& error) = 0;
 
@@ -146,9 +151,16 @@ enum class ModuleLoadMode {
 
 using ModuleLoadResult = std::pair<JSValueRef, ModuleLoadMode>;
 
-struct ModuleMemoryConsumptionInfo {
-    ptrdiff_t waterMark;           // The memory usage water mark before loading
-    ptrdiff_t childrenConsumption; // Total memory usage by children of this module
+/**
+Module resource consumption info, i.e. memory and duration;
+Currently, we monitor resource consumption only if the memory usage is available.
+*/
+struct ModuleResourceConsumptionInfo {
+    int64_t memoryWaterMark;     // The memory usage water mark before loading
+    int64_t childrenMemoryUsage; // Total memory usage by children of this module
+
+    int64_t timestamp;        // Timestamp before loading
+    int64_t childrenDuration; // Total duration of children of this module
 };
 
 /**
@@ -158,12 +170,12 @@ struct ModuleMemoryConsumptionInfo {
  */
 class JavaScriptRuntime : public JavaScriptTaskScheduler,
                           public IJavaScriptContextListener,
-                          public snap::valdi::JSRuntime,
+                          public snap::valdi_core::JSRuntime,
                           public JavaScriptComponentContextHandlerListener {
 public:
     JavaScriptRuntime(IJavaScriptBridge& jsBridge,
                       ResourceManager& resourceManager,
-                      ContextManager& contextManager,
+                      const Ref<ContextManager>& contextManager,
                       MainThreadManager& mainThreadManager,
                       AttributeIds& attributeIds,
                       PlatformType platformType,
@@ -176,11 +188,107 @@ public:
 
     void postInit();
 
-    void setListener(IJavaScriptRuntimeListener* listener);
-    IJavaScriptRuntimeListener* getListener() const;
+    /**
+     A listener reference that retains the listener's owner while held, so a caller can safely
+     invoke the listener even if the owning runtime is concurrently being torn down on another
+     thread (e.g. a worker's JS thread using the parent runtime's listener).
+     */
+    class RetainedListener {
+    public:
+        RetainedListener() = default;
+        RetainedListener(IJavaScriptRuntimeListener* listener, Shared<SharedPtrRefCountable> owner)
+            : _listener(listener), _owner(std::move(owner)) {}
+
+        explicit operator bool() const {
+            return _listener != nullptr;
+        }
+        IJavaScriptRuntimeListener* operator->() const {
+            return _listener;
+        }
+
+    private:
+        IJavaScriptRuntimeListener* _listener = nullptr;
+        Shared<SharedPtrRefCountable> _owner;
+    };
+
+    /**
+     `listenerOwner` must own (or be) the object implementing `listener`; getListener() resolves
+     the listener only while the owner is still alive and retains it for the handle's lifetime.
+     */
+    void setListener(IJavaScriptRuntimeListener* listener, const Weak<SharedPtrRefCountable>& listenerOwner);
+    RetainedListener getListener() const;
+    void setANRDiagnosticsEnabled(bool enabled);
+
+    // Kept in sync with the VALDI_ENABLE_RESOLUTION_TEARDOWN_DEGRADE tweak by Runtime::setRuntimeTweaks
+    // so pushModuleToMarshaller can read the kill switch after teardown (when the listener is gone).
+    void setResolutionTeardownDegradeEnabled(bool enabled) {
+        _resolutionTeardownDegradeEnabled = enabled;
+    }
+
+    // Kept in sync with VALDI_USE_COOPERATIVE_TERMINATION by Runtime::setRuntimeTweaks. Read by
+    // JavaScriptWorker::terminate()/dtor (skip forced execution termination) and by
+    // makeJsThreadDispatchFunction (drain in-flight/queued work during teardown instead of skipping it).
+    void setCooperativeTermination(bool enabled) {
+        _cooperativeTermination = enabled;
+    }
+    bool cooperativeTermination() const {
+        return _cooperativeTermination;
+    }
+
+    // Kept in sync with VALDI_JOIN_JS_THREAD_ON_TEARDOWN by Runtime::setRuntimeTweaks (and pulled in
+    // postInit for worker runtimes, which don't get the pushed tweaks). Read by ~JavaScriptRuntime to
+    // join the JS thread before member destruction; off reverts to the prior member-order behavior.
+    void setJoinJsThreadOnTeardown(bool enabled) {
+        _joinJsThreadOnTeardown = enabled;
+    }
+
+    // Test-only: enter/leave the disposed-but-context-alive teardown window without running teardown,
+    // so the dispatch guard's cooperative-drain vs aggressive-skip behavior can be tested deterministically.
+    void setDisposedForTesting(bool disposed) {
+        _isDisposed = disposed;
+    }
+
+    // Test-only: simulate the onInitError init-failure state (running cleared while the context is
+    // still non-null), so the dispatch guard's !_running refusal can be tested deterministically.
+    void setRunningForTesting(bool running) {
+        _running = running;
+    }
+
+    // Test-only: mirror the _moduleResourceTracker mutation loadJsModule performs on
+    // the JS thread and return a pointer INTO the buffer (as loadJsModule holds
+    // _moduleResourceTracker.back() across its load), so the teardown-race regression test can observe
+    // a use-after-free if the destructor frees the buffer without first joining the JS thread.
+    ModuleResourceConsumptionInfo* mutateAndGetModuleResourceTrackerBackForTesting() {
+        _moduleResourceTracker.push_back({0, 0, 0, 0});
+        return &_moduleResourceTracker.back();
+    }
+
+    // Test-only: free the _moduleResourceTracker buffer as ~JavaScriptRuntime does
+    // during member destruction, standalone, so the ASan mechanism repro can free it from one thread
+    // while the JS thread holds a pointer into it.
+    void freeModuleResourceTrackerForTesting() {
+        std::vector<ModuleResourceConsumptionInfo>().swap(_moduleResourceTracker);
+    }
+
+    // True when ANR diagnostics are on and the caller is on this runtime's JS thread. Guards the
+    // native-call activity writes so worker threads never touch the JS thread's slot.
+    bool anrDiagnosticsActiveOnJsThread();
+    // Safe to read from any thread so bridges can skip attribution conversion before dispatch.
+    bool anrDiagnosticsEnabled() const;
+
+    // Breadcrumb name for an ANR inside a runtime.trace span: the tag cut at its first ':' (tags put
+    // dynamic payloads after it) and capped, so one span is one group.
+    static StringBox anrNativeCallNameForTraceSpan(const StringBox& traceName);
+
+    // Swaps the recorded in-flight JS->native call name and returns the previous one, so nested
+    // calls report the innermost and unwind to the parent. Written on the JS thread around bridge
+    // calls, read by the ANR detector.
+    StringBox swapCurrentNativeCallName(StringBox name);
 
     void fullTeardown();
     void partialTeardown();
+    void requestFullTeardown();
+    void requestExecutionTermination();
 
     void setThreadQoS(ThreadQoSClass threadQoS);
 
@@ -226,41 +334,68 @@ public:
                             JavaScriptTaskScheduleType scheduleType,
                             uint32_t delayMs,
                             JavaScriptThreadTask&& function) final;
+    void dispatchOnJsThread(JsThreadDispatchReason reason,
+                            JavaScriptTaskScheduleType scheduleType,
+                            uint32_t delayMs,
+                            JavaScriptThreadTask&& function) final;
+    /** `attribution` must be a stable, nonempty, low-cardinality identifier for the scheduling callsite. */
+    void dispatchOnJsThread(const StringBox& attribution,
+                            JavaScriptTaskScheduleType scheduleType,
+                            uint32_t delayMs,
+                            JavaScriptThreadTask&& function);
+    using JavaScriptTaskScheduler::dispatchOnJsThreadAsync;
+    using JavaScriptTaskScheduler::dispatchOnJsThreadSync;
+    void dispatchOnJsThreadAsync(const StringBox& attribution, JavaScriptThreadTask&& function) {
+        dispatchOnJsThread(attribution, JavaScriptTaskScheduleTypeDefault, 0, std::move(function));
+    }
+    void dispatchOnJsThreadSync(const StringBox& attribution, JavaScriptThreadTask&& function) {
+        dispatchOnJsThread(attribution, JavaScriptTaskScheduleTypeAlwaysSync, 0, std::move(function));
+    }
     void dispatchSynchronouslyOnJsThread(JavaScriptThreadTask&& function);
+    void dispatchSynchronouslyOnJsThread(JsThreadDispatchReason reason, JavaScriptThreadTask&& function);
+    void dispatchSynchronouslyOnJsThread(const StringBox& attribution, JavaScriptThreadTask&& function);
     bool isInJsThread() final;
     Ref<Context> getLastDispatchedContext() const final;
+    std::string getANRAttributionInfo() const final;
+    bool isReadyForANRDetection() const final;
 
     void performGc();
     JavaScriptContextMemoryStatistics dumpMemoryStatistics();
+    void dumpMemoryStatisticsAsync(Function<void(JavaScriptContextMemoryStatistics)> completion);
 
     Result<Value> evaluateScript(const BytesView& script, const StringBox& sourceFilename);
 
     bool isJsModuleLoaded(const ResourceId& resourceId);
 
     Ref<JavaScriptModuleContainer> getModule(
-        const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+        const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
         const Valdi::StringBox& path);
 
     void preloadModule(const StringBox& path, int32_t maxDepth) override;
 
+    void preloadModules(const std::vector<Valdi::StringBox>& paths, int32_t maxDepth) override;
+
+    void warmUpValueMarshaller(const Value& value);
+
     int32_t pushModuleToMarshaller(
-        const /*not-null*/ std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+        const /*not-null*/ std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
         const Valdi::StringBox& path,
         int64_t marshallerHandle) override;
 
     int32_t pushModuleToMarshaller(
-        const /*not-null*/ std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+        const /*not-null*/ std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
         const Valdi::StringBox& path,
         Marshaller& marshaller);
 
     void addModuleUnloadObserver(const Valdi::StringBox& path, const Valdi::Value& observer) override;
 
-    std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager> createNativeObjectsManager() override;
+    std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager> createNativeObjectsManager(
+        const std::string& scopeName) override;
 
     void destroyNativeObjectsManager(
-        const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager) override;
+        const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager) override;
 
-    std::shared_ptr<snap::valdi::JSRuntime> createWorker() override;
+    std::shared_ptr<snap::valdi_core::JSRuntime> createWorker() override;
 
     void runOnJsThread(const Value& runnable) override;
 
@@ -273,7 +408,7 @@ public:
 
     std::future<Result<DumpedLogs>> dumpLogs(bool includeMetadata, bool includeVerbose);
 
-    void setEnableStackTraceCapture(bool enableStackTraceCapture);
+    void setForceStackTraceCapture(bool force);
 
     void requestUpdateJsContextHandler(JavaScriptEntryParameters& jsEntry,
                                        JavaScriptComponentContextHandler& handler) override;
@@ -318,11 +453,17 @@ private:
     IJavaScriptBridge& _javaScriptBridge;
     Ref<IJavaScriptContext> _javaScriptContext;
     ResourceManager& _resourceManager;
-    ContextManager& _contextManager;
+    Ref<ContextManager> _contextManager;
     MainThreadManager& _mainThreadManager;
     AttributeIds& _attributeIds;
     [[maybe_unused]] Ref<ILogger> _logger;
+    // Guarded by _listenerMutex: written from the owning runtime's thread (setListener, teardown)
+    // but also from a parent runtime detaching its workers during teardown, while the worker's JS
+    // thread reads it. The weak owner lets getListener() retain the listener's implementor across
+    // a call, closing the race against the owner's destruction.
+    mutable Mutex _listenerMutex;
     IJavaScriptRuntimeListener* _listener;
+    Weak<SharedPtrRefCountable> _listenerOwner;
 
     FlatMap<ResourceId, Shared<JavaScriptModuleContainer>> _modules;
     Ref<JavaScriptComponentContextHandler> _contextHandler;
@@ -334,7 +475,7 @@ private:
     Result<JSValueRef> _symbolicateFunction;
     Result<JSValueRef> _onDaemonClientEventFunction;
     JSValueRef _moduleLoader;
-    JSPropertyNameIndex<6> _propertyNameIndex;
+    JSPropertyNameIndex<7> _propertyNameIndex;
 
     Ref<IDiskCache> _diskCache;
     // List of JS modules which should be reloaded whenever they are unloaded
@@ -348,14 +489,36 @@ private:
 
     Ref<DispatchQueue> _dispatchQueue;
     std::atomic<bool> _isDisposed;
+    // Mirror of the VALDI_ENABLE_RESOLUTION_TEARDOWN_DEGRADE kill switch, set via
+    // setResolutionTeardownDegradeEnabled from Runtime::setRuntimeTweaks. pushModuleToMarshaller reads it
+    // to gate the teardown degrade; held here (not fetched via the listener) so it survives teardown.
+    // Defaults to on.
+    std::atomic<bool> _resolutionTeardownDegradeEnabled = true;
+    // Mirror of VALDI_USE_COOPERATIVE_TERMINATION (see setCooperativeTermination). Held here
+    // so JavaScriptWorker can read it independent of the listener. Defaults to cooperative.
+    std::atomic<bool> _cooperativeTermination = true;
+    // Mirror of VALDI_JOIN_JS_THREAD_ON_TEARDOWN (see setJoinJsThreadOnTeardown). Gates the
+    // destructor's JS-thread join. Defaults on.
+    std::atomic<bool> _joinJsThreadOnTeardown = true;
     std::atomic<ContextId> _lastDispatchedContextId;
+    // ANR attribution diagnostics, gated by the VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS COF key (key
+    // name kept from the earlier module-load diagnostics for config continuity). The mutex guards
+    // the in-flight native call name: written on the JS thread around JS->native bridge calls,
+    // read by the ANR detector without running JS.
+    std::atomic<bool> _anrDiagnosticsEnabled = false;
+    mutable Mutex _nativeCallActivityMutex;
+    StringBox _currentNativeCallName;
     // A lock that will block the JS thread until postInit() is called and the initialization has completed
     AsyncGroup _initLock;
     bool _hasGcScheduled = false;
     bool _symbolicating = false;
     bool _running = false;
     bool _enableDebugger;
-    bool _enableStackTraceCapture;
+    // Set once doInitialize() finished evaluating the core bundles; read by the ANR detector to
+    // exclude the bootstrap window from ANR accounting.
+    std::atomic<bool> _bootstrapCompleted = false;
+    // Used for unit testing only
+    std::atomic<bool> _forceStackTraceCapture = false;
     int _daemonClientListenerIdSequence = 0;
 
     PlatformType _platformType;
@@ -369,13 +532,14 @@ private:
     std::vector<RegisteredTypeConverter> _typeConverters;
     std::vector<Ref<JavaScriptStacktraceCaptureSession>> _stacktraceCaptureSessions;
     std::vector<Weak<JavaScriptRuntime>> _jsWorkers;
+    Mutex _jsWorkersMutex;
 
     Shared<JSValueRefHolder> _uncaughtExceptionHandler;
     Shared<JSValueRefHolder> _unhandledRejectionHandler;
 
     const bool _isWorker;
 
-    std::vector<ModuleMemoryConsumptionInfo> _moduleMemoryTracker;
+    std::vector<ModuleResourceConsumptionInfo> _moduleResourceTracker;
 
     void doInitialize();
 
@@ -422,7 +586,10 @@ private:
     JSValueRef runtimeGetAssets(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeMakeDirectionalAsset(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeMakePlatformSpecificAsset(JSFunctionNativeCallContext& callContext);
-    JSValueRef runtimeSetColorPalette(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeMakeThemableAsset(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeGetLoadedAssetMetadata(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeConfigureColorPalette(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeSetActiveColorPalette(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeTakeElementSnapshot(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeGetNativeNodeForElementId(JSFunctionNativeCallContext& callContext);
 
@@ -463,6 +630,7 @@ private:
     JSValueRef runtimeMakeTraceProxy(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeStartTraceRecording(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeStopTraceRecording(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeStopTraceRecordingWithStats(JSFunctionNativeCallContext& callContext);
 
     JSValueRef runtimeScheduleWorkItem(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeUnscheduleWorkItem(JSFunctionNativeCallContext& callContext);
@@ -479,6 +647,8 @@ private:
 
     JSValueRef runtimeDumpMemoryStatistics(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimePerformGC(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeNewWeakRef(JSFunctionNativeCallContext& callContext);
+    JSValueRef runtimeDerefWeakRef(JSFunctionNativeCallContext& callContext);
     JSValueRef runtimeHeapDump(JSFunctionNativeCallContext& callContext);
 
     JSValueRef runtimeSetUncaughtExceptionHandler(JSFunctionNativeCallContext& callContext);
@@ -490,6 +660,7 @@ private:
 
     // Worker methods
     // - new Worker(...)
+    // - new MessageChannel()
     // - worker.onmessage = ...
     // - worker.postMessage(...)
     // - worker.terminate()
@@ -572,9 +743,15 @@ private:
     void onRecoverableError(std::string_view failingAction, JSExceptionTracker& exceptionTracker);
     void onRecoverableError(std::string_view failingAction, const Error& error);
 
-    DispatchFunction makeJsThreadDispatchFunction(Ref<Context>&& ownerContext, JavaScriptThreadTask&& jsTask);
+    DispatchFunction makeJsThreadDispatchFunction(Ref<Context>&& ownerContext,
+                                                  JavaScriptThreadTask&& jsTask,
+                                                  StringBox dispatchAttribution = StringBox());
 
-    void dispatchOnJsThreadUnattributed(JavaScriptThreadTask&& function);
+    void dispatchOnJsThreadImpl(Ref<Context> ownerContext,
+                                JavaScriptTaskScheduleType scheduleType,
+                                uint32_t delayMs,
+                                StringBox dispatchAttribution,
+                                JavaScriptThreadTask&& function);
 
     void handleUncaughtJsError(IJavaScriptContext& jsContext,
                                const Ref<Context>& ownerContext,
@@ -589,6 +766,7 @@ private:
                                         bool shouldCrash);
 
     void teardown(bool destroyContext);
+    void teardownOnJsThread(bool destroyContext);
 
     Ref<JSStackTraceProvider> doCaptureCurrentStackTrace(IJavaScriptContext& jsContext);
 
@@ -597,6 +775,35 @@ private:
                                const DispatchFunction& onDone);
 
     Result<Ref<Context>> getContextForId(ContextId contextId) const;
+};
+
+/**
+ Records the JS->native call the JS thread is inside so an ANR whose stack capture times out can
+ name it. Saves and restores the previous name, so nested calls report the innermost and unwind
+ to the parent. No-op when ANR diagnostics are off, off the runtime's JS thread, or the name is
+ empty (which would only erase the parent's).
+ */
+class ScopedNativeCallActivity {
+public:
+    ScopedNativeCallActivity(JavaScriptRuntime* runtime, const StringBox& functionName) {
+        if (runtime != nullptr && !functionName.isEmpty() && runtime->anrDiagnosticsActiveOnJsThread()) {
+            _runtime = runtime;
+            _previousName = runtime->swapCurrentNativeCallName(functionName);
+        }
+    }
+
+    ~ScopedNativeCallActivity() {
+        if (_runtime != nullptr) {
+            _runtime->swapCurrentNativeCallName(std::move(_previousName));
+        }
+    }
+
+    ScopedNativeCallActivity(const ScopedNativeCallActivity&) = delete;
+    ScopedNativeCallActivity& operator=(const ScopedNativeCallActivity&) = delete;
+
+private:
+    JavaScriptRuntime* _runtime = nullptr;
+    StringBox _previousName;
 };
 
 } // namespace Valdi

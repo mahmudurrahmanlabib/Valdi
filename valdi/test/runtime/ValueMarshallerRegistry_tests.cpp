@@ -926,9 +926,13 @@ private:
 
 class TestValueMarshallerRegistry : public SimpleRefCountable, public ValueMarshallerRegistry<Value> {
 public:
+    // withResolverRegistry=false mirrors the JS-side ValueMarshallerRegistry, whose type
+    // resolver has no ValueSchemaRegistry and can only reach schemas through the
+    // ValueSchemaReferences embedded in the schemas it receives.
     TestValueMarshallerRegistry(const Ref<ValueSchemaRegistry>& schemaRegistry,
-                                const Ref<TestDispatchQueue>& testDispatchQueue = nullptr)
-        : ValueMarshallerRegistry<Value>(ValueSchemaTypeResolver(schemaRegistry.get()),
+                                const Ref<TestDispatchQueue>& testDispatchQueue = nullptr,
+                                bool withResolverRegistry = true)
+        : ValueMarshallerRegistry<Value>(ValueSchemaTypeResolver(withResolverRegistry ? schemaRegistry.get() : nullptr),
                                          makeShared<TestPlatformValueDelegate>(),
                                          testDispatchQueue,
                                          STRING_LITERAL("Test")),
@@ -2208,6 +2212,277 @@ TEST(ValueMarshallerRegistry, supportsMarshallingSet) {
 
     ASSERT_TRUE(aSetRef->entries[2].isString());
     ASSERT_EQ(STRING_LITERAL("blue"), aSetRef->entries[2].toStringBox());
+}
+
+// Regression test for PUSH-10349: a marshaller registry whose type resolver has no
+// ValueSchemaRegistry (the JS-side registry) receives schemas as ValueSchemaReferences into a
+// platform-owned registry. When the referenced entry still contains unresolved named type
+// references — which happens whenever the platform side has not walked the entry yet, e.g.
+// with lazy function return-marshalling — the entry must be resolved against the reference's
+// owning registry instead of failing with "Cannot resolve schema from type references without
+// a registry set".
+TEST(ValueMarshallerRegistry, resolvesSchemaReferenceEntryAgainstOwningRegistry) {
+    auto schemaRegistry = makeShared<ValueSchemaRegistry>();
+
+    auto payloadSchema = ValueSchema::parse("c 'Payload'{'x': d}");
+    ASSERT_TRUE(payloadSchema) << payloadSchema.description();
+    schemaRegistry->registerSchema(payloadSchema.value());
+
+    // The function parameter keeps an unresolved named reference inside the registered entry,
+    // mirroring the G71.onForceTweakFailed shape from the crash.
+    auto sessionSchema = ValueSchema::parse("c 'Session'{'onFail': f(r:'Payload'): v, 'name': s}");
+    ASSERT_TRUE(sessionSchema) << sessionSchema.description();
+    schemaRegistry->registerSchema(sessionSchema.value());
+
+    auto valueMarshallerRegistry =
+        makeShared<TestValueMarshallerRegistry>(schemaRegistry, nullptr, /*withResolverRegistry=*/false);
+
+    auto sessionKey =
+        ValueSchemaRegistryKey(ValueSchema::typeReference(ValueSchemaTypeReference::named(STRING_LITERAL("Session"))));
+    auto sessionReference = schemaRegistry->getSchemaReferenceForTypeKey(sessionKey);
+    ASSERT_TRUE(sessionReference != nullptr);
+
+    SimpleExceptionTracker exceptionTracker;
+    auto marshaller =
+        valueMarshallerRegistry->getValueMarshaller(ValueSchema::schemaReference(sessionReference), exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+    ASSERT_TRUE(marshaller.valueMarshaller != nullptr);
+
+    auto onFail = makeShared<ValueFunctionWithCallable>(
+        [](const ValueFunctionCallContext& /*callContext*/) -> Value { return Value(); });
+    auto object = Value().setMapValue("onFail", Value(onFail)).setMapValue("name", Value(STRING_LITERAL("hello")));
+
+    auto result = marshaller.valueMarshaller->unmarshall(object, ReferenceInfoBuilder(), exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+
+    auto session = result.getTypedRef<TestObject>();
+    ASSERT_TRUE(session != nullptr);
+    ASSERT_EQ(Value(STRING_LITERAL("hello")), session->getProperty(1));
+}
+
+// End-to-end shape of the PUSH-10349 crash: with lazy function return-marshalling enabled, a
+// JS-like registry (no registry on its type resolver) defers the return marshaller of
+// Tool.createSession(); the first call resolves the return type Session — whose entry still
+// contains a named reference to Payload — through the reference's owning registry.
+TEST(ValueMarshallerRegistry, lazyReturnMarshallerResolvesThroughOwningRegistry) {
+    lazyFunctionReturnMarshallerFlag().store(true);
+
+    auto schemaRegistry = makeShared<ValueSchemaRegistry>();
+
+    auto payloadSchema = ValueSchema::parse("c 'Payload'{'x': d}");
+    ASSERT_TRUE(payloadSchema) << payloadSchema.description();
+    schemaRegistry->registerSchema(payloadSchema.value());
+
+    auto sessionSchema = ValueSchema::parse("c 'Session'{'onFail': f(r:'Payload'): v, 'name': s}");
+    ASSERT_TRUE(sessionSchema) << sessionSchema.description();
+    schemaRegistry->registerSchema(sessionSchema.value());
+
+    auto toolSchema = ValueSchema::parse("c 'Tool'{'createSession': f(): r:'Session'}");
+    ASSERT_TRUE(toolSchema) << toolSchema.description();
+    schemaRegistry->registerSchema(toolSchema.value());
+
+    auto valueMarshallerRegistry =
+        makeShared<TestValueMarshallerRegistry>(schemaRegistry, nullptr, /*withResolverRegistry=*/false);
+
+    auto toolKey =
+        ValueSchemaRegistryKey(ValueSchema::typeReference(ValueSchemaTypeReference::named(STRING_LITERAL("Tool"))));
+    auto toolReference = schemaRegistry->getSchemaReferenceForTypeKey(toolKey);
+    ASSERT_TRUE(toolReference != nullptr);
+
+    SimpleExceptionTracker exceptionTracker;
+    auto marshaller =
+        valueMarshallerRegistry->getValueMarshaller(ValueSchema::schemaReference(toolReference), exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+    ASSERT_TRUE(marshaller.valueMarshaller != nullptr);
+
+    auto createSession =
+        makeShared<ValueFunctionWithCallable>([](const ValueFunctionCallContext& /*callContext*/) -> Value {
+            auto onFail = makeShared<ValueFunctionWithCallable>(
+                [](const ValueFunctionCallContext& /*innerCallContext*/) -> Value { return Value(); });
+            return Value().setMapValue("onFail", Value(onFail)).setMapValue("name", Value(STRING_LITERAL("session-1")));
+        });
+    auto toolObject = Value().setMapValue("createSession", Value(createSession));
+
+    auto unmarshalledTool =
+        marshaller.valueMarshaller->unmarshall(toolObject, ReferenceInfoBuilder(), exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+
+    auto tool = unmarshalledTool.getTypedRef<TestObject>();
+    ASSERT_TRUE(tool != nullptr);
+
+    auto createSessionFunction = tool->getProperty(0).getTypedRef<TestFunction>();
+    ASSERT_TRUE(createSessionFunction != nullptr);
+
+    // First call triggers the lazy return-marshaller resolution; pre-fix this failed with
+    // "Lazy ValueMarshaller failed to resolve return type ... without a registry set".
+    auto callResult = createSessionFunction->call(nullptr, 0);
+    ASSERT_TRUE(callResult) << callResult.description();
+
+    auto session = callResult.value().getTypedRef<TestObject>();
+    ASSERT_TRUE(session != nullptr);
+    ASSERT_EQ(Value(STRING_LITERAL("session-1")), session->getProperty(1));
+
+    lazyFunctionReturnMarshallerFlag().store(false);
+}
+
+// A ValueFunction whose call was skipped because its owning runtime/context was being torn
+// down: it yields 'undefined' with a clean exception tracker (nothing threw — the JS body
+// simply never ran), exactly like a JS-backed function whose dispatch early-returned on
+// _isDisposed. ownerIsTearingDown() reports the teardown state the marshalling boundary
+// consults. See Valdi PR #127 (aggressive worker termination).
+class SkippedDuringTeardownValueFunction : public ValueFunction {
+public:
+    explicit SkippedDuringTeardownValueFunction(bool ownerTearingDown) : _ownerTearingDown(ownerTearingDown) {}
+    ~SkippedDuringTeardownValueFunction() override = default;
+
+    Value operator()(const ValueFunctionCallContext& /*callContext*/) noexcept override {
+        return Value::undefined();
+    }
+
+    std::string_view getFunctionType() const override {
+        return "SkippedDuringTeardownValueFunction";
+    }
+
+    bool ownerIsTearingDown() const override {
+        return _ownerTearingDown;
+    }
+
+private:
+    bool _ownerTearingDown;
+};
+
+// A synchronous native->JS bridge call whose JS body was skipped during runtime teardown returns
+// 'undefined'. For a non-Promise typed return, forwardCall() would fail to unmarshall the
+// 'undefined' and raise the uncatchable SCValdiError "Failed to unmarshall return value of
+// function ...". The Promise-return path already degrades gracefully (rejected promise); this
+// asserts the sync path degrades to a null return when the owning runtime/context is tearing
+// down, rather than crashing the app.
+TEST(ValueMarshallerRegistry, syncTypedReturnDegradesToNullWhenOwnerTornDownMidCall) {
+    auto schemaRegistry = makeShared<ValueSchemaRegistry>();
+    auto valueMarshallerRegistry = makeShared<TestValueMarshallerRegistry>(schemaRegistry);
+
+    // A module exposing a synchronous, non-Promise typed-return function (returns a string).
+    auto utilsSchema = ValueSchema::parse("c 'Utils'{'compute': f(): s}");
+    ASSERT_TRUE(utilsSchema) << utilsSchema.description();
+    auto utilsSchemaIdentifier = schemaRegistry->registerSchema(utilsSchema.value());
+
+    auto skippedCall = makeShared<SkippedDuringTeardownValueFunction>(/*ownerTearingDown*/ true);
+
+    SimpleExceptionTracker exceptionTracker;
+    auto object = Value().setMapValue("compute", Value(skippedCall));
+
+    auto result = valueMarshallerRegistry->unmarshall(utilsSchemaIdentifier, object, exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+
+    auto utils = result.getTypedRef<TestObject>();
+    ASSERT_TRUE(utils != nullptr);
+
+    auto compute = utils->getProperty(0).getTypedRef<TestFunction>();
+    ASSERT_TRUE(compute != nullptr);
+
+    auto callResult = compute->call(nullptr, 0);
+
+    ASSERT_TRUE(callResult) << callResult.description();
+    ASSERT_TRUE(callResult.value().isNullOrUndefined());
+}
+
+// The teardown guard must never mask a genuine bug: when the owner is live and healthy, a
+// non-Promise typed function returning 'undefined' is a real error and must still surface.
+// Passes today and must keep passing once the guard lands (it is gated on ownerIsTearingDown()).
+TEST(ValueMarshallerRegistry, syncTypedReturnStillErrorsOnUndefinedWhenOwnerLive) {
+    auto schemaRegistry = makeShared<ValueSchemaRegistry>();
+    auto valueMarshallerRegistry = makeShared<TestValueMarshallerRegistry>(schemaRegistry);
+
+    auto utilsSchema = ValueSchema::parse("c 'Utils'{'compute': f(): s}");
+    ASSERT_TRUE(utilsSchema) << utilsSchema.description();
+    auto utilsSchemaIdentifier = schemaRegistry->registerSchema(utilsSchema.value());
+
+    auto liveCall = makeShared<SkippedDuringTeardownValueFunction>(/*ownerTearingDown*/ false);
+
+    SimpleExceptionTracker exceptionTracker;
+    auto object = Value().setMapValue("compute", Value(liveCall));
+
+    auto result = valueMarshallerRegistry->unmarshall(utilsSchemaIdentifier, object, exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+
+    auto utils = result.getTypedRef<TestObject>();
+    ASSERT_TRUE(utils != nullptr);
+
+    auto compute = utils->getProperty(0).getTypedRef<TestFunction>();
+    ASSERT_TRUE(compute != nullptr);
+
+    auto callResult = compute->call(nullptr, 0);
+
+    ASSERT_FALSE(callResult) << "Undefined return from a live non-Promise function must still error";
+    ASSERT_TRUE(callResult.error().toStringBox().contains("Failed to unmarshall return value"))
+        << callResult.error().toString();
+}
+
+// A skipped-during-teardown call whose declared return is a non-nullable primitive (int) must
+// degrade to a TYPED default (0), not an object-typed null. On iOS an object null handed to an
+// int-returning block trips assertFieldType -> std::abort (on Android, an unboxing
+// NullPointerException); the earlier makeNull() did exactly that. Here (ValueType == Value) a
+// null degrade would surface as isNullOrUndefined(); assert we instead get a real number 0.
+TEST(ValueMarshallerRegistry, syncPrimitiveReturnDegradesToTypedZeroWhenOwnerTornDownMidCall) {
+    auto schemaRegistry = makeShared<ValueSchemaRegistry>();
+    auto valueMarshallerRegistry = makeShared<TestValueMarshallerRegistry>(schemaRegistry);
+
+    // Synchronous, non-Promise function returning a primitive int.
+    auto utilsSchema = ValueSchema::parse("c 'Utils'{'compute': f(): i}");
+    ASSERT_TRUE(utilsSchema) << utilsSchema.description();
+    auto utilsSchemaIdentifier = schemaRegistry->registerSchema(utilsSchema.value());
+
+    auto skippedCall = makeShared<SkippedDuringTeardownValueFunction>(/*ownerTearingDown*/ true);
+
+    SimpleExceptionTracker exceptionTracker;
+    auto object = Value().setMapValue("compute", Value(skippedCall));
+
+    auto result = valueMarshallerRegistry->unmarshall(utilsSchemaIdentifier, object, exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+
+    auto utils = result.getTypedRef<TestObject>();
+    ASSERT_TRUE(utils != nullptr);
+
+    auto compute = utils->getProperty(0).getTypedRef<TestFunction>();
+    ASSERT_TRUE(compute != nullptr);
+
+    auto callResult = compute->call(nullptr, 0);
+
+    ASSERT_TRUE(callResult) << callResult.description();
+    ASSERT_FALSE(callResult.value().isNullOrUndefined())
+        << "Primitive return must degrade to a typed zero, not an object null (which aborts on device)";
+    ASSERT_TRUE(callResult.value().isNumber());
+    ASSERT_EQ(0, callResult.value().toDouble());
+}
+
+// A skipped-during-teardown call whose declared return is void must degrade to platform void,
+// not an object-typed null (void-returning blocks likewise assert their field type on device).
+TEST(ValueMarshallerRegistry, syncVoidReturnDegradesToVoidWhenOwnerTornDownMidCall) {
+    auto schemaRegistry = makeShared<ValueSchemaRegistry>();
+    auto valueMarshallerRegistry = makeShared<TestValueMarshallerRegistry>(schemaRegistry);
+
+    auto utilsSchema = ValueSchema::parse("c 'Utils'{'compute': f(): v}");
+    ASSERT_TRUE(utilsSchema) << utilsSchema.description();
+    auto utilsSchemaIdentifier = schemaRegistry->registerSchema(utilsSchema.value());
+
+    auto skippedCall = makeShared<SkippedDuringTeardownValueFunction>(/*ownerTearingDown*/ true);
+
+    SimpleExceptionTracker exceptionTracker;
+    auto object = Value().setMapValue("compute", Value(skippedCall));
+
+    auto result = valueMarshallerRegistry->unmarshall(utilsSchemaIdentifier, object, exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << exceptionTracker.extractError().toString();
+
+    auto utils = result.getTypedRef<TestObject>();
+    ASSERT_TRUE(utils != nullptr);
+
+    auto compute = utils->getProperty(0).getTypedRef<TestFunction>();
+    ASSERT_TRUE(compute != nullptr);
+
+    auto callResult = compute->call(nullptr, 0);
+
+    ASSERT_TRUE(callResult) << callResult.description();
+    ASSERT_TRUE(callResult.value().isUndefined());
 }
 
 } // namespace ValdiTest

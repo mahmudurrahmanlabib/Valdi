@@ -17,13 +17,16 @@
 #include "valdi/runtime/Attributes/CompositeAttribute.hpp"
 #include "valdi/runtime/Attributes/ScrollAttributes.hpp"
 #include "valdi/runtime/Attributes/TextAttributeValueParser.hpp"
+#include "valdi/runtime/Attributes/TransformAttributes.hpp"
 #include "valdi/runtime/Attributes/ValueConverters.hpp"
+#include "valdi/runtime/Attributes/ViewNodeTextInlineAttachment.hpp"
 #include "valdi/runtime/Views/MeasureDelegate.hpp"
 
 #include "valdi/runtime/Runtime.hpp"
 #include "valdi_core/cpp/Attributes/AttributeUtils.hpp"
 #include "valdi_core/cpp/Resources/Asset.hpp"
 #include "valdi_core/cpp/Utils/Format.hpp"
+#include "valdi_core/cpp/Utils/SmallVector.hpp"
 #include "valdi_core/cpp/Utils/StringCache.hpp"
 #include "valdi_core/cpp/Utils/Trace.hpp"
 #include "valdi_core/cpp/Utils/ValueArray.hpp"
@@ -50,10 +53,22 @@ static Result<Value> preprocessString(const Value& value) {
     return ValueConverter::toString(value).map<Value>();
 }
 
+static Result<Value> postprocessColor(ViewNode& viewNode, const Value& value) {
+    if (!value.isString()) {
+        return value;
+    }
+
+    const auto& colorPalette = viewNode.getResolvedColorPalette();
+    if (colorPalette == nullptr) {
+        return Error("ViewNode has no resolved ColorPalette");
+    }
+    return ValueConverter::toColor(*colorPalette, value);
+}
+
 AttributesBindingContextImpl::AttributesBindingContextImpl(AttributeIds& attributeIds,
-                                                           const Ref<ColorPalette>& colorPalette,
+                                                           const Ref<ColorPaletteManager>& colorPaletteManager,
                                                            ILogger& logger)
-    : _attributeIds(attributeIds), _colorPalette(colorPalette), _logger(logger) {}
+    : _attributeIds(attributeIds), _colorPaletteManager(colorPaletteManager), _logger(logger) {}
 
 AttributesBindingContextImpl::~AttributesBindingContextImpl() = default;
 
@@ -113,17 +128,33 @@ AttributeId AttributesBindingContextImpl::bindTextAttribute(const StringBox& att
                                                             bool invalidateLayoutOnChange,
                                                             const Ref<AttributeHandlerDelegate>& delegate) {
     auto& registeredHandler = registerHandler(attribute, invalidateLayoutOnChange, delegate);
-    registeredHandler.appendPreprocessor(
-        [colorPalette = _colorPalette, logger = &_logger](const Value& value) -> Result<Value> {
-            if (value.isString()) {
-                return value;
-            }
-            // strict parsing for non production build
-            auto strict = !snap::kIsAppstoreBuild;
-            return TextAttributeValueParser::parse(*colorPalette, value, *logger, strict);
-        },
-        false);
-    registeredHandler.setEnablePreprocessorCache(true);
+    registeredHandler.appendPostprocessor([logger = &_logger](ViewNode& viewNode, const Value& value) -> Result<Value> {
+        if (value.isString()) {
+            return value;
+        }
+        // strict parsing for non production build
+        auto strict = !snap::kIsAppstoreBuild;
+        const auto& colorPalette = viewNode.getResolvedColorPalette();
+        if (colorPalette == nullptr) {
+            return Error("ViewNode has no resolved ColorPalette");
+        }
+
+        auto* attachmentsViewNode = viewNode.getEmittingViewNode();
+        if (attachmentsViewNode == nullptr) {
+            attachmentsViewNode = &viewNode;
+        }
+
+        SmallVector<Ref<TextInlineAttachment>, 8> attachments;
+        auto childCount = attachmentsViewNode->getChildCount();
+        attachments.reserve(childCount);
+        for (size_t i = 0; i < childCount; i++) {
+            attachments.emplace_back(
+                makeShared<ViewNodeTextInlineAttachment>(i, strongSmallRef(attachmentsViewNode->getChildAt(i))));
+        }
+        return TextAttributeValueParser::parse(
+            *colorPalette, value, *logger, attachments.data(), attachments.size(), strict);
+    });
+    registeredHandler.setShouldReevaluateOnColorPaletteChange(true);
 
     return registeredHandler.getId();
 }
@@ -207,6 +238,21 @@ AttributeId AttributesBindingContextImpl::bindCompositeAttribute(
     return attributeId;
 }
 
+AttributeId AttributesBindingContextImpl::bindTransformAttributes(const Ref<AttributeHandlerDelegate>& delegate) {
+    std::vector<snap::valdi_core::CompositeAttributePart> parts;
+    parts.emplace_back(STRING_LITERAL("transformOrigin"), snap::valdi_core::AttributeType::String, true, false);
+    parts.emplace_back(STRING_LITERAL("transform"), snap::valdi_core::AttributeType::String, true, false);
+    parts.emplace_back(STRING_LITERAL("translationX"), snap::valdi_core::AttributeType::Untyped, true, false);
+    parts.emplace_back(STRING_LITERAL("translationY"), snap::valdi_core::AttributeType::Untyped, true, false);
+    parts.emplace_back(STRING_LITERAL("scaleX"), snap::valdi_core::AttributeType::Double, true, false);
+    parts.emplace_back(STRING_LITERAL("scaleY"), snap::valdi_core::AttributeType::Double, true, false);
+    parts.emplace_back(STRING_LITERAL("rotation"), snap::valdi_core::AttributeType::Double, true, false);
+
+    auto attributeId = bindCompositeAttribute(STRING_LITERAL("transformComposite"), parts, delegate);
+    _handlers[attributeId].appendPostprocessor(&TransformAttributes::postprocessViewNode);
+    return attributeId;
+}
+
 void AttributesBindingContextImpl::bindScrollAttributes() {
     ScrollAttributes scrollAttributes(_attributeIds);
     scrollAttributes.bind(_handlers);
@@ -261,16 +307,8 @@ const AttributeHandlerById& AttributesBindingContextImpl::getHandlers() const {
 }
 
 void AttributesBindingContextImpl::registerColorPreprocessor(AttributeHandler& handler) {
-    handler.appendPreprocessor(
-        [colorPalette = _colorPalette](const Value& value) -> Result<Value> {
-            auto color = ValueConverter::toColor(*colorPalette, value);
-            if (!color) {
-                return color.moveError();
-            }
-
-            return Value(color.value().value);
-        },
-        false);
+    handler.appendPreprocessor(&ValueConverter::toColorValue, false);
+    handler.appendPostprocessor(&postprocessColor);
     handler.setShouldReevaluateOnColorPaletteChange(true);
 }
 

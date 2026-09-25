@@ -32,10 +32,10 @@
 
 #include <fmt/format.h>
 
-#include <codecvt>
 #include <functional>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -149,12 +149,7 @@ using String = Primitive<std::string>;
 template<typename T>
 using Enum = Primitive<T, int32_t>;
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 class WString {
-    using Utf8Converter = std::wstring_convert<std::codecvt_utf8<wchar_t>>;
-    using Utf16Converter = std::wstring_convert<std::codecvt_utf16<wchar_t>>;
-
 public:
     using CppType = std::wstring;
     using ValdiType = Valdi::Value;
@@ -163,28 +158,21 @@ public:
 
     static CppType toCpp(const ValdiType& v) {
         if (v.isInternedString()) {
-            auto utf8str = v.toStringBox().toStringView();
-            return Utf8Converter{}.from_bytes(utf8str.data(), utf8str.data() + utf8str.size());
+            return Valdi::StaticString::utf8ToWString(v.toStringBox().toStringView());
         } else {
-            const auto* sstr = v.getStaticString();
-            if (sstr->encoding() == Valdi::StaticString::Encoding::UTF8) {
-                return Utf8Converter{}.from_bytes(sstr->utf8Data(), sstr->utf8Data() + sstr->size());
-            } else {
-                const auto* begin = reinterpret_cast<const char*>(sstr->utf16Data());
-                const auto* end = reinterpret_cast<const char*>(sstr->utf16Data() + sstr->size());
-                return Utf16Converter{}.from_bytes(begin, end);
-            }
+            return v.getStaticString()->toStdWString();
         }
     }
+
     static ValdiType fromCpp(const CppType& c) {
-        return ValdiType(Utf8Converter{}.to_bytes(c));
+        return ValdiType(Valdi::StaticString::makeWithWideChars(c.data(), c.size()));
     }
+
     static const Valdi::ValueSchema& schema() noexcept {
         static auto schema = Valdi::ValueSchema::string();
         return schema;
     }
 };
-#pragma clang diagnostic pop
 
 class Binary {
 public:
@@ -482,6 +470,12 @@ extern std::unordered_map<void*, CppProxyCacheEntry> cppProxyCache;
 extern std::mutex jsProxyCacheMutex;
 extern std::mutex cppProxyCacheMutex;
 
+// Set once from the Composer layer after COF resolves; read on the hot path (COMPOSER-6103).
+void setGlobalOneWayCalls(bool enabled) noexcept;
+bool globalOneWayCallsEnabled() noexcept;
+
+void logDroppedExpiredProxyCall(const Valdi::ValueTypedProxyObject& proxy, size_t methodIndex) noexcept;
+
 class ValdiProxyBase {
 protected:
     Valdi::Ref<Valdi::ValueTypedProxyObject> _js;
@@ -489,7 +483,9 @@ protected:
 
 public:
     ValdiProxyBase(Valdi::Ref<Valdi::ValueTypedProxyObject> js)
-        : _js(js), _methods(_js->getTypedObject()->getPropertiesSize()) {}
+        : _js(js), _methods(_js->getTypedObject()->getPropertiesSize()) {
+        buildOneWayMethodMap();
+    }
     virtual ~ValdiProxyBase() {
         std::lock_guard lk(jsProxyCacheMutex);
         jsProxyCache.erase(_js->getId());
@@ -498,11 +494,23 @@ public:
         return _js;
     }
     Valdi::Value callJsMethod(size_t i, std::initializer_list<Valdi::Value> parameters) {
+        // Void-only so a return value is never dropped (COMPOSER-6103).
+        const bool isOneWay = globalOneWayCallsEnabled() && i < _isVoidMethod.size() && _isVoidMethod[i];
         if (_js->expired()) {
+            // A one-way event to a torn-down listener is a no-op by definition; throwing
+            // instead aborts callers on non-JS threads with no handler up-stack.
+            if (isOneWay) {
+                logDroppedExpiredProxyCall(*_js, i);
+                return Valdi::Value::undefined();
+            }
             throw JsException(Valdi::Error("proxy expired"));
         }
         if (_methods[i] == nullptr) {
             _methods[i] = _js->getTypedObject()->getProperty(i).getFunctionRef();
+        }
+        if (isOneWay) {
+            std::ignore = _methods[i]->call(Valdi::ValueFunctionFlagsNone, parameters);
+            return Valdi::Value::undefined();
         }
         constexpr auto flags = static_cast<Valdi::ValueFunctionFlags>(Valdi::ValueFunctionFlagsCallSync |
                                                                       Valdi::ValueFunctionFlagsPropagatesError);
@@ -512,6 +520,23 @@ public:
         } else {
             // Throw JS Error as C++ exception
             throw JsException(res.moveError());
+        }
+    }
+
+private:
+    // Empty when the proxy's schema is unavailable, which keeps every method on the synchronous path (COMPOSER-6103).
+    std::vector<bool> _isVoidMethod;
+
+    void buildOneWayMethodMap() {
+        const auto& classSchema = _js->getTypedObject()->getSchema();
+        if (classSchema == nullptr) {
+            return;
+        }
+        const size_t count = classSchema->getPropertiesSize();
+        _isVoidMethod.resize(count, false);
+        for (size_t i = 0; i < count; ++i) {
+            const auto* function = classSchema->getProperty(i).schema.getFunction();
+            _isVoidMethod[i] = function != nullptr && function->getReturnValue().isVoid();
         }
     }
 };

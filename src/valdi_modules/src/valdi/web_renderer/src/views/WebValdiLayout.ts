@@ -1,4 +1,5 @@
 import { generateStyles, isAttributeValidStyle } from '../styles/ValdiWebStyles';
+import { injectTouchAreaStyles } from '../styles/touchAreaExtension';
 import { UpdateAttributeDelegate } from '../ValdiWebRendererDelegate';
 import { TouchEventState } from 'valdi_tsx/src/GestureEvents';
 
@@ -43,6 +44,9 @@ export class WebValdiLayout {
   // Touch area extension
   private _touchAreaExtension = { top: 0, right: 0, bottom: 0, left: 0 };
 
+  // Stored listeners for cleanup on re-assignment, keyed by attribute name
+  private _onTouchListeners: { key: string; type: string; handler: EventListener; target: EventTarget }[] = [];
+
   constructor(id: number, attributeDelegate?: UpdateAttributeDelegate) {
     this.id = id;
     this.attributeDelegate = attributeDelegate;
@@ -85,10 +89,15 @@ export class WebValdiLayout {
     return element;
   }
 
-  makeRoot(root: HTMLElement) {
+  makeRoot(root: HTMLElement | ShadowRoot) {
     this.parent?.removeChild(this);
     this.parent = null;
     root.replaceChildren(this.htmlElement);
+    if (root instanceof ShadowRoot) {
+      injectTouchAreaStyles(root);
+    } else {
+      injectTouchAreaStyles(root.ownerDocument);
+    }
     if (this._onViewChange && !this._isAttached) {
       this._isAttached = true;
       this._onViewChange({ type: 'Attached' });
@@ -119,7 +128,23 @@ export class WebValdiLayout {
     this._onViewDestroy?.();
     this._onLayoutObserver?.disconnect();
     this._visibilityAndViewportObserver?.disconnect();
+    for (const { type, handler, target } of this._onTouchListeners) {
+      target.removeEventListener(type, handler);
+    }
+    this._onTouchListeners = [];
     this.htmlElement.remove();
+  }
+
+  private _removeListenersByKey(key: string) {
+    const remaining: typeof this._onTouchListeners = [];
+    for (const entry of this._onTouchListeners) {
+      if (entry.key === key) {
+        entry.target.removeEventListener(entry.type, entry.handler);
+      } else {
+        remaining.push(entry);
+      }
+    }
+    this._onTouchListeners = remaining;
   }
 
   private updateTransform() {
@@ -132,18 +157,32 @@ export class WebValdiLayout {
       parts.push(`scale(${scaleX}, ${scaleY})`);
     }
     if (rotation !== 0) {
-      parts.push(`rotate(${rotation}deg)`);
+      parts.push(`rotate(${rotation}rad)`);
     }
     this.htmlElement.style.transform = parts.join(' ');
   }
 
   private updateTouchAreaExtension() {
     const { top, right, bottom, left } = this._touchAreaExtension;
-    this.htmlElement.style.paddingTop = `${top}px`;
-    this.htmlElement.style.paddingRight = `${right}px`;
-    this.htmlElement.style.paddingBottom = `${bottom}px`;
-    this.htmlElement.style.paddingLeft = `${left}px`;
-    this.htmlElement.style.margin = `-${top}px -${right}px -${bottom}px -${left}px`;
+    const hasExtension = top > 0 || right > 0 || bottom > 0 || left > 0;
+
+    if (hasExtension) {
+      const rootNode = this.htmlElement.getRootNode();
+      if (rootNode instanceof ShadowRoot || rootNode instanceof Document) {
+        injectTouchAreaStyles(rootNode);
+      }
+      this.htmlElement.setAttribute('data-touch-ext', '');
+      this.htmlElement.style.setProperty('--touch-ext-top', `${top}px`);
+      this.htmlElement.style.setProperty('--touch-ext-right', `${right}px`);
+      this.htmlElement.style.setProperty('--touch-ext-bottom', `${bottom}px`);
+      this.htmlElement.style.setProperty('--touch-ext-left', `${left}px`);
+    } else {
+      this.htmlElement.removeAttribute('data-touch-ext');
+      this.htmlElement.style.removeProperty('--touch-ext-top');
+      this.htmlElement.style.removeProperty('--touch-ext-right');
+      this.htmlElement.style.removeProperty('--touch-ext-bottom');
+      this.htmlElement.style.removeProperty('--touch-ext-left');
+    }
   }
 
   private setupEventListeners() {
@@ -199,10 +238,11 @@ export class WebValdiLayout {
     return (event: MouseEvent | TouchEvent) => {
       if (typeof value !== 'function') return;
       const touch = 'touches' in event ? event.touches[0] || event.changedTouches[0] : event;
+      const rect = this.htmlElement.getBoundingClientRect();
       const touchEvent = {
         state,
-        x: touch.clientX,
-        y: touch.clientY,
+        x: touch.clientX - rect.left,
+        y: touch.clientY - rect.top,
         absoluteX: touch.clientX,
         absoluteY: touch.clientY,
         pointerCount: 'touches' in event ? event.touches.length : 1,
@@ -216,6 +256,21 @@ export class WebValdiLayout {
   }
 
   changeAttribute(attributeName: string, attributeValue: any) {
+    // A whole Style object lands here when a component spreads props through
+    // setAttributes(): that path dispatches via onElementAttributeChangeAny,
+    // which (unlike setAttributeStyle -> onElementAttributeChangeStyle) does not
+    // expand the style per key. Without this, generateStyles('style', ...)
+    // yields {style: <object>} and the element's whole style is silently dropped.
+    if (attributeName === 'style' && attributeValue && typeof attributeValue === 'object') {
+      const styleAttributes = attributeValue.attributes;
+      if (styleAttributes && typeof styleAttributes === 'object') {
+        for (const key of Object.keys(styleAttributes)) {
+          this.changeAttribute(key, styleAttributes[key]);
+        }
+        return;
+      }
+    }
+
     if (isAttributeValidStyle(attributeName)) {
       const generatedStyles = generateStyles(attributeName, attributeValue);
       Object.assign(this.htmlElement.style, generatedStyles);
@@ -281,40 +336,56 @@ export class WebValdiLayout {
         }
         return;
       case 'slowClipping':
+        this.htmlElement.style.overflow = attributeValue ? 'hidden' : 'visible';
+        return;
       case 'touchEnabled':
       case 'hitTest':
         this.htmlElement.style.pointerEvents = attributeValue ? 'auto' : 'none';
         return;
-      case 'onTouch':
-        this.htmlElement.addEventListener(
-          'touchstart',
-          this.createTouchEventHandler(attributeValue, TouchEventState.Started),
-        );
-        this.htmlElement.addEventListener(
-          'touchmove',
-          this.createTouchEventHandler(attributeValue, TouchEventState.Changed),
-        );
-        this.htmlElement.addEventListener(
-          'touchend',
-          this.createTouchEventHandler(attributeValue, TouchEventState.Ended),
-        );
-        this.htmlElement.addEventListener(
-          'touchcancel',
-          this.createTouchEventHandler(attributeValue, TouchEventState.Ended),
-        );
+      case 'onTouch': {
+        this._removeListenersByKey('onTouch');
+        this.htmlElement.style.pointerEvents = 'auto';
+
+        const addTracked = (target: EventTarget, type: string, handler: EventListener) => {
+          target.addEventListener(type, handler);
+          this._onTouchListeners.push({ key: 'onTouch', type, handler, target });
+        };
+
+        addTracked(this.htmlElement, 'touchstart', this.createTouchEventHandler(attributeValue, TouchEventState.Started) as EventListener);
+        addTracked(this.htmlElement, 'touchmove', this.createTouchEventHandler(attributeValue, TouchEventState.Changed) as EventListener);
+        addTracked(this.htmlElement, 'touchend', this.createTouchEventHandler(attributeValue, TouchEventState.Ended) as EventListener);
+        addTracked(this.htmlElement, 'touchcancel', this.createTouchEventHandler(attributeValue, TouchEventState.Ended) as EventListener);
+
+        const mouseMoveHandler = this.createTouchEventHandler(attributeValue, TouchEventState.Changed);
+        const mouseEndHandler = this.createTouchEventHandler(attributeValue, TouchEventState.Ended);
+        const onMouseUp = ((e: MouseEvent) => {
+          if (e.button !== 0) return;
+          document.removeEventListener('mousemove', mouseMoveHandler);
+          document.removeEventListener('mouseup', onMouseUp);
+          mouseEndHandler(e);
+        }) as EventListener;
+        addTracked(this.htmlElement, 'mousedown', ((e: MouseEvent) => {
+          if (e.button !== 0) return;
+          this.createTouchEventHandler(attributeValue, TouchEventState.Started)(e);
+          document.addEventListener('mousemove', mouseMoveHandler);
+          document.addEventListener('mouseup', onMouseUp);
+        }) as EventListener);
         return;
-      case 'onTouchStart':
-        this.htmlElement.addEventListener(
-          'touchstart',
-          this.createTouchEventHandler(attributeValue, TouchEventState.Started),
-        );
+      }
+      case 'onTouchStart': {
+        this._removeListenersByKey('onTouchStart');
+        const handler = this.createTouchEventHandler(attributeValue, TouchEventState.Started) as EventListener;
+        this.htmlElement.addEventListener('touchstart', handler);
+        this._onTouchListeners.push({ key: 'onTouchStart', type: 'touchstart', handler, target: this.htmlElement });
         return;
-      case 'onTouchEnd':
-        this.htmlElement.addEventListener(
-          'touchend',
-          this.createTouchEventHandler(attributeValue, TouchEventState.Ended),
-        );
+      }
+      case 'onTouchEnd': {
+        this._removeListenersByKey('onTouchEnd');
+        const handler = this.createTouchEventHandler(attributeValue, TouchEventState.Ended) as EventListener;
+        this.htmlElement.addEventListener('touchend', handler);
+        this._onTouchListeners.push({ key: 'onTouchEnd', type: 'touchend', handler, target: this.htmlElement });
         return;
+      }
       case 'onTouchDelayDuration':
         // This affects gesture recognition timing. Mapping to long press duration.
         this._longPressDuration = attributeValue;
@@ -324,6 +395,13 @@ export class WebValdiLayout {
         return;
       case 'onTap':
         this._onTap = attributeValue;
+        if (attributeValue) {
+          this.htmlElement.style.pointerEvents = 'auto';
+          this.htmlElement.style.cursor = 'pointer';
+        } else {
+          this.htmlElement.style.pointerEvents = 'none';
+          this.htmlElement.style.cursor = '';
+        }
         return;
       case 'onTapPredicate':
         this._onTapPredicate = attributeValue;
@@ -420,7 +498,7 @@ export class WebValdiLayout {
           this._onLayoutObserver = new ResizeObserver(entries => {
             for (const entry of entries) {
               const { width, height, x, y } = entry.contentRect;
-              attributeValue({ layout: { x, y, width, height } });
+              attributeValue({ x, y, width, height });
             }
           });
           this._onLayoutObserver.observe(this.htmlElement);

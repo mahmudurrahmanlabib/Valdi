@@ -19,6 +19,7 @@
 #include "valdi_core/cpp/Utils/Mutex.hpp"
 #include "valdi_core/cpp/Utils/Shared.hpp"
 #include <atomic>
+#include <optional>
 #include <vector>
 
 struct YGConfig;
@@ -61,7 +62,7 @@ public:
     virtual void onRuntimeCreated(Runtime& runtime) = 0;
 };
 
-class RuntimeManager : public ValdiObject, protected ColorPaletteListener {
+class RuntimeManager : public ValdiObject, protected ColorPaletteManagerListener {
 public:
     RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispatcher,
                    IJavaScriptBridge* jsBridge,
@@ -74,6 +75,18 @@ public:
                    bool enableDebuggerService,
                    bool disableHotReloader,
                    bool isStandalone);
+    RuntimeManager(const Ref<IMainThreadDispatcher>& mainThreadDispatcher,
+                   IJavaScriptBridge* jsBridge,
+                   const Ref<IDiskCache>& diskCache,
+                   Shared<snap::valdi::Keychain> keychain,
+                   const Shared<snap::valdi::RuntimeMessageHandler>& runtimeMessageHandler,
+                   PlatformType platformType,
+                   ThreadQoSClass jsThreadQoS,
+                   const Ref<ILogger>& logger,
+                   bool enableDebuggerService,
+                   bool disableHotReloader,
+                   bool isStandalone,
+                   std::optional<uint32_t> debuggerPort);
     ~RuntimeManager() override;
 
     void postInit();
@@ -112,6 +125,7 @@ public:
     void applicationWillTerminate();
 
     bool debuggerServiceEnabled() const;
+    std::optional<uint32_t> getDebuggerServicePort() const;
 
     void setUserSession(const StringBox& userId);
     void setApplicationId(const StringBox& applicationId);
@@ -133,7 +147,10 @@ public:
 
     void setTweakValueProvider(const Shared<ITweakValueProvider>& tweakValueProvider);
 
+    void setMmapCacheDirectory(const Path& path);
+
     JavaScriptContextMemoryStatistics dumpMemoryStatistics();
+    void dumpMemoryStatisticsAsync(Function<void(JavaScriptContextMemoryStatistics)> completion);
 
     void setJsThreadQoS(ThreadQoSClass jsThreadQoS);
 
@@ -148,6 +165,8 @@ public:
     void flushLoadOperations();
 
     void emitInitMetrics();
+    void emitXpatCreateRuntimeMetrics();
+    void emitIosRuntimeCreateMetrics();
     void emitUserSessionReadyMetrics();
 
     void setMetrics(const Ref<Metrics>& metrics);
@@ -159,9 +178,13 @@ public:
     VALDI_CLASS_HEADER(RuntimeManager)
 
 protected:
-    void onColorPaletteUpdated(const ColorPalette& colorPalette) override;
+    void onColorPaletteManagerUpdated(const ColorPaletteManager& colorPaletteManager,
+                                      const ColorPalette& colorPalette,
+                                      bool activeColorPaletteChanged) override;
 
 private:
+    using MetricsDuration = snap::utils::time::Duration<std::chrono::steady_clock>;
+
     std::shared_ptr<MetricsStopWatch> _initStopWatch;
     std::shared_ptr<YGConfig> _yogaConfig;
     Shared<DebuggerService> _debuggerService;
@@ -190,11 +213,14 @@ private:
     std::vector<RegisteredTypeConverter> _registeredTypeConverters;
     std::vector<Ref<IRuntimeManagerListener>> _listeners;
 
-    Ref<ColorPalette> _colorPalette;
+    Ref<ColorPaletteManager> _colorPaletteManager;
     Ref<AttributionResolver> _attributionResolver;
     Holder<Ref<UserSession>> _userSession;
     Ref<ValdiRuntimeTweaks> _runtimeTweaks;
     Ref<Metrics> _metrics;
+    std::optional<MetricsDuration> _userSessionAttachLatency;
+    bool _userSessionAttachLatencyEmitted = false;
+    Path _mmapCacheDirectory;
     Ref<JavaScriptANRDetector> _anrDetector;
     PlatformType _platformType;
     ThreadQoSClass _jsThreadQoS;
@@ -217,9 +243,8 @@ private:
 
     void updateLoadOperationsCount(int increment);
 
-    using MetricsDuration = snap::utils::time::Duration<std::chrono::steady_clock>;
-
     void emitMetrics(void (Metrics::*emitterFunc)(const MetricsDuration&));
+    void emitUserSessionAttachMetricsIfNeeded();
 };
 
 } // namespace Valdi

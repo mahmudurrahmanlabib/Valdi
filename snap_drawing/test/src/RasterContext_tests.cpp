@@ -9,6 +9,7 @@
 #include "snap_drawing/cpp/Layers/ExternalLayer.hpp"
 #include "snap_drawing/cpp/Layers/Interfaces/ILayerRoot.hpp"
 #include "snap_drawing/cpp/Layers/Layer.hpp"
+#include "snap_drawing/cpp/Layers/ShapeLayer.hpp"
 #include "snap_drawing/cpp/Utils/Bitmap.hpp"
 #include "valdi_core/cpp/Interfaces/IBitmapFactory.hpp"
 #include "valdi_core/cpp/Utils/ConsoleLogger.hpp"
@@ -175,6 +176,25 @@ TEST_F(RasterContextTests, canRasterSimpleScene) {
     ASSERT_EQ(0, _bitmapFactory->createdBitmapCount);
 }
 
+TEST_F(RasterContextTests, shapeFillGradientUsesLayerBoundsWhenPathIsSmaller) {
+    _contentLayer->setFrame(Rect::makeXYWH(0, 0, 4, 4));
+
+    auto shapeLayer = makeLayer<ShapeLayer>(_resources);
+    shapeLayer->setFrame(Rect::makeXYWH(0, 0, 4, 4));
+
+    Path path;
+    path.addRect(Rect::makeXYWH(0, 0, 4, 2), true);
+    shapeLayer->setPath(std::move(path));
+    shapeLayer->setFillLinearGradient({0.0f, 1.0f}, {Color::red(), Color::blue()}, LinearGradientOrientationTopBottom);
+    _contentLayer->addChild(shapeLayer);
+
+    auto result = raster();
+    ASSERT_TRUE(result) << result.description();
+
+    auto pixel = result.value()->getPixel(1, 1);
+    ASSERT_GT(pixel.getRed(), pixel.getBlue());
+}
+
 TEST_F(RasterContextTests, scalesSceneToBitmap) {
     _contentLayer->setBackgroundColor(Color::red());
 
@@ -224,7 +244,8 @@ TEST_F(RasterContextTests, canRasterDelta) {
                   // clang-format on
               }));
 
-    ASSERT_EQ(16, result.value().renderedPixelsCount);
+    // With 1px AA margin, 4x4 rect becomes 6x6 = 36 pixels
+    ASSERT_EQ(36, result.value().renderedPixelsCount);
 
     outputBitmap->setPixels(std::initializer_list<Color>({
         // clang-format off
@@ -254,17 +275,20 @@ TEST_F(RasterContextTests, canRasterDelta) {
     result = rasterDelta(outputBitmap);
     ASSERT_TRUE(result) << result.description();
 
+    // With 1px AA margin, the damage rect extends beyond the changed 2x2 area,
+    // causing the red background to be re-rendered in the margin area
     ASSERT_EQ(*outputBitmap,
               std::initializer_list<Color>({
                   // clang-format off
-                            Color::black(), Color::black(), Color::black(), Color::black(),
-                            Color::black(), Color::green(), Color::green(), Color::black(),
-                            Color::black(), Color::green(), Color::green(), Color::black(),
-                            Color::black(), Color::black(), Color::black(), Color::black(),
+                            Color::red(), Color::red(), Color::red(), Color::red(),
+                            Color::red(), Color::green(), Color::green(), Color::red(),
+                            Color::red(), Color::green(), Color::green(), Color::red(),
+                            Color::red(), Color::red(), Color::red(), Color::red(),
                   // clang-format on
               }));
 
-    ASSERT_EQ(4, result.value().renderedPixelsCount);
+    // With 1px AA margin, 2x2 rect becomes 4x4 = 16 pixels
+    ASSERT_EQ(16, result.value().renderedPixelsCount);
 }
 
 TEST_F(RasterContextTests, canRasterDeltaWithScale) {
@@ -305,12 +329,13 @@ TEST_F(RasterContextTests, canRasterDeltaWithScale) {
     result = rasterDelta(outputBitmap);
     ASSERT_TRUE(result) << result.description();
 
+    // With 1px AA margin, the 2x2 green layer's damage extends to adjacent red pixels
     ASSERT_EQ(*outputBitmap,
               std::initializer_list<Color>({
                   // clang-format off
-                            Color::green(), Color::green(), Color::black(), Color::black(),
-                            Color::green(), Color::green(), Color::black(), Color::black(),
-                            Color::black(), Color::black(), Color::black(), Color::black(),
+                            Color::green(), Color::green(), Color::red(), Color::black(),
+                            Color::green(), Color::green(), Color::red(), Color::black(),
+                            Color::red(), Color::red(), Color::red(), Color::black(),
                             Color::black(), Color::black(), Color::black(), Color::black(),
                   // clang-format on
               }));
@@ -344,13 +369,15 @@ TEST_F(RasterContextTests, canRasterDeltaWitMovedSurfaces) {
     result = rasterDelta(outputBitmap);
     ASSERT_TRUE(result) << result.description();
 
+    // With 1px AA margin, moving the layer causes both old and new positions to
+    // re-render with their margins, exposing the red background
     ASSERT_EQ(*outputBitmap,
               std::initializer_list<Color>({
                   // clang-format off
-                            Color::black(), Color::black(), Color::black(), Color::black(),
-                            Color::blue(), Color::blue(), Color::red(), Color::black(),
-                            Color::blue(), Color::blue(), Color::red(), Color::black(),
-                            Color::black(), Color::black(), Color::black(), Color::black(),
+                            Color::red(), Color::red(), Color::red(), Color::red(),
+                            Color::blue(), Color::blue(), Color::red(), Color::red(),
+                            Color::blue(), Color::blue(), Color::red(), Color::red(),
+                            Color::red(), Color::red(), Color::red(), Color::red(),
                   // clang-format on
               }));
 }
@@ -551,8 +578,8 @@ TEST_F(RasterContextTests, canRasterWithInternalDeltaMode) {
                   // clang-format on
               }));
 
-    // Initially it should rasterize the entire bitmap.
-    ASSERT_EQ(16, result.value().renderedPixelsCount);
+    // Initially it should rasterize the entire bitmap (4x4 + margin = 6x6 = 36 pixels).
+    ASSERT_EQ(36, result.value().renderedPixelsCount);
 
     // Raster again with no changes, it should not draw anything.
 
@@ -586,7 +613,8 @@ TEST_F(RasterContextTests, canRasterWithInternalDeltaMode) {
                   // clang-format on
               }));
 
-    ASSERT_EQ(8, result.value().renderedPixelsCount);
+    // With 1px AA margin, old (2x2) + new (2x2) positions overlap to ~24 pixels
+    ASSERT_EQ(24, result.value().renderedPixelsCount);
 
     innerLayer->setBackgroundColor(Color::green());
 
@@ -603,7 +631,8 @@ TEST_F(RasterContextTests, canRasterWithInternalDeltaMode) {
                   // clang-format on
               }));
 
-    ASSERT_EQ(4, result.value().renderedPixelsCount);
+    // With 1px AA margin, 2x2 rect becomes 4x4 = 16 pixels
+    ASSERT_EQ(16, result.value().renderedPixelsCount);
 }
 
 TEST_F(RasterContextTests, canRasterWithInternalDeltaModeAndNoClear) {
@@ -641,7 +670,8 @@ TEST_F(RasterContextTests, canRasterWithInternalDeltaModeAndNoClear) {
                   // clang-format on
               }));
 
-    ASSERT_EQ(16, result.value().renderedPixelsCount);
+    // With 1px AA margin, 4x4 rect becomes 6x6 = 36 pixels
+    ASSERT_EQ(36, result.value().renderedPixelsCount);
 
     outputBitmap->setPixels(std::initializer_list<Color>({
         // clang-format off
@@ -667,7 +697,8 @@ TEST_F(RasterContextTests, canRasterWithInternalDeltaModeAndNoClear) {
                   // clang-format on
               }));
 
-    ASSERT_EQ(9, result.value().renderedPixelsCount);
+    // With 1px AA margin, old (2x2) and new (2x2) positions with overlap = 25 pixels
+    ASSERT_EQ(25, result.value().renderedPixelsCount);
 }
 
 } // namespace snap::drawing

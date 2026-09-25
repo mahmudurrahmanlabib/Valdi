@@ -63,6 +63,7 @@ public:
 
     struct RasterResult {
         size_t renderedPixelsCount = 0;
+        std::vector<Rect> damageRects;
     };
 
     Valdi::Result<RasterResult> raster(const Ref<DisplayList>& displayList,
@@ -123,7 +124,8 @@ private:
         ExternalSurfaceSnapshot* externalSurfaceSnapshot,
         const Rect& frame,
         const Matrix& transform,
-        const Valdi::BitmapInfo& bitmapInfo,
+        int bitmapWidth,
+        int bitmapHeight,
         Scalar rasterScaleX,
         Scalar rasterScaleY,
         size_t rasterId);

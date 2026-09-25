@@ -30,10 +30,14 @@ Each entry within the `strings-en.json` file has a unique key and must be lower 
 
 Messages can contain uniquely named placeholders. By default, a placeholder is of type `string` but you may add `sprintf` style formatting such as `%s` and `%d` as a suffix to your named placeholder.
 
-### 2. Add the strings directory to your module.yaml
-```yaml
-# Where to find your strings directory
-strings_dir: strings
+### 2. Point your module at the strings directory
+Set `strings_dir` on the `valdi_module()` call in your module's `BUILD.bazel`:
+```python
+valdi_module(
+    name = "my_module",
+    # ...
+    strings_dir = "strings",
+)
 ```
 
 ### 3. Generate `Strings.d.ts`
@@ -70,6 +74,9 @@ val helloWorld = getResources().getString(com.snap.valdi.modules.valdi_example.R
 ### 6. That's it!
 
 Valdi tooling processes the input strings .json files for both the Base (English) localization and the translations. The tooling generates .strings files for iOS and strings .xml files for Android, which are included in the published Valdi modules artifacts.
+
+> [!Note]
+> The Valdi compiler automatically generates a TypeScript file exposing individual localizable strings, similar to the Asset Catalog. This ensures that using localized strings in TypeScript is type-safe and enables autocompletion in your IDE.
 
 
 ## Template Strings

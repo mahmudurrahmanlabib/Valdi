@@ -20,6 +20,7 @@ export function getModel(): string;
 export function getDisplayWidth(): number;
 export function getDisplayHeight(): number;
 export function getDisplayScale(): number;
+export function getDynamicTypeScale(): number;
 export function getWindowWidth(): number;
 export function getWindowHeight(): number;
 export function getDisplayLeftInset(): number;
@@ -37,4 +38,5 @@ export function observeDisplayInsetChange(observe: () => void): DeviceCancelable
 export function observeDisplaySizeChange(observe: () => void): DeviceCancelable;
 export function observeDarkMode(observe: (isDarkMode: boolean) => void): DeviceCancelable;
 export function isDesktop(): boolean;
+export function isWeb(): boolean;
 export const setBackButtonObserver: ((observer: (() => boolean) | undefined) => void) | undefined;

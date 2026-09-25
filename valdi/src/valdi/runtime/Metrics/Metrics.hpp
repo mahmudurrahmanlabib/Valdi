@@ -49,8 +49,13 @@ public:
     virtual void emitANR() = 0;
 
     virtual void emitRuntimeManagerInitLatency(const MetricsDuration& duration) = 0;
+    virtual void emitRuntimeManagerXpatInitLatency(const MetricsDuration& duration) = 0;
+    virtual void emitRuntimeManagerIosInitLatency(const MetricsDuration& duration) = 0;
+    virtual void emitRuntimePreInitLatency(const MetricsDuration& duration) = 0;
     virtual void emitRuntimeInitLatency(const MetricsDuration& duration) = 0;
     virtual void emitUserSessionReadyLatency(const MetricsDuration& duration) = 0;
+    // Time from RuntimeManager init until setUserSession first attaches a non-empty user session.
+    virtual void emitUserSessionAttachLatency(const MetricsDuration& duration) {};
 
     virtual void emitAssetsDownloadSuccess(const StringBox& module) = 0;
     virtual void emitAssetsDownloadFailure(const StringBox& module) = 0;
@@ -69,6 +74,30 @@ public:
     virtual void emitSlowSyncJsCallThreshold(const StringBox& module, const MetricsDuration& duration) = 0;
 
     virtual void emitLoadModuleMemory(const StringBox& module, int64_t totalMemory, int64_t ownMemory) {};
+    virtual void emitLoadModuleDuration(const StringBox& module, int64_t totalDuration, int64_t ownDuration) {};
+    virtual void emitRunUpdatesInnerTimePercentage(const StringBox& module, int64_t percentage) {};
+
+    // Module archive decompression A/B telemetry.
+    // Exactly one of these counters is incremented per ValdiModuleArchive::decompress call.
+    virtual void emitModuleArchiveMmapSuccess(const StringBox& module) {};
+    virtual void emitModuleArchiveMmapFallback(const StringBox& module) {};
+    virtual void emitModuleArchiveHeap(const StringBox& module) {};
+    // Wall-clock time spent decompressing a module archive (either backing).
+    virtual void emitModuleDecompressLatency(const StringBox& module, const MetricsDuration& duration) {};
+    // Mmap region created and decompressed successfully, but std::rename of the
+    // tmp file onto the cache path failed. The returned MmapBuffer is still
+    // valid for the session (the inode is kept alive while mapped); this
+    // counter exists so the A/B can observe and alert on the publish failure.
+    virtual void emitModuleArchiveMmapPublishFail(const StringBox& module) {};
+
+    // Wall time of one synchronous view-tree inflation pass (ViewNode::updateViewTree),
+    // with the node/view counts the pass already computes. The counts let a slow pass be
+    // attributed to one expensive platform view (low createdViews) vs a wide inflation
+    // (high createdViews) vs a deep no-op traversal (high visitedNodes, low createdViews).
+    virtual void emitUpdateViewTreeLatency(const StringBox& module,
+                                           const MetricsDuration& duration,
+                                           int64_t visitedNodes,
+                                           int64_t createdViews) {};
 
     static ScopedMetrics scopedOnScrollLatency(const Ref<Metrics>& metrics,
                                                const StringBox& module,

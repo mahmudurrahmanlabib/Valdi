@@ -65,6 +65,14 @@ public:
 
     JSValueRef newWrappedObject(const Ref<RefCountable>& wrappedObject, JSExceptionTracker& exceptionTracker) final;
 
+    JSValueRef newNativeClass(const Ref<RefCountable>& classOpaque,
+                              const JSClassDefinition& classDefinition,
+                              JSExceptionTracker& exceptionTracker) final;
+
+    JSValueRef newObjectFromNativeClass(const Ref<RefCountable>& opaque,
+                                        const JSValue& cls,
+                                        JSExceptionTracker& exceptionTracker) final;
+
     JSValueRef newWeakRef(const JSValue& object, JSExceptionTracker& exceptionTracker) final;
 
     JSValueRef getObjectProperty(const JSValue& object,
@@ -145,6 +153,7 @@ public:
 
     void willEnterVM() final;
     void willExitVM(JSExceptionTracker& exceptionTracker) final;
+    void requestExecutionTermination() final;
 
     void startDebugger(bool isWorker) final;
     std::optional<IJavaScriptContextDebuggerInfo> getDebuggerInfo() const final;

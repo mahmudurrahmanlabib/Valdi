@@ -4,6 +4,8 @@
 #include "valdi_core/cpp/Resources/LoadedAsset.hpp"
 #include "valdi_core/cpp/Threading/Thread.hpp"
 
+#include <cstdlib>
+
 using namespace Valdi;
 
 namespace ValdiTest {
@@ -132,16 +134,46 @@ Valdi::Path resolveTestPath(const std::string& path) {
 }
 
 Valdi::Path resolveOpenSourceTestPath(const std::string& path) {
+    // Runfiles layouts differ between the standalone Valdi workspace and the
+    // mobile monorepo. Standalone runs put data at <runfiles>/valdi/<path>;
+    // the monorepo exposes Valdi as a canonical repo named +local_repos+valdi
+    // and puts data at <runfiles>/+local_repos+valdi/valdi/<path>. Probe each
+    // candidate and return the first one that exists.
+    std::vector<Valdi::Path> candidates;
+    auto pushCandidate = [&](const char* base, const char* prefix) {
+        Valdi::Path p(base);
+        if (prefix != nullptr && *prefix != '\0') {
+            p.append(prefix);
+        }
+        p.append(path);
+        p.normalize();
+        candidates.push_back(std::move(p));
+    };
+
+    for (const char* envName : {"TEST_SRCDIR", "RUNFILES_DIR"}) {
+        const char* base = std::getenv(envName);
+        if (base != nullptr && *base != '\0') {
+            pushCandidate(base, "valdi");
+            pushCandidate(base, "+local_repos+valdi/valdi");
+        }
+    }
+
     char cwdBuffer[PATH_MAX];
-    (void)::getcwd(cwdBuffer, PATH_MAX);
+    if (::getcwd(cwdBuffer, PATH_MAX) != nullptr) {
+        pushCandidate(cwdBuffer, "external/+local_repos+valdi/valdi");
+        pushCandidate(cwdBuffer, "valdi");
+        pushCandidate(cwdBuffer, "");
+    }
 
-    auto basePath = Valdi::Path(cwdBuffer);
-
-    basePath.append("external/_main~local_repos~valdi/valdi");
-    basePath.append(path);
-    basePath.normalize();
-
-    return basePath;
+    for (const auto& candidate : candidates) {
+        if (Valdi::DiskUtils::stat(candidate).exists()) {
+            return candidate;
+        }
+    }
+    if (!candidates.empty()) {
+        return candidates.front();
+    }
+    return Valdi::Path(path);
 }
 
 Valdi::Result<Valdi::BytesView> loadFileFromAbsolutePath(const Valdi::Path& absolutePath) {
@@ -149,11 +181,31 @@ Valdi::Result<Valdi::BytesView> loadFileFromAbsolutePath(const Valdi::Path& abso
 }
 
 Valdi::Result<Valdi::BytesView> loadResourceFromDisk(const std::string& path) {
-    auto filePath = resolveOpenSourceTestPath(path);
-
-    // std::cout << "Loading " << filePath << std::endl;
-
-    return loadFileFromAbsolutePath(filePath);
+    auto result = loadFileFromAbsolutePath(resolveOpenSourceTestPath(path));
+    if (result) {
+        return result;
+    }
+    // Fallbacks: Bazel may run tests with cwd = runfiles root without setting TEST_SRCDIR.
+    char cwdBuffer[PATH_MAX];
+    if (::getcwd(cwdBuffer, PATH_MAX) != nullptr) {
+        Valdi::Path runfilesPath(cwdBuffer);
+        runfilesPath.append("valdi");
+        runfilesPath.append(path);
+        runfilesPath.normalize();
+        auto fallback = loadFileFromAbsolutePath(runfilesPath);
+        if (fallback) {
+            return fallback;
+        }
+        // cwd might be runfiles/valdi (package dir) already
+        Valdi::Path pkgPath(cwdBuffer);
+        pkgPath.append(path);
+        pkgPath.normalize();
+        fallback = loadFileFromAbsolutePath(pkgPath);
+        if (fallback) {
+            return fallback;
+        }
+    }
+    return result;
 }
 
 Valdi::FlatMap<Valdi::Path, Valdi::BytesView> readDirectory(const std::string& path) {

@@ -19,7 +19,7 @@
 #include "valdi/runtime/Resources/AssetLoader.hpp"
 #include "valdi/runtime/Resources/AssetLoaderManager.hpp"
 #include "valdi/runtime/Resources/DiskCacheImpl.hpp"
-#include "valdi/runtime/Views/Measure.hpp"
+#include "valdi_core/cpp/Views/Measure.hpp"
 
 #include "snap_drawing/cpp/Text/LoadableTypeface.hpp"
 #include "valdi/snap_drawing/Modules/SnapDrawingModuleFactoriesProvider.hpp"
@@ -104,7 +104,8 @@ RuntimeManagerWrapper::RuntimeManagerWrapper(JavaEnv env,
                                                                    _logger,
                                                                    /* enableDebuggerService */ true,
                                                                    /* disableHotReloader */ false,
-                                                                   /* isStandalone */ false);
+                                                                   /* isStandalone */ false,
+                                                                   std::nullopt);
         _runtimeManager->postInit();
         _runtimeManager->setKeepDebuggerServiceOnPause(static_cast<bool>(keepDebuggerServiceOnPause));
         _runtimeManager->setApplicationId(_applicationId);
@@ -170,7 +171,7 @@ RuntimeManagerWrapper::RuntimeManagerWrapper(JavaEnv env,
     }
 #endif
     _runtimeManager->getAssetLoaderManager()->registerAssetLoaderFactory(
-        Valdi::makeShared<AndroidAssetLoaderFactory>(_resourceLoader));
+        Valdi::makeShared<AndroidAssetLoaderFactory>(_resourceLoader, _runtimeManager->getWorkerQueue()));
 }
 
 RuntimeManagerWrapper::~RuntimeManagerWrapper() {
@@ -311,7 +312,12 @@ Logger& RuntimeManagerWrapper::getLogger() {
 }
 
 float RuntimeManagerWrapper::getPointScale() const {
-    return _pointScale;
+    return _pointScale.load(std::memory_order_relaxed);
+}
+
+void RuntimeManagerWrapper::setPointScale(float pointScale) {
+    _pointScale.store(pointScale, std::memory_order_relaxed);
+    _viewManager->setPointScale(pointScale);
 }
 
 Valdi::RuntimeManager& RuntimeManagerWrapper::getRuntimeManager() const {

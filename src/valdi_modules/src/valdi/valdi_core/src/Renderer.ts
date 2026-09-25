@@ -17,7 +17,14 @@ import { ConsoleRepresentable } from './ConsoleRepresentable';
 import { ComponentConstructor, IComponent } from './IComponent';
 import { IRenderedElement } from './IRenderedElement';
 import { IRenderedVirtualNode } from './IRenderedVirtualNode';
-import { ComponentDisposable, IRenderer, RendererObserver } from './IRenderer';
+import {
+  ComponentDisposable,
+  IRenderer,
+  RendererDebugComponentPropertyEdit,
+  RendererDebugEditableScalar,
+  RendererDebugVirtualNodeSnapshot,
+  RendererObserver,
+} from './IRenderer';
 import { IRendererDelegate } from './IRendererDelegate';
 import { IRendererEventListener } from './IRendererEventListener';
 import { NodePrototype } from './NodePrototype';
@@ -28,10 +35,238 @@ import { classNames } from './utils/ClassNames';
 import { enumeratePropertyList, PropertyList, propertyListToObject } from './utils/PropertyList';
 import { computeUniqueId } from './utils/RenderedVirtualNodeUtils';
 import { RendererError } from './utils/RendererError';
-import { trace } from './utils/Trace';
+import { isTracingSupported, trace } from './utils/Trace';
 
 const EMPTY_OBJECT = Object.freeze({});
 const EMPTY_ARRAY = Object.freeze([]) as [];
+const DEBUG_FORBIDDEN_VIEW_MODEL_PROPERTIES = new Set(['__proto__', 'children', 'constructor', 'prototype']);
+const DEBUG_VIEW_MODEL_MAX_OWN_KEYS = 1_000;
+const DEBUG_PROPERTY_DESCRIPTOR_FIELDS: Array<keyof PropertyDescriptor> = [
+  'configurable',
+  'enumerable',
+  'get',
+  'set',
+  'value',
+  'writable',
+];
+
+interface DebugViewModelShape {
+  readonly descriptors: ReadonlyMap<string | symbol, PropertyDescriptor>;
+  readonly extensible: boolean;
+  readonly keys: readonly (string | symbol)[];
+  readonly prototype: object | null;
+}
+
+interface DebugViewModelOverlayState {
+  readonly overrides: ReadonlyMap<string, RendererDebugEditableScalar>;
+  readonly shape: DebugViewModelShape;
+  readonly sourceViewModel: object;
+}
+
+const DEBUG_VIEW_MODEL_OVERLAYS = new WeakMap<object, DebugViewModelOverlayState>();
+
+function isDebugEditableScalar(value: unknown): value is RendererDebugEditableScalar {
+  return (
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value) && !Object.is(value, -0))
+  );
+}
+
+function sameDebugPropertyDescriptor(left: PropertyDescriptor, right: PropertyDescriptor): boolean {
+  for (const field of DEBUG_PROPERTY_DESCRIPTOR_FIELDS) {
+    const leftField = Object.getOwnPropertyDescriptor(left, field);
+    const rightField = Object.getOwnPropertyDescriptor(right, field);
+    if (leftField === undefined || rightField === undefined) {
+      if (leftField !== rightField) return false;
+      continue;
+    }
+    if (
+      !Object.prototype.hasOwnProperty.call(leftField, 'value') ||
+      !Object.prototype.hasOwnProperty.call(rightField, 'value') ||
+      !Object.is(leftField.value, rightField.value)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isDebugDataDescriptor(descriptor: PropertyDescriptor): boolean {
+  const value = Object.getOwnPropertyDescriptor(descriptor, 'value');
+  return value !== undefined && Object.prototype.hasOwnProperty.call(value, 'value');
+}
+
+function sameDebugDataDescriptor(left: PropertyDescriptor, right: PropertyDescriptor): boolean {
+  return isDebugDataDescriptor(left) && isDebugDataDescriptor(right) && sameDebugPropertyDescriptor(left, right);
+}
+
+function captureDebugViewModelShape(viewModel: object): DebugViewModelShape | undefined {
+  const keys = Reflect.ownKeys(viewModel);
+  if (keys.length > DEBUG_VIEW_MODEL_MAX_OWN_KEYS) return undefined;
+  const descriptors = new Map<string | symbol, PropertyDescriptor>();
+  for (const key of keys) {
+    const descriptor = Reflect.getOwnPropertyDescriptor(viewModel, key);
+    if (descriptor === undefined) return undefined;
+    if (!isDebugDataDescriptor(descriptor) || typeof descriptor.value === 'function') return undefined;
+    descriptors.set(key, descriptor);
+  }
+  const prototype = Reflect.getPrototypeOf(viewModel);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  return {
+    descriptors,
+    extensible: Reflect.isExtensible(viewModel),
+    keys,
+    prototype,
+  };
+}
+
+function sameDebugViewModelShape(left: DebugViewModelShape, right: DebugViewModelShape): boolean {
+  if (
+    left.prototype !== right.prototype ||
+    left.extensible !== right.extensible ||
+    left.keys.length !== right.keys.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < left.keys.length; index++) {
+    const leftKey = left.keys[index];
+    const rightKey = right.keys[index];
+    const leftDescriptor = left.descriptors.get(leftKey);
+    const rightDescriptor = right.descriptors.get(rightKey);
+    if (
+      leftKey !== rightKey ||
+      leftDescriptor === undefined ||
+      rightDescriptor === undefined ||
+      !sameDebugPropertyDescriptor(leftDescriptor, rightDescriptor)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function captureStableDebugViewModelShape(viewModel: object): DebugViewModelShape | undefined {
+  const captured = captureDebugViewModelShape(viewModel);
+  const verified = captureDebugViewModelShape(viewModel);
+  return captured !== undefined && verified !== undefined && sameDebugViewModelShape(captured, verified)
+    ? verified
+    : undefined;
+}
+
+function debugViewModelShapeMatchesOverlay(captured: DebugViewModelShape, state: DebugViewModelOverlayState): boolean {
+  if (
+    captured.prototype !== state.shape.prototype ||
+    captured.extensible !== state.shape.extensible ||
+    captured.keys.length !== state.shape.keys.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < captured.keys.length; index++) {
+    const capturedKey = captured.keys[index];
+    const shapeKey = state.shape.keys[index];
+    const capturedDescriptor = captured.descriptors.get(capturedKey);
+    const shapeDescriptor = state.shape.descriptors.get(shapeKey);
+    if (capturedKey !== shapeKey || capturedDescriptor === undefined || shapeDescriptor === undefined) {
+      return false;
+    }
+    const override = typeof shapeKey === 'string' ? state.overrides.get(shapeKey) : undefined;
+    const expectedDescriptor = override === undefined ? shapeDescriptor : { ...shapeDescriptor, value: override };
+    if (!sameDebugPropertyDescriptor(capturedDescriptor, expectedDescriptor)) return false;
+  }
+  return true;
+}
+
+function prepareDebugViewModelOverlay(
+  viewModel: object,
+  capturedShape: DebugViewModelShape,
+  propertyName: string,
+  newValue: RendererDebugEditableScalar,
+): DebugViewModelOverlayState | undefined {
+  const priorState = DEBUG_VIEW_MODEL_OVERLAYS.get(viewModel);
+  if (priorState !== undefined && !debugViewModelShapeMatchesOverlay(capturedShape, priorState)) return undefined;
+  const overrides = new Map(priorState?.overrides ?? []);
+  const currentDescriptor = capturedShape.descriptors.get(propertyName);
+  if (currentDescriptor === undefined || !isDebugDataDescriptor(currentDescriptor)) return undefined;
+  overrides.set(propertyName, newValue);
+  return {
+    overrides,
+    shape: priorState?.shape ?? capturedShape,
+    sourceViewModel: priorState?.sourceViewModel ?? viewModel,
+  };
+}
+
+function createDebugViewModelOverlay(state: DebugViewModelOverlayState): object | undefined {
+  const shadow = Object.create(state.shape.prototype) as object;
+  for (const key of state.shape.keys) {
+    const baseDescriptor = state.shape.descriptors.get(key);
+    if (baseDescriptor === undefined) return undefined;
+    const override = typeof key === 'string' ? state.overrides.get(key) : undefined;
+    const descriptor = override === undefined ? baseDescriptor : { ...baseDescriptor, value: override };
+    if (!Reflect.defineProperty(shadow, key, descriptor)) return undefined;
+  }
+  if (!state.shape.extensible && !Reflect.preventExtensions(shadow)) return undefined;
+  const boundFallbacks = new Map<string | symbol, { boundValue: unknown; sourceValue: object }>();
+
+  const overlay = new Proxy(shadow, {
+    defineProperty() {
+      return false;
+    },
+    deleteProperty() {
+      return false;
+    },
+    get(target, key, receiver) {
+      const override = typeof key === 'string' ? state.overrides.get(key) : undefined;
+      if (override !== undefined) return override;
+      if (
+        !state.shape.descriptors.has(key) &&
+        state.shape.prototype !== null &&
+        Reflect.getOwnPropertyDescriptor(state.shape.prototype, key) !== undefined
+      ) {
+        boundFallbacks.delete(key);
+        return Reflect.get(target, key, receiver);
+      }
+      const sourceValue = Reflect.get(state.sourceViewModel, key, state.sourceViewModel) as unknown;
+      if (typeof sourceValue !== 'function') {
+        boundFallbacks.delete(key);
+        return sourceValue;
+      }
+      const existing = boundFallbacks.get(key);
+      if (existing?.sourceValue === sourceValue) return existing.boundValue;
+      const boundValue = Function.prototype.bind.call(sourceValue, state.sourceViewModel) as unknown;
+      boundFallbacks.set(key, { boundValue, sourceValue });
+      return boundValue;
+    },
+    has(target, key) {
+      const sourceHasKey = Reflect.has(state.sourceViewModel, key);
+      return Reflect.getOwnPropertyDescriptor(target, key) !== undefined || sourceHasKey;
+    },
+    ownKeys() {
+      return [...state.shape.keys];
+    },
+    preventExtensions() {
+      return false;
+    },
+    set() {
+      return false;
+    },
+    setPrototypeOf() {
+      return false;
+    },
+  });
+  DEBUG_VIEW_MODEL_OVERLAYS.set(overlay, state);
+  return overlay;
+}
+
+interface RememberSlot<T = unknown> {
+  value: T;
+  keys: unknown[];
+}
+
+interface RememberState {
+  slots: RememberSlot[];
+  slotIndex: number;
+}
 
 interface NodeChildren<T> {
   childByKey: { [key: string]: T };
@@ -67,6 +302,8 @@ interface VirtualNode extends Node {
 
   // Bridge instance, will be set if the virtual node was requested externally.
   bridge?: VirtualNodeBridge;
+
+  rememberState?: RememberState;
 }
 
 interface RenderedElement {
@@ -75,6 +312,7 @@ interface RenderedElement {
   id: number;
   nodePrototype: NodePrototype | undefined;
   attributes: StringMap<any>;
+  directionWasSetDuringRender?: boolean;
 
   wasVisibleOnce?: boolean;
   // Bridge instance, will be set if the element was requested externally.
@@ -121,6 +359,11 @@ interface RenderedComponent<T extends IComponent = IComponent> {
   onDestroyObserver?: (instance: any) => void;
 
   componentRef: IRenderedComponentHolder<T, IRenderedVirtualNode> | undefined;
+}
+
+interface DebugComponentPropertyViewModelUpdate {
+  readonly renderedComponent: RenderedComponent;
+  readonly viewModel: object;
 }
 
 interface ComponentSlotData<F extends AnyRenderFunction = AnyRenderFunction> {
@@ -236,6 +479,92 @@ class VirtualNodeBridge implements IRenderedVirtualNode {
     getVirtualNodeBridgeChildren(this.renderer, this.node, out);
 
     return out;
+  }
+
+  getDebugSnapshot(
+    maximumChildLinks: number,
+    maximumTraversalLinks: number,
+  ): RendererDebugVirtualNodeSnapshot | undefined {
+    if (
+      !Number.isSafeInteger(maximumChildLinks) ||
+      maximumChildLinks < 0 ||
+      !Number.isSafeInteger(maximumTraversalLinks) ||
+      maximumTraversalLinks <= 0
+    ) {
+      return undefined;
+    }
+
+    let traversedLinkCount = 0;
+    let parent = this.node.parent;
+    const visitedParentSlots = new Set<VirtualNode>();
+    while (parent?.slot === true) {
+      if (visitedParentSlots.has(parent)) {
+        return undefined;
+      }
+      visitedParentSlots.add(parent);
+      traversedLinkCount++;
+      if (traversedLinkCount > maximumTraversalLinks) {
+        return undefined;
+      }
+      parent = parent.parent;
+    }
+    if (parent !== undefined) {
+      traversedLinkCount++;
+      if (traversedLinkCount > maximumTraversalLinks) {
+        return undefined;
+      }
+    }
+
+    const children: IRenderedVirtualNode[] = [];
+    const visitedSlots = new Set<VirtualNode>();
+    const childFrames: Array<{ children: VirtualNode[]; index: number }> = [];
+    if (this.node.children !== undefined) {
+      childFrames.push({ children: this.node.children.children, index: 0 });
+    }
+    while (childFrames.length > 0) {
+      const frame = childFrames[childFrames.length - 1];
+      if (frame.index >= frame.children.length) {
+        childFrames.pop();
+        continue;
+      }
+      const child = frame.children[frame.index];
+      frame.index++;
+      traversedLinkCount++;
+      if (traversedLinkCount > maximumTraversalLinks) {
+        return undefined;
+      }
+      if (child.slot === true) {
+        if (visitedSlots.has(child)) {
+          return undefined;
+        }
+        visitedSlots.add(child);
+        if (child.children !== undefined) {
+          childFrames.push({ children: child.children.children, index: 0 });
+        }
+      } else {
+        if (children.length >= maximumChildLinks) {
+          return undefined;
+        }
+        children.push(getVirtualNodeBridge(this.renderer, child));
+      }
+    }
+
+    const snapshot: RendererDebugVirtualNodeSnapshot = {
+      children,
+      component: this.node.component?.instance,
+      element: this.node.element === undefined ? undefined : getRenderedElementBridge(this.renderer, this.node.element),
+      key: this.node.key,
+      parent:
+        parent === undefined || parent === this.renderer.nodeTree
+          ? undefined
+          : getVirtualNodeBridge(this.renderer, parent),
+      traversedLinkCount,
+    };
+    Object.defineProperty(snapshot, 'componentViewModel', {
+      enumerable: false,
+      value: this.node.component?.viewModel,
+    });
+    return snapshot;
   }
 
   get parentIndex(): number {
@@ -414,6 +743,21 @@ function getNodeDescription(node: VirtualNode): string {
   return 'unknown node';
 }
 
+function rememberKeysEqual(left: unknown[], right: unknown[]): boolean {
+  const length = left.length;
+  if (length !== right.length) {
+    return false;
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (!Object.is(left[i], right[i])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 interface RendererLogInfo {
   treeId: string;
   componentRerendersCount: number;
@@ -534,6 +878,7 @@ export class Renderer implements IRenderer {
 
   private currentNode: VirtualNode | undefined;
   private nodeStack: VirtualNode[] = [];
+  private rootElementEndingRender: RenderedElement | undefined;
 
   readonly nodeTree: VirtualNode;
   private readonly elementTree: RenderedElement;
@@ -547,10 +892,20 @@ export class Renderer implements IRenderer {
   private componentRerendersCount = 0;
   private rootRendersCount = 0;
   private beginCount = 0;
+  private uncaughtErrorGeneration = 0;
   private observers: RendererObserver[] = [];
   private nextAnimationCancelToken: CancelToken = 0;
   private eventListener: IRendererEventListener | undefined = undefined;
+  private rendererTracingEnabled = false;
   private allowedRootElementTypes?: StringSet;
+
+  /** Moves buffered during render; flushed in top-down order at end to avoid bottom-up attach (ANR). */
+  private pendingRootMove: { elementId: number } | undefined = undefined;
+  private pendingMovesByParent = new Map<number, Array<{ elementId: number; parentIndex: number }>>();
+  private pendingMoveElementIds = new Set<number>();
+
+  /** When true (gated by VALDI_MAX_VIEW_OPERATIONS_PROCESSING_TIME), emit moves in top-down order. */
+  private _useTopDownMoveOrder: boolean = false;
 
   enableLog: boolean = false;
   private logComponentsOnly = true;
@@ -559,9 +914,15 @@ export class Renderer implements IRenderer {
     return this.beginCount > 0;
   }
 
-  constructor(contextId: string, allowedRootElementTypes: string[] | undefined, delegate: IRendererDelegate) {
+  constructor(
+    contextId: string,
+    allowedRootElementTypes: string[] | undefined,
+    delegate: IRendererDelegate,
+    useTopDownMoveOrder?: boolean,
+  ) {
     this.contextId = contextId;
     this.delegate = delegate;
+    this._useTopDownMoveOrder = useTopDownMoveOrder ?? false;
     if (allowedRootElementTypes) {
       this.allowedRootElementTypes = {};
       for (const allowedRootElementType of allowedRootElementTypes) {
@@ -751,6 +1112,9 @@ export class Renderer implements IRenderer {
     }
 
     if (this.beginCount === 1) {
+      if (this._useTopDownMoveOrder) {
+        this.flushPendingMovesInTopDownOrder();
+      }
       // Flush our pending nested render callbacks
       while (this.pendingRenders.length) {
         const pendingRender = this.pendingRenders.shift();
@@ -904,7 +1268,7 @@ export class Renderer implements IRenderer {
     const currentNode = this.getCurrentNode();
 
     const resolvedKey = key || nodePrototype.id;
-    const resolvedNode = this.resolveVirtualNode(currentNode, resolvedKey, undefined, undefined);
+    const resolvedNode = this.resolveVirtualNode(currentNode, resolvedKey, undefined, undefined, undefined);
 
     let justCreated = false;
 
@@ -934,6 +1298,9 @@ export class Renderer implements IRenderer {
     }
 
     this.pushVirtualNode(resolvedNode);
+    if (resolvedNode.parentElement === this.elementTree) {
+      resolvedNode.element!.directionWasSetDuringRender = false;
+    }
 
     if (justCreated && nodePrototype.attributes) {
       enumeratePropertyList(nodePrototype.attributes, (name, value) => {
@@ -945,10 +1312,15 @@ export class Renderer implements IRenderer {
   endElement() {
     const currentNode = this.currentNode;
     if (currentNode && currentNode.parentElement === this.elementTree) {
-      for (const observer of this.observers) {
-        if (observer.onRootElementWillEndRender) {
-          observer.onRootElementWillEndRender();
+      this.rootElementEndingRender = currentNode.element;
+      try {
+        for (const observer of this.observers) {
+          if (observer.onRootElementWillEndRender) {
+            observer.onRootElementWillEndRender();
+          }
         }
+      } finally {
+        this.rootElementEndingRender = undefined;
       }
     }
 
@@ -1033,6 +1405,9 @@ export class Renderer implements IRenderer {
     if (node.children) {
       node.children.insertionIndex = 0;
     }
+    if (node.rememberState) {
+      node.rememberState.slotIndex = 0;
+    }
     node.lastRenderId = this.renderId;
 
     this.currentNode = node;
@@ -1099,11 +1474,72 @@ export class Renderer implements IRenderer {
       if (this.allowedRootElementTypes && !this.allowedRootElementTypes[tag]) {
         this.throwDisallowedRootElementType(tag);
       }
-
-      this.delegate.onElementBecameRoot(id);
+      if (this._useTopDownMoveOrder) {
+        this.pendingRootMove = { elementId: id };
+        this.pendingMoveElementIds.add(id);
+      } else {
+        this.delegate.onElementBecameRoot(id);
+      }
     } else {
-      this.delegate.onElementMoved(id, parentId, index);
+      if (this._useTopDownMoveOrder) {
+        this.pendingMoveElementIds.add(id);
+        let list = this.pendingMovesByParent.get(parentId);
+        if (!list) {
+          list = [];
+          this.pendingMovesByParent.set(parentId, list);
+        }
+        list.push({ elementId: id, parentIndex: index });
+      } else {
+        this.delegate.onElementMoved(id, parentId, index);
+      }
     }
+  }
+
+  /** Emit buffered moves in top-down order (parent attached before children) to avoid ANR. */
+  private flushPendingMovesInTopDownOrder() {
+    if (this.pendingRootMove === undefined && this.pendingMovesByParent.size === 0) {
+      return;
+    }
+
+    if (this.pendingRootMove) {
+      this.delegate.onElementBecameRoot(this.pendingRootMove.elementId);
+    }
+
+    for (const list of this.pendingMovesByParent.values()) {
+      list.sort((a, b) => a.parentIndex - b.parentIndex);
+    }
+
+    // Start BFS from the new root (if any) and from any stable parents (parents that are not
+    // being moved this pass but have children moving into them). Without including stable
+    // parents, a pass that both sets a new root and reparents nodes into non-root stable
+    // parents would drop those moves because the BFS only follows move chains from the root.
+    let queue: number[];
+    if (this.pendingRootMove) {
+      queue = [this.pendingRootMove.elementId];
+    } else {
+      queue = [];
+    }
+    for (const parentId of this.pendingMovesByParent.keys()) {
+      if (!this.pendingMoveElementIds.has(parentId)) {
+        queue.push(parentId);
+      }
+    }
+    queue.sort((a, b) => a - b);
+
+    let head = 0;
+    while (head < queue.length) {
+      const parentId = queue[head++];
+      const children = this.pendingMovesByParent.get(parentId);
+      if (!children) continue;
+      for (const m of children) {
+        this.delegate.onElementMoved(m.elementId, parentId, m.parentIndex);
+        queue.push(m.elementId);
+      }
+    }
+
+    this.pendingRootMove = undefined;
+    this.pendingMovesByParent.clear();
+    this.pendingMoveElementIds.clear();
   }
 
   private doElementIterate(
@@ -1297,10 +1733,12 @@ export class Renderer implements IRenderer {
 
   private resolveVirtualNode(
     parent: VirtualNode,
-    resolvedKey: string,
+    key: string,
+    duplicateKeyIndex: number | undefined,
     componentConstructor: ComponentConstructor<IComponent> | undefined,
     componentPrototype: ComponentPrototype | undefined,
   ): VirtualNode {
+    const resolvedKey = duplicateKeyIndex !== undefined ? `${key}-${duplicateKeyIndex}` : key;
     let resolvedNode: VirtualNode | undefined;
     let children = parent.children;
     if (!children) {
@@ -1349,12 +1787,7 @@ export class Renderer implements IRenderer {
         // We need to render it with a new key
 
         const duplicateKeyIndex = children.insertionIndex - resolvedNode.parentIndex + 1;
-        return this.resolveVirtualNode(
-          parent,
-          resolvedKey + duplicateKeyIndex,
-          componentConstructor,
-          componentPrototype,
-        );
+        return this.resolveVirtualNode(parent, key, duplicateKeyIndex, componentConstructor, componentPrototype);
       }
     }
 
@@ -1379,6 +1812,9 @@ export class Renderer implements IRenderer {
 
   private destroyVirtualNode(node: VirtualNode, parentElementWasDestroyed: boolean) {
     node.parent = undefined;
+    if (node.rememberState) {
+      node.rememberState = undefined;
+    }
 
     if (node.element) {
       const element = node.element;
@@ -1508,6 +1944,7 @@ export class Renderer implements IRenderer {
   }
 
   onUncaughtError(message: string, error: Error, sourceComponent?: IComponent) {
+    this.uncaughtErrorGeneration++;
     let lastRenderedNode: IRenderedVirtualNode | undefined;
     let componentCatchingError: IComponent | undefined;
 
@@ -1531,6 +1968,36 @@ export class Renderer implements IRenderer {
     } else {
       this.delegate.onUncaughtError(message, error);
     }
+  }
+
+  remember<T>(factory: () => T, keys: unknown[]): T {
+    const currentNode = this.currentNode;
+    if (!currentNode) {
+      throw Error('Cannot call this outside of a onRender callback');
+    }
+
+    let rememberState = currentNode.rememberState;
+    if (!rememberState) {
+      rememberState = {
+        slots: [],
+        slotIndex: 0,
+      };
+      currentNode.rememberState = rememberState;
+    }
+
+    const slotIndex = rememberState.slotIndex++;
+    const slots = rememberState.slots;
+    const slot = slots[slotIndex] as RememberSlot<T> | undefined;
+    if (slot && rememberKeysEqual(slot.keys, keys)) {
+      return slot.value;
+    }
+
+    const value = factory();
+    slots[slotIndex] = {
+      value,
+      keys: keys.length ? keys : EMPTY_ARRAY,
+    };
+    return value;
   }
 
   hasInjectedAttribute(name: string): boolean {
@@ -1598,6 +2065,7 @@ export class Renderer implements IRenderer {
 
   setAttributeString(name: string, value: string | undefined): boolean {
     const element = this.getCurrentElement();
+    this.recordElementDirectionFromCurrentRender(element, name);
     const attributes = element.attributes;
     if (attributes[name] === value) {
       return false;
@@ -1694,6 +2162,7 @@ export class Renderer implements IRenderer {
   }
 
   setAttributeOnElement(element: RenderedElement, name: string, value: any): boolean {
+    this.recordElementDirectionFromCurrentRender(element, name);
     if (typeof value !== 'string' && (name === 'class' || name === '$class')) {
       value = classNames(value);
     }
@@ -1757,7 +2226,7 @@ export class Renderer implements IRenderer {
     const resolvedKey = key || prototype.id;
 
     const parent = this.getCurrentNode();
-    const resolvedNode = this.resolveVirtualNode(parent, resolvedKey, ctr, prototype);
+    const resolvedNode = this.resolveVirtualNode(parent, resolvedKey, undefined, ctr, prototype);
 
     let justCreated = false;
 
@@ -1987,9 +2456,14 @@ export class Renderer implements IRenderer {
       currentComponent.rendering = true;
 
       // this.log('Rendering component ', currentComponent.ctr.name);
+      const componentToRender = componentInstance;
 
       try {
-        componentInstance.onRender();
+        if (this.rendererTracingEnabled) {
+          trace(`Renderer.onRender.${currentComponent.ctr.name}`, () => componentToRender.onRender());
+        } else {
+          componentToRender.onRender();
+        }
       } catch (err: any) {
         this.popToVirtualNode(currentComponent.virtualNode);
         this.onUncaughtError(`Failed to render component '${currentComponent.ctr.name}'`, err);
@@ -2075,6 +2549,9 @@ export class Renderer implements IRenderer {
           if (this.eventListener) {
             this.eventListener.onComponentViewModelPropertyChange(name);
           }
+          if (this.rendererTracingEnabled) {
+            trace(`Renderer.viewModelChange.${currentComponent.ctr.name}.${name}`, () => {});
+          }
           // this.log('View model property ', name, ' changed for component ', currentComponent.ctr.name);
         }
       }
@@ -2083,7 +2560,7 @@ export class Renderer implements IRenderer {
 
   beginSlot<F extends AnyRenderFunction>(slotData: ComponentSlotData<F>) {
     const parentNode = this.getCurrentNode();
-    const node = this.resolveVirtualNode(parentNode, slotData.nodeKey, undefined, undefined);
+    const node = this.resolveVirtualNode(parentNode, slotData.nodeKey, undefined, undefined, undefined);
     slotData.node = node;
     node.slot = true;
     this.pushVirtualNode(node);
@@ -2426,14 +2903,29 @@ export class Renderer implements IRenderer {
     return nodes;
   }
 
-  getRootElement(): IRenderedElement | undefined {
+  /** Return every top-level rendered element in render order. */
+  getRootElements(): IRenderedElement[] {
     const out: IRenderedElement[] = [];
     if (this.nodeTree.children) {
       for (const node of this.nodeTree.children.children) {
         this.collectElements(node, out);
       }
     }
-    return out[0];
+    return out;
+  }
+
+  /** Reports a declarative direction write for the root currently notifying render observers. */
+  wasElementDirectionSetDuringCurrentRender(element: IRenderedElement): boolean {
+    const renderedElement = this.getElementById(element.id);
+    return (
+      renderedElement !== undefined &&
+      renderedElement === this.rootElementEndingRender &&
+      renderedElement.directionWasSetDuringRender === true
+    );
+  }
+
+  getRootElement(): IRenderedElement | undefined {
+    return this.getRootElements()[0];
   }
 
   getComponentKey(component: IComponent): string {
@@ -2489,6 +2981,146 @@ export class Renderer implements IRenderer {
     return undefined;
   }
 
+  getDebugVirtualNodeSnapshot(
+    node: IRenderedVirtualNode,
+    maximumChildLinks: number,
+    maximumTraversalLinks: number,
+  ): RendererDebugVirtualNodeSnapshot | undefined {
+    if (!(node instanceof VirtualNodeBridge) || node.renderer !== this) {
+      return undefined;
+    }
+    return node.getDebugSnapshot(maximumChildLinks, maximumTraversalLinks);
+  }
+
+  editDebugComponentProperty(request: RendererDebugComponentPropertyEdit): boolean {
+    if (
+      !(request.node instanceof VirtualNodeBridge) ||
+      request.node.renderer !== this ||
+      DEBUG_FORBIDDEN_VIEW_MODEL_PROPERTIES.has(request.propertyName) ||
+      !isDebugEditableScalar(request.newValue) ||
+      !this.isDebugComponentPropertyDescriptorCurrent(request) ||
+      this.resolveDebugComponentPropertyTarget(request) === undefined
+    ) {
+      return false;
+    }
+
+    return this.renderDebugComponentWithFullViewModel(request);
+  }
+
+  private resolveDebugComponentPropertyTarget(
+    request: RendererDebugComponentPropertyEdit,
+  ): RenderedComponent | undefined {
+    if (this.currentNode !== undefined) return undefined;
+    try {
+      const renderedComponent = this.resolveRenderedComponent(request.component);
+      return getVirtualNodeBridge(this, renderedComponent.virtualNode) === request.node &&
+        renderedComponent.instance === request.component &&
+        renderedComponent.viewModel === request.expectedViewModel
+        ? renderedComponent
+        : undefined;
+    } catch (_error) {
+      return undefined;
+    }
+  }
+
+  private isDebugComponentPropertyDescriptorCurrent(request: RendererDebugComponentPropertyEdit): boolean {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(request.expectedViewModel, request.propertyName);
+      return (
+        descriptor !== undefined &&
+        descriptor.enumerable === true &&
+        sameDebugDataDescriptor(descriptor, request.expectedDescriptor) &&
+        isDebugEditableScalar(descriptor.value) &&
+        typeof descriptor.value === typeof request.newValue &&
+        Object.isExtensible(request.expectedViewModel) === request.expectedViewModelExtensible
+      );
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  private createDebugComponentPropertyViewModelUpdate(
+    request: RendererDebugComponentPropertyEdit,
+  ): DebugComponentPropertyViewModelUpdate | undefined {
+    try {
+      const capturedShape = captureStableDebugViewModelShape(request.expectedViewModel);
+      const currentDescriptor =
+        capturedShape === undefined ? undefined : capturedShape.descriptors.get(request.propertyName);
+      if (
+        capturedShape === undefined ||
+        currentDescriptor === undefined ||
+        currentDescriptor.enumerable !== true ||
+        !sameDebugDataDescriptor(currentDescriptor, request.expectedDescriptor) ||
+        !isDebugEditableScalar(currentDescriptor.value) ||
+        typeof currentDescriptor.value !== typeof request.newValue ||
+        capturedShape.extensible !== request.expectedViewModelExtensible
+      ) {
+        return undefined;
+      }
+      const verifiedShape = captureStableDebugViewModelShape(request.expectedViewModel);
+      if (verifiedShape === undefined || !sameDebugViewModelShape(verifiedShape, capturedShape)) {
+        return undefined;
+      }
+      const overlayState = prepareDebugViewModelOverlay(
+        request.expectedViewModel,
+        capturedShape,
+        request.propertyName,
+        request.newValue,
+      );
+      if (overlayState === undefined) return undefined;
+      const currentShape = captureStableDebugViewModelShape(request.expectedViewModel);
+      const renderedComponent = this.resolveDebugComponentPropertyTarget(request);
+      if (
+        currentShape === undefined ||
+        !sameDebugViewModelShape(currentShape, capturedShape) ||
+        renderedComponent === undefined
+      ) {
+        return undefined;
+      }
+      const viewModel = createDebugViewModelOverlay(overlayState);
+      if (viewModel === undefined) return undefined;
+      return {
+        renderedComponent,
+        viewModel,
+      };
+    } catch (_error) {
+      return undefined;
+    }
+  }
+
+  private renderDebugComponentWithFullViewModel(request: RendererDebugComponentPropertyEdit): boolean {
+    let renderedComponent = this.resolveDebugComponentPropertyTarget(request);
+    if (renderedComponent === undefined) return false;
+    let rendered = true;
+    const errorGeneration = this.uncaughtErrorGeneration;
+
+    this.doBegin();
+    try {
+      trace(`renderComponent.${renderedComponent.ctr.name}`, () => {
+        for (const observer of this.observers) {
+          observer.onComponentWillRerender?.(request.component);
+        }
+        const update = this.createDebugComponentPropertyViewModelUpdate(request);
+        if (update === undefined) {
+          rendered = false;
+          return;
+        }
+        renderedComponent = update.renderedComponent;
+        this.componentRerendersCount++;
+        renderedComponent.needRendering = true;
+        this.pushVirtualNode(renderedComponent.virtualNode);
+        this.setViewModelFull(update.viewModel as PropertyList);
+        this.endComponent();
+      });
+    } catch (error) {
+      rendered = false;
+      console.warn('Valdi debugger could not apply a component property edit.', error);
+    } finally {
+      this.doEnd();
+    }
+    return rendered && this.uncaughtErrorGeneration === errorGeneration;
+  }
+
   getComponentVirtualNode(component: IComponent): IRenderedVirtualNode {
     const renderedComponent = this.resolveRenderedComponent(component);
     const virtualNodeBridge = getVirtualNodeBridge(this, renderedComponent.virtualNode);
@@ -2521,6 +3153,16 @@ export class Renderer implements IRenderer {
     } else {
       this.doBegin();
       this.delegate.onNextLayoutComplete(callback);
+      this.doEnd();
+    }
+  }
+
+  onNextDraw(callback: (hookTimeMs: number) => void): void {
+    if (this.began) {
+      this.delegate.onNextDraw(callback);
+    } else {
+      this.doBegin();
+      this.delegate.onNextDraw(callback);
       this.doEnd();
     }
   }
@@ -2559,6 +3201,14 @@ export class Renderer implements IRenderer {
     return this.eventListener;
   }
 
+  setTracingEnabled(enabled: boolean): void {
+    this.rendererTracingEnabled = enabled && isTracingSupported();
+  }
+
+  isTracingEnabled(): boolean {
+    return this.rendererTracingEnabled;
+  }
+
   private collectElements(node: VirtualNode, output: IRenderedElement[]) {
     if (node.element) {
       output.push(getRenderedElementBridge(this, node.element));
@@ -2590,6 +3240,17 @@ export class Renderer implements IRenderer {
 
   private getElementById(elementId: number): RenderedElement | undefined {
     return this.elementById[elementId];
+  }
+
+  private recordElementDirectionFromCurrentRender(element: RenderedElement, attributeName: string): void {
+    if (
+      attributeName !== 'direction' ||
+      this.rootElementEndingRender !== undefined ||
+      this.currentNode?.element !== element
+    ) {
+      return;
+    }
+    element.directionWasSetDuringRender = true;
   }
 
   private processFrameUpdates(updates: Float64Array) {

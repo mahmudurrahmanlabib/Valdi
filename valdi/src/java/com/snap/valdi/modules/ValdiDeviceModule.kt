@@ -176,9 +176,8 @@ class ValdiDeviceModule(
         val list = marshaller.pushList(count)
         for (idx in 0..count - 1) {
             val locale = locales.get(idx)
-            val language = locale.getLanguage()
-            val country = locale.getCountry()
-            marshaller.pushString("${language}-${country}")
+            val localeString = locale.toLanguageTag()
+            marshaller.pushString(localeString)
             marshaller.setListItem(list, idx)
         }
     }
@@ -201,6 +200,13 @@ class ValdiDeviceModule(
 
     private fun getDisplayScale(marshaller: ValdiMarshaller) {
         marshaller.pushDouble(displayScale)
+    }
+
+    private fun getDynamicTypeScale(marshaller: ValdiMarshaller) {
+        val metrics = context.resources.displayMetrics
+        val density = metrics.density
+        val scale = if (density > 0f) metrics.scaledDensity.toDouble() / density.toDouble() else 1.0
+        marshaller.pushDouble(scale)
     }
 
     private fun getDisplayLeftInset(marshaller: ValdiMarshaller) {
@@ -301,6 +307,7 @@ class ValdiDeviceModule(
                 "getDisplayWidth" to makeBridgeMethod(this::getDisplayWidth),
                 "getDisplayHeight" to makeBridgeMethod(this::getDisplayHeight),
                 "getDisplayScale" to makeBridgeMethod(this::getDisplayScale),
+                "getDynamicTypeScale" to makeBridgeMethod(this::getDynamicTypeScale),
                 "getWindowWidth" to makeBridgeMethod(this::getWindowWidth),
                 "getWindowHeight" to makeBridgeMethod(this::getWindowHeight),
                 "getDisplayLeftInset" to makeBridgeMethod(this::getDisplayLeftInset),

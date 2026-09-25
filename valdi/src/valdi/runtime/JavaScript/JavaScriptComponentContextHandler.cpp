@@ -91,7 +91,8 @@ void JavaScriptComponentContextHandler::setJsContextHandler(const Result<Shared<
     auto jsTaskScheduler = _jsTaskScheduler.lock();
     if (_jsContextHandler) {
         if (jsTaskScheduler != nullptr) {
-            jsTaskScheduler->dispatchOnJsThreadSync(nullptr, [&](JavaScriptEntryParameters& jsEntry) {
+            constexpr auto reason = JsThreadDispatchReason::HotReloadStashData;
+            jsTaskScheduler->dispatchOnJsThreadSync(reason, [&](JavaScriptEntryParameters& jsEntry) {
                 JSFunctionCallContext callContext(jsEntry.jsContext, nullptr, 0, jsEntry.exceptionTracker);
 
                 auto stashResult = callJsContextHandlerFunction(kStashDataPropertyName, jsEntry, callContext);
@@ -117,7 +118,8 @@ void JavaScriptComponentContextHandler::setJsContextHandler(const Result<Shared<
         _stashedHotReloadData = nullptr;
 
         if (jsTaskScheduler != nullptr) {
-            jsTaskScheduler->dispatchOnJsThreadSync(nullptr, [&](JavaScriptEntryParameters& jsEntry) {
+            constexpr auto reason = JsThreadDispatchReason::HotReloadRestoreData;
+            jsTaskScheduler->dispatchOnJsThreadSync(reason, [&](JavaScriptEntryParameters& jsEntry) {
                 auto jsValue = stashedHotReloadData->getJsValue(jsEntry.jsContext, jsEntry.exceptionTracker);
                 if (!jsEntry.exceptionTracker) {
                     return;
@@ -255,10 +257,19 @@ void JavaScriptComponentContextHandler::doOnCreate(JavaScriptEntryParameters& js
     resolveParentContext(componentContextAsValue, parentContext);
 
     if (parentContext != nullptr && parentContext->getContextId() != 1 /* Ignore root context */) {
-        VALDI_DEBUG(
-            _logger, "Resolved parent context of {} to {}", componentPathString, parentContext->getPath().toString());
-        jsEntry.valdiContext->setParent(parentContext);
-        parentContext->getRoot()->retainDisposables();
+        if (parentContext->isDestroyed() && Context::isDestroyedContextFixEnabled()) {
+            VALDI_WARN(_logger,
+                       "Skipping destroyed parent context {} for {}",
+                       parentContext->getContextId(),
+                       componentPathString);
+        } else {
+            VALDI_DEBUG(_logger,
+                        "Resolved parent context of {} to {}",
+                        componentPathString,
+                        parentContext->getPath().toString());
+            jsEntry.valdiContext->setParent(parentContext);
+            parentContext->getRoot()->retainDisposables();
+        }
     }
 
     auto jsComponentPath = jsEntry.jsContext.newStringUTF8(componentPathString, jsEntry.exceptionTracker);

@@ -16,12 +16,18 @@ public:
     static constexpr auto kJavaDescriptor = "Lcom/snapchat/client/valdi/NativeBridge;";
 
     static jint getBuildOptions(fbjni::alias_ref<fbjni::JClass> clazz);
+    static void setDebuggerPortEnvironment(fbjni::alias_ref<fbjni::JClass> clazz, jint debuggerPort);
 
     static jobject getAllRuntimeAttachedObjects(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle);
 
     static jobject getJSRuntime(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeHandle);
     static jstring getViewClassName(fbjni::alias_ref<fbjni::JClass> clazz, jlong viewNodeHandle);
     static jobject getValueForAttribute(fbjni::alias_ref<fbjni::JClass> clazz, jlong viewNodeHandle, jstring attribute);
+    static jobject getStoredObjectForViewNode(fbjni::alias_ref<fbjni::JClass> clazz, jlong viewNodeHandle, jlong key);
+    static void setStoredObjectForViewNode(fbjni::alias_ref<fbjni::JClass> clazz,
+                                           jlong viewNodeHandle,
+                                           jlong key,
+                                           jobject object);
     static jobject getViewInContextForId(fbjni::alias_ref<fbjni::JClass> clazz, jlong contextHandle, jstring viewId);
     static jlong getRetainedViewNodeInContext(fbjni::alias_ref<fbjni::JClass> clazz,
                                               jlong contextHandle,
@@ -112,6 +118,7 @@ public:
     static void applicationSetConfiguration(fbjni::alias_ref<fbjni::JClass> clazz,
                                             jlong runtimeManagerHandle,
                                             jfloat dynamicTypeScale);
+    static void setPointScale(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle, jfloat pointScale);
     static void applicationDidResume(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle);
     static void applicationIsInLowMemory(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle);
     static void applicationWillPause(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle);
@@ -177,6 +184,7 @@ public:
     static void contextOnCreate(fbjni::alias_ref<fbjni::JClass> clazz, jlong contextHandle);
     static void deleteNativeHandle(fbjni::alias_ref<fbjni::JClass> clazz, jlong nativeHandle);
     static void releaseNativeRef(fbjni::alias_ref<fbjni::JClass> clazz, jlong handle);
+    static void discardCallback(fbjni::alias_ref<fbjni::JClass> clazz, jlong callbackHandle);
     static void deleteRuntime(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeHandle);
     static void deleteRuntimeManager(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle);
     static void destroyContext(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeHandle, jlong contextHandle);
@@ -192,6 +200,9 @@ public:
                               jboolean invalidateLayoutOnChange,
                               jobject delegate,
                               jobject compositeParts);
+    static void bindTransformAttributes(fbjni::alias_ref<fbjni::JClass> clazz,
+                                        jlong bindingContextHandle,
+                                        jobject delegate);
     static void bindScrollAttributes(fbjni::alias_ref<fbjni::JClass> clazz, jlong bindingContextHandle);
     static void bindAssetAttributes(fbjni::alias_ref<fbjni::JClass> clazz, jlong bindingContextHandle, jint outputType);
     static void setMeasureDelegate(fbjni::alias_ref<fbjni::JClass> clazz,
@@ -272,6 +283,13 @@ public:
                                      jstring attribute,
                                      jobject value,
                                      jboolean keepAsOverride);
+    static void setInlineTextAnimationAttributesForViewNode(fbjni::alias_ref<fbjni::JClass> clazz,
+                                                            jlong viewNodeHandle,
+                                                            jboolean hasOpacity,
+                                                            jdouble opacity,
+                                                            jboolean hasTransform,
+                                                            jdouble translationY,
+                                                            jdouble scale);
 
     static void notifyApplyAttributeFailed(fbjni::alias_ref<fbjni::JClass> clazz,
                                            jlong viewNodeHandle,
@@ -328,6 +346,16 @@ public:
                               fbjni::alias_ref<JValdiFunction> completion);
 
     static jobject wrapAndroidBitmap(fbjni::alias_ref<fbjni::JClass> clazz, jobject bitmap);
+
+    static jobject rasterizeSVG(fbjni::alias_ref<fbjni::JClass> clazz,
+                                jbyteArray svgData,
+                                jint preferredWidth,
+                                jint preferredHeight,
+                                jfloat displayScale);
+
+    static jobject rasterizeSVGFromFilePath(fbjni::alias_ref<fbjni::JClass> clazz,
+                                            jstring filePath,
+                                            jfloat displayScale);
 
     static jlong getSnapDrawingRuntimeHandle(fbjni::alias_ref<fbjni::JClass> clazz, jlong runtimeManagerHandle);
 

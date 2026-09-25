@@ -1,5 +1,13 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application")
 load("//bzl:expand_template.bzl", "expand_template")
+load(
+    "//bzl/valdi:valdi_macos_application_icons.bzl",
+    "generate_valdi_macos_application_icons",
+    _valdi_macos_application_icons = "valdi_macos_application_icons",
+)
+
+def valdi_macos_application_icons(src):
+    return _valdi_macos_application_icons(src = src)
 
 def valdi_macos_application(
         name,
@@ -9,6 +17,8 @@ def valdi_macos_application(
         window_width,
         window_height,
         window_resizable,
+        app_icons = None,
+        resources = [],
         deps = []):
     main_target = "{}_maingen".format(name)
     plist_target = "{}_plist".format(name)
@@ -26,7 +36,7 @@ def valdi_macos_application(
     expand_template(
         name = main_target,
         src = "@valdi//bzl/valdi/app_templates:macos_main.m.tpl",
-        output = "main.m",
+        output = "main_macos.m",
         substitutions = {
             "@VALDI_ROOT_COMPONENT_PATH@": root_component_path,
             "@VALDI_TITLE@": title,
@@ -51,6 +61,8 @@ def valdi_macos_application(
         infoplists = [":{}".format(plist_target)],
         deps = [":{}".format(src_target)],
         minimum_os_version = "15.0",
+        app_icons = generate_valdi_macos_application_icons(name, app_icons),
+        resources = resources,
         tags = ["valdi_macos_application"],
         visibility = ["//visibility:public"],
     )

@@ -18,6 +18,7 @@ struct ExportedEnum {
     }
     let cases: Cases
     let comments: String?
+    let declaredVersion: String?
 }
 
 final class ExportedEnumGenerator: NativeSourceGenerator {
@@ -59,6 +60,10 @@ final class ExportedEnumGenerator: NativeSourceGenerator {
     }
 
     func generateCppSources(parameters: NativeSourceParameters, cppType: CPPType) throws -> [NativeSource] {
-        return []
+        let cppGenerator = CppEnumGenerator(exportedEnum: exportedEnum,
+                                            cppType: cppType,
+                                            bundleInfo: parameters.bundleInfo,
+                                            sourceFileName: parameters.sourceFileName)
+        return try cppGenerator.write()
     }
 }

@@ -11,19 +11,23 @@
 #include "valdi/runtime/Attributes/ViewNodeAttributesApplier.hpp"
 #include "valdi/runtime/CSS/CSSAttributesManager.hpp"
 #include "valdi/runtime/Context/RawViewNodeId.hpp"
+#include "valdi/runtime/Context/ScrollAnchorPosition.hpp"
+#include "valdi/runtime/Context/StickyPosition.hpp"
 #include "valdi/runtime/Context/ViewNodeAccessibility.hpp"
-#include "valdi/runtime/Views/Frame.hpp"
-#include "valdi/runtime/Views/Measure.hpp"
 #include "valdi/runtime/Views/View.hpp"
+#include "valdi_core/cpp/Views/Frame.hpp"
+#include "valdi_core/cpp/Views/Measure.hpp"
 
 #include "valdi_core/cpp/Context/PlatformType.hpp"
 #include "valdi_core/cpp/Utils/Bytes.hpp"
 #include "valdi_core/cpp/Utils/Function.hpp"
 #include "valdi_core/cpp/Utils/ObjectPool.hpp"
 #include "valdi_core/cpp/Utils/Shared.hpp"
+#include "valdi_core/cpp/Utils/Value.hpp"
 #include "valdi_core/cpp/Utils/ValueMap.hpp"
 #include <bitset>
 #include <memory>
+#include <string>
 
 struct YGNode;
 struct YGConfig;
@@ -57,6 +61,7 @@ class BoundAttributes;
 class AttributeOwner;
 class ViewNodesFrameObserver;
 class Metrics;
+class ColorPalette;
 
 class ViewNode;
 class ViewNodeIterator {
@@ -85,6 +90,12 @@ struct LazyLayoutData {
     ~LazyLayoutData();
 
     void destroyNode();
+};
+
+struct ViewNodeTranslation {
+    float value = 0.0f;
+
+    float getResolvedValue(float referenceLength, bool isPercent) const;
 };
 
 struct ViewNodeUpdateViewTreeResult {
@@ -149,7 +160,7 @@ enum SimplifiedScrollDirection {
 
 class ViewNode : public SharedPtrRefCountable {
 public:
-    ViewNode(YGConfig* yogaConfig, AttributeIds& attributeIds, ILogger& logger);
+    ViewNode(YGConfig* yogaConfig, AttributeIds& attributeIds, const Ref<ColorPalette>& colorPalette, ILogger& logger);
 
     ~ViewNode() override;
 
@@ -170,6 +181,12 @@ public:
      * Returns the calculated frame from Yoga, taking in account RTL offset.
      */
     const Frame& getCalculatedFrame() const;
+
+    /**
+     * Returns the Yoga frame being measured for a managed child-frame parent,
+     * or the last committed calculated frame outside a measurement pass.
+     */
+    Frame getMeasuredFrame() const;
 
     /**
      * Get the calculated frame without taking in account the LTR or RTL direction.
@@ -270,6 +287,9 @@ public:
      */
     Value toPlaformRepresentation(bool wrapInPlatformReference);
 
+    void setStoredObject(const StringBox& key, const Value& value);
+    Value getStoredObject(const StringBox& key) const;
+
     void setView(ViewTransactionScope& viewTransactionScope, const Ref<View>& view, const Ref<Animator>& animator);
     bool removeView(ViewTransactionScope& viewTransactionScope);
 
@@ -320,6 +340,11 @@ public:
     void reapplyAttributesRecursive(ViewTransactionScope& viewTransactionScope,
                                     const std::vector<AttributeId>& attributes,
                                     bool invalidateMeasure);
+    void onColorPaletteMutated(ViewTransactionScope& viewTransactionScope, const ColorPalette& colorPalette);
+
+    void setColorPaletteName(ViewTransactionScope& viewTransactionScope, const StringBox& colorPaletteName);
+    void setInheritedColorPalette(ViewTransactionScope& viewTransactionScope, const Ref<ColorPalette>& colorPalette);
+    const Ref<ColorPalette>& getResolvedColorPalette() const;
 
     void notifyAttributeFailed(AttributeId attributeId, const Error& error);
 
@@ -345,6 +370,7 @@ public:
     bool isScrollingOrAnimatingScroll() const;
 
     bool isMeasurerPlaceholder() const;
+    ViewNode* getEmittingViewNode() const;
 
     /**
      Measure the node by itself, ignoring its children.
@@ -370,6 +396,7 @@ public:
     void findAllNodesWithId(const StringBox& nodeId, std::vector<SharedViewNode>& output);
 
     size_t getChildCount() const;
+    size_t getLiveChildCount() const;
     ViewNode* getChildAt(size_t index) const;
     void insertChildAt(ViewTransactionScope& viewTransactionScope, const Ref<ViewNode>& child, size_t index);
     void appendChild(ViewTransactionScope& viewTransactionScope, const Ref<ViewNode>& child);
@@ -467,6 +494,24 @@ public:
     void setViewportExtensionLeft(float viewportExtensionLeft);
     void setViewportExtensionRight(float viewportExtensionRight);
 
+    // Scroll anchor: pin a child at the top or bottom of the viewport during pagination
+    void setScrollAnchorPosition(int position);
+    int getScrollAnchorPosition() const;
+    void setMaintainScrollAnchor(bool maintain);
+
+    // Preserve scroll position across content-size growth. See ViewNodeScrollState.
+    void setPreserveScrollPosition(bool preserve);
+
+    // Sticky headers: when set on a child inside a scroll with nativeStickyEnabled,
+    // the child's translationY is repositioned in the native scroll pass so it sticks
+    // to the top of the viewport as its parent section scrolls under it. Eliminates the
+    // JS round-trip that lags the JS sticky-header path.
+    void setStickyPosition(int position);
+    int getStickyPosition() const;
+    void setNativeStickyEnabled(bool enabled);
+    void setNativeStickyCover(float cover);
+    void setNativeStickyOffset(float offset);
+
     /**
      * Accessibility attributes (checkout NativeTemplateElement.ts for more info)
      */
@@ -529,7 +574,7 @@ public:
     void setIgnoreParentViewport(bool ignoreParentViewport);
 
     float getTranslationX() const;
-    void setTranslationX(float translationX);
+    void setTranslationX(float translationX, bool isPercent);
 
     /**
      * Returns the effective translation X that should be used for the backing view.
@@ -538,7 +583,10 @@ public:
     float getDirectionDependentTranslationX() const;
 
     float getTranslationY() const;
-    void setTranslationY(float translationY);
+    void setTranslationY(float translationY, bool isPercent);
+
+    void setScaleX(float scaleX);
+    void setScaleY(float scaleY);
 
     void setEstimatedWidth(float estimatedWidth);
     void setEstimatedHeight(float estimatedHeight);
@@ -563,6 +611,9 @@ public:
     Ref<ViewNode> makePlaceholderViewNode(ViewTransactionScope& viewTransactionScope, const Ref<View>& placeholderView);
 
     Result<Ref<ValueMap>> copyProcessedViewLayoutAttributes();
+
+    bool managesChildFrames() const;
+    bool parentManagesChildFrames() const;
 
     Frame computeVisualFrameInRoot() const;
 
@@ -605,8 +656,10 @@ private:
     Frame _calculatedFrame;
     Frame _viewFrame;
     Frame _previousViewFrame;
-    float _translationX = 0;
-    float _translationY = 0;
+    ViewNodeTranslation _translationX;
+    ViewNodeTranslation _translationY;
+    float _scaleX = 1.0f;
+    float _scaleY = 1.0f;
     std::unique_ptr<ViewNodeScrollState> _scrollState;
     std::unique_ptr<ViewNodeAccessibilityState> _accessibilityState;
     std::unique_ptr<ViewNodeChildrenIndexer> _childrenIndexer;
@@ -620,22 +673,31 @@ private:
     int _animationsCount = 0;
     int _lastChildrenIndexerId = 0;
     RawViewNodeId _rawId = 0;
+    int _scrollAnchorPosition = ScrollAnchorPositionNone;
+    int _stickyPosition = StickyPositionNone;
+    // Per-sticky-child measurement cache, refreshed from updateScrollState (layout pass) and
+    // read from handleOnScroll (per scroll frame). Avoids layout thrash while scrolling.
+    float _stickyCachedParentY = 0.0f;
+    float _stickyCachedParentH = 0.0f;
+    float _stickyCachedChildH = 0.0f;
 
-    std::bitset<30> _flags;
+    std::bitset<37> _flags;
 
     ViewNodeTree* _viewNodeTree = nullptr;
 
     Ref<View> _view;
     Ref<ViewFactory> _viewFactory;
     Ref<IViewNodeAssetHandler> _assetHandler;
+    Ref<ColorPalette> _colorPalette;
+    Ref<ValueMap> _storedObjects;
 
     Ref<ValueFunction> _onViewCreatedCallback;
     Ref<ValueFunction> _onViewDestroyedCallback;
     Ref<ValueFunction> _onViewChangedCallback;
     Ref<ValueFunction> _onLayoutCompletedCallback;
 
-    void layoutFinished(ViewTransactionScope& viewTransactionScope, bool didPerformLayout);
-    void layoutFinished(ViewTransactionScope& viewTransactionScope,
+    bool layoutFinished(ViewTransactionScope& viewTransactionScope, bool didPerformLayout);
+    bool layoutFinished(ViewTransactionScope& viewTransactionScope,
                         bool didPerformLayout,
                         float viewOffsetX,
                         float viewOffsetY,
@@ -650,6 +712,8 @@ private:
 
     bool updateViewFrameIfNeeded(ViewTransactionScope& viewTransactionScope, const Ref<Animator>& animator);
     void setViewFrameNeedsUpdate();
+    bool updateManagedChildrenLayout(
+        float width, MeasureMode widthMode, float height, MeasureMode heightMode, bool forceLayout);
 
     bool updateLazyLayout();
     void doUpdateViewTree(ViewTransactionScope& viewTransactionScope,
@@ -680,6 +744,7 @@ private:
 
     bool createView(ViewTransactionScope& viewTransactionScope, const Ref<Animator>& animator);
     bool removeView(ViewTransactionScope& viewTransactionScope, bool safeRemove);
+    size_t resolveYogaInsertionIndexForLiveIndex(size_t liveIndex);
 
     void callViewChangedIfNeeded();
 
@@ -697,6 +762,12 @@ private:
     void handleOnScroll(const Point& directionDependentContentOffset,
                         const Point& directionDependentUnclampedContentOffset,
                         const Point& directionDependentVelocity);
+
+    // Repositions sticky-tagged descendants for the current scroll offset.
+    // refreshCache=true recomputes each sticky child's cached parent Y / parent height /
+    // child height by walking Yoga positions (call from layout / content-size passes).
+    // refreshCache=false only reads the cache (call from per-frame scroll pass).
+    void updateStickyHeaders(bool refreshCache);
 
     void applyFrame(ViewTransactionScope& viewTransactionScope,
                     const Ref<Animator>& animator,
@@ -720,6 +791,14 @@ private:
     ReusableArray<ViewNode*> sortChildrenByZIndex() const;
 
     const Ref<Animator>& resolveAnimator(const Ref<Animator>& parentAnimator) const;
+
+    bool hasOveriddenColorPalette() const;
+    void setHasOveriddenColorPalette(bool hasOveriddenColorPalette);
+    bool setResolvedColorPalette(const Ref<ColorPalette>& colorPalette);
+    Ref<ColorPalette> getParentResolvedColorPalette() const;
+    void invalidateColorAttributes(ViewTransactionScope& viewTransactionScope, bool shouldApply);
+    void propagateInheritedColorPalette(ViewTransactionScope& viewTransactionScope,
+                                        const Ref<ColorPalette>& colorPalette);
 
     ViewNodeScrollState& getOrCreateScrollState();
     ViewNodeAccessibilityState& getOrCreateAccessibilityState();
@@ -753,7 +832,7 @@ private:
     void onChildrenChanged();
     void setChildrenIndexerNeedsUpdate();
 
-    void updateTranslation(float translation, float* outValue);
+    void updateTranslation(float translation, bool isPercent, ViewNodeTranslation* outTranslation, size_t percentFlag);
 
     void setCalculatedViewportHasChildNeedsUpdate();
 
@@ -761,6 +840,7 @@ private:
 
     void setIsLazyLayout(ViewTransactionScope& viewTransactionScope, bool isLazyLayout);
     void updateIsLazyLayout(ViewTransactionScope& viewTransactionScope);
+    void reinsertChildrenInYogaContainer(ViewTransactionScope& viewTransactionScope);
 
     void setAccessibilityTreeNeedsUpdate();
     void propagateAccessibilityTreeUpToDate();
@@ -768,6 +848,8 @@ private:
     bool isMemberOfAccessibilityTree();
 
     LazyLayoutData& getOrCreateLazyLayoutData();
+    YGNode* getOrCreateDetachedYogaNode();
+    YGNode* getDetachedYogaNode() const;
     YGNode* getLazyLayoutYogaNode() const;
     const YGNode* getContainerYogaNode() const;
 

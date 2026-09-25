@@ -9,9 +9,9 @@
 #include "valdi/snap_drawing/SnapDrawingLayerHolder.hpp"
 #include "valdi/snap_drawing/Utils/ValdiUtils.hpp"
 
-#include "snap_drawing/cpp/Utils/Image.hpp"
+#include <fmt/format.h>
 
-#include "valdi_core/cpp/Utils/LoggerUtils.hpp"
+#include "snap_drawing/cpp/Utils/Image.hpp"
 
 #include "valdi/runtime/Context/ViewNode.hpp"
 
@@ -23,17 +23,20 @@
 #include "snap_drawing/cpp/Drawing/GraphicsContext/BitmapGraphicsContext.hpp"
 #include "valdi/snap_drawing/Animations/ValdiAnimator.hpp"
 
+#include "snap_drawing/cpp/Layers/Interfaces/IChildInsertionLayerProvider.hpp"
 #include "snap_drawing/cpp/Layers/Interfaces/ILoadedAssetLayer.hpp"
 #include "snap_drawing/cpp/Layers/LayerRoot.hpp"
 #include "snap_drawing/cpp/Layers/ScrollLayer.hpp"
-#include "valdi/runtime/Views/Measure.hpp"
+#include "valdi_core/cpp/Views/Measure.hpp"
 
 using namespace Valdi;
 
 namespace snap::drawing {
 
+/// Returns the Layer for a View that is a SnapDrawingLayerHolder. Returns null if the view is
+/// not a holder (e.g. a bridged NSView on macOS), so callers must null-check to avoid crashes.
 static Valdi::Ref<Layer> toLayer(const Ref<View>& view) {
-    return dynamic_cast<SnapDrawingLayerHolder*>(view.get())->get();
+    return valdiViewToLayer(view);
 }
 
 SnapDrawingViewTransaction::SnapDrawingViewTransaction() = default;
@@ -43,10 +46,19 @@ void SnapDrawingViewTransaction::flush(bool sync) {}
 
 void SnapDrawingViewTransaction::willUpdateRootView(const Ref<View>& view) {}
 
-void SnapDrawingViewTransaction::didUpdateRootView(const Ref<View>& view, bool layoutDidBecomeDirty) {}
+void SnapDrawingViewTransaction::didUpdateRootView(const Ref<View>& view, bool layoutDidBecomeDirty) {
+    auto callbacks = std::move(_pendingOnNextDrawCallbacks);
+    for (auto& callback : callbacks) {
+        callback();
+    }
+}
 
 void SnapDrawingViewTransaction::moveViewToTree(const Ref<View>& view, ViewNodeTree* viewNodeTree, ViewNode* viewNode) {
-    setValdiViewNodeToLayer(*toLayer(view), viewNode);
+    auto layer = toLayer(view);
+    if (layer == nullptr) {
+        return;
+    }
+    setValdiViewNodeToLayer(*layer, viewNode);
 }
 
 void SnapDrawingViewTransaction::insertChildView(const Ref<View>& view,
@@ -55,14 +67,19 @@ void SnapDrawingViewTransaction::insertChildView(const Ref<View>& view,
                                                  const Ref<Animator>& animator) {
     auto parent = toLayer(view);
     auto child = toLayer(childView);
+    if (parent == nullptr || child == nullptr) {
+        return;
+    }
 
-    auto scrollView = Valdi::castOrNull<ScrollLayer>(parent);
-
-    if (scrollView != nullptr) {
-        scrollView->getContentLayer()->insertChild(child, static_cast<size_t>(index));
-        auto viewNode = snap::drawing::valdiViewNodeFromLayer(*scrollView);
-        if (viewNode != nullptr) {
-            scrollView->setHorizontal(viewNode->isHorizontal());
+    auto* childInsertionLayerProvider = dynamic_cast<IChildInsertionLayerProvider*>(parent.get());
+    if (childInsertionLayerProvider != nullptr) {
+        childInsertionLayerProvider->getChildInsertionLayer().insertChild(child, static_cast<size_t>(index));
+        auto scrollView = Valdi::castOrNull<ScrollLayer>(parent);
+        if (scrollView != nullptr) {
+            auto viewNode = snap::drawing::valdiViewNodeFromLayer(*scrollView);
+            if (viewNode != nullptr) {
+                scrollView->setHorizontal(viewNode->isHorizontal());
+            }
         }
     } else {
         parent->insertChild(child, static_cast<size_t>(index));
@@ -72,11 +89,17 @@ void SnapDrawingViewTransaction::insertChildView(const Ref<View>& view,
 void SnapDrawingViewTransaction::removeViewFromParent(const Ref<View>& view,
                                                       const Ref<Animator>& animator,
                                                       bool shouldClearViewNode) {
-    toLayer(view)->removeFromParent();
+    auto layer = toLayer(view);
+    if (layer != nullptr) {
+        layer->removeFromParent();
+    }
 }
 
 void SnapDrawingViewTransaction::invalidateViewLayout(const Ref<View>& view) {
-    toLayer(view)->setNeedsLayout();
+    auto layer = toLayer(view);
+    if (layer != nullptr) {
+        layer->setNeedsLayout();
+    }
 }
 
 static Rect makeViewFrame(const Valdi::Frame& frame, Scalar displayScale) {
@@ -93,6 +116,9 @@ void SnapDrawingViewTransaction::setViewFrame(const Ref<View>& view,
                                               bool isRightToLeft,
                                               const Ref<Animator>& animator) {
     auto layer = toLayer(view);
+    if (layer == nullptr) {
+        return;
+    }
     auto frame = makeViewFrame(newFrame, layer->getResources()->getDisplayScale());
 
     auto typedAnimator =
@@ -128,7 +154,11 @@ void SnapDrawingViewTransaction::setViewScrollSpecs(const Ref<View>& view,
                                                     const Valdi::Point& directionDependentContentOffset,
                                                     const Valdi::Size& contentSize,
                                                     bool animated) {
-    auto scrollView = Valdi::castOrNull<ScrollLayer>(toLayer(view));
+    auto layer = toLayer(view);
+    if (layer == nullptr) {
+        return;
+    }
+    auto scrollView = Valdi::castOrNull<ScrollLayer>(layer);
 
     if (scrollView != nullptr) {
         scrollView->setContentSize(Size::make(contentSize.width, contentSize.height));
@@ -141,9 +171,22 @@ void SnapDrawingViewTransaction::setViewLoadedAsset(const Ref<View>& view,
                                                     const Ref<LoadedAsset>& loadedAsset,
                                                     bool shouldDrawFlipped) {
     auto layer = toLayer(view);
+    if (layer == nullptr) {
+        return;
+    }
     auto loadedAssetLayer = dynamic_cast<ILoadedAssetLayer*>(layer.get());
     if (loadedAssetLayer != nullptr) {
         loadedAssetLayer->onLoadedAssetChanged(loadedAsset, shouldDrawFlipped);
+        return;
+    }
+
+    auto bridgeLayer = Valdi::castOrNull<BridgeLayer>(layer);
+    auto viewNode = bridgeLayer != nullptr ? valdiViewNodeFromLayer(*bridgeLayer) : nullptr;
+    auto bridgedView = bridgeLayer != nullptr ? bridgeLayer->getBridgedView() : nullptr;
+    if (viewNode != nullptr && bridgedView != nullptr) {
+        bridgedView->getViewTransaction(viewNode->getViewNodeTree())
+            .setViewLoadedAsset(bridgedView->getView(), loadedAsset, shouldDrawFlipped);
+        bridgeLayer->setNeedsDisplay();
     }
 }
 
@@ -153,19 +196,24 @@ void SnapDrawingViewTransaction::cancelAllViewAnimations(const Ref<View>& view) 
 
 void SnapDrawingViewTransaction::willEnqueueViewToPool(const Ref<View>& view, Valdi::Function<void(View&)> onEnqueue) {
     auto snapDrawingView = toLayer(view);
-    if (snapDrawingView != nullptr) {
-        snapDrawingView->setAttachedData(nullptr);
-
-        snapDrawingView->prepareForReuse();
-        snapDrawingView->removeAllAnimations();
-
-        onEnqueue(*view);
+    if (snapDrawingView == nullptr) {
+        return;
     }
+    snapDrawingView->setAttachedData(nullptr);
+
+    snapDrawingView->prepareForReuse();
+    snapDrawingView->removeAllAnimations();
+
+    onEnqueue(*view);
 }
 
 void SnapDrawingViewTransaction::snapshotView(const Ref<View>& view,
                                               Valdi::Function<void(Valdi::Result<Valdi::BytesView>)> cb) {
     auto layer = toLayer(view);
+    if (layer == nullptr) {
+        cb(Valdi::Error(STRING_LITERAL("View is not a SnapDrawing layer")));
+        return;
+    }
 
     auto bridgeLayer = Valdi::castOrNull<BridgeLayer>(layer);
     if (bridgeLayer != nullptr) {
@@ -227,6 +275,10 @@ void SnapDrawingViewTransaction::flushAnimator(const Ref<Animator>& animator, co
 void SnapDrawingViewTransaction::cancelAnimator(const Ref<Animator>& animator) {
     auto typedAnimator = Valdi::castOrNull<ValdiAnimator>(animator->getNativeAnimator());
     typedAnimator->cancel();
+}
+
+void SnapDrawingViewTransaction::scheduleOnNextDraw(const Ref<View>& rootView, Valdi::DispatchFunction callback) {
+    _pendingOnNextDrawCallbacks.emplace_back(std::move(callback));
 }
 
 void SnapDrawingViewTransaction::executeInTransactionThread(DispatchFunction executeFn) {

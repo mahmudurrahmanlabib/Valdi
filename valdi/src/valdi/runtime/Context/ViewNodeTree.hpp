@@ -13,7 +13,6 @@
 #include "valdi/runtime/Context/Context.hpp"
 #include "valdi/runtime/Context/RawViewNodeId.hpp"
 #include "valdi/runtime/Context/ViewNode.hpp"
-#include "valdi/runtime/Views/Measure.hpp"
 #include "valdi/runtime/Views/View.hpp"
 #include "valdi/runtime/Views/ViewFactory.hpp"
 #include "valdi/runtime/Views/ViewTransactionScope.hpp"
@@ -21,7 +20,11 @@
 #include "valdi_core/cpp/Utils/Mutex.hpp"
 #include "valdi_core/cpp/Utils/TrackedLock.hpp"
 #include "valdi_core/cpp/Utils/ValdiObject.hpp"
+#include "valdi_core/cpp/Views/Measure.hpp"
+#include <chrono>
 #include <deque>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace Valdi {
@@ -42,9 +45,15 @@ class Metrics;
 struct ViewNodeTreeUpdates {
     DispatchFunction performUpdates;
     DispatchFunction completion;
+    /** Optional trigger reason for tracing (e.g. "render_request", "setLayoutSpecs", "reapply_attributes:height"). */
+    std::string traceTrigger;
 
-    inline ViewNodeTreeUpdates(DispatchFunction&& performUpdates, DispatchFunction&& completion)
-        : performUpdates(std::move(performUpdates)), completion(std::move(completion)) {}
+    inline ViewNodeTreeUpdates(DispatchFunction&& performUpdates,
+                               DispatchFunction&& completion,
+                               std::string traceTrigger = {})
+        : performUpdates(std::move(performUpdates)),
+          completion(std::move(completion)),
+          traceTrigger(std::move(traceTrigger)) {}
 };
 
 class ViewNodeTreeDisableUpdates;
@@ -68,6 +77,7 @@ public:
     ~ViewNodeTree() override;
 
     void clear();
+    void clearRunUpdatesMetricsSession();
 
     void updateCSS(const SharedAnimator& animator);
 
@@ -183,7 +193,22 @@ public:
      */
     void scheduleExclusiveUpdate(DispatchFunction updateFunction, DispatchFunction completion);
 
+    /**
+     Schedule an exclusive update with an optional trace trigger (e.g. "render_request",
+     "reapply_attributes:height,padding") for visibility in traces.
+     */
+    void scheduleExclusiveUpdate(DispatchFunction updateFunction,
+                                 DispatchFunction completion,
+                                 std::string traceTrigger);
+
     void withLock(const DispatchFunction& fn);
+
+    /**
+     Like withLock, but gives up if the tree lock cannot be acquired by the deadline, so the
+     calling thread never parks on the lock indefinitely. A deadline in the past attempts the
+     lock exactly once. Returns whether fn ran.
+     */
+    bool tryWithLock(const DispatchFunction& fn, const std::chrono::steady_clock::time_point& deadline);
 
     bool inExclusiveUpdate() const;
 
@@ -215,6 +240,7 @@ public:
     void setAssetTracker(const Ref<IViewNodesAssetTracker>& assetTracker);
 
     void onNextLayout(const Ref<ValueFunction>& callback);
+    void onNextDraw(const Ref<ValueFunction>& callback);
 
     [[nodiscard]] ViewNodeTreeDisableUpdates beginDisableUpdates();
 
@@ -252,6 +278,7 @@ private:
     Ref<ViewTransactionScope> _currentViewTransactionScope;
     std::deque<ViewNodeTreeUpdates> _updateFunctions;
     std::vector<Ref<ValueFunction>> _onLayoutCallbacks;
+    std::vector<Ref<ValueFunction>> _onDrawCallbacks;
     mutable RecursiveMutex _mutex;
 
     FlatMap<AnimationCancelToken, SharedAnimator> _pendingCancellableAnimations;
@@ -285,14 +312,20 @@ private:
     int _disableUpdatesCounter = 0;
     int _beginViewTransactionCounter = 0;
     size_t _layoutDirtyCounter = 0;
+    std::chrono::steady_clock::duration _runUpdatesInnerAccumulatedTime{0};
+    std::optional<std::chrono::steady_clock::time_point> _runUpdatesInnerSessionStart;
+    std::optional<std::chrono::steady_clock::time_point> _runUpdatesInnerSessionStop;
 
     std::unique_ptr<AttributeOwner> _parentAttributeOwner;
+
+    void flushRunUpdatesInnerStatsIfNeeded();
 
     void attachRootNodeInParentTreeIfNeeded();
     void runUpdates();
     void runUpdatesInner();
 
     void flushOnLayoutCallbacks();
+    void flushOnDrawCallbacks();
 
     void schedulePerformUpdates();
     void performUpdatesIfLayoutSpecsUpToDate();

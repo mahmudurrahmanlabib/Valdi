@@ -10,12 +10,39 @@ Open `client/src/open_source/compiler/compiler/Compiler/Package.swift` in Xcode 
 
 Run client/src/dev_setup.sh. This should download and install Swift, clone and build watchman from source and install all the necessary apt-get dependencies.
 
-## Updating the compiler binary in client
+## Building the compiler locally
 
-Run:
+To build and use the compiler from source (instead of the prebuilt binary):
 
 ```sh
-./scripts/update_compiler.sh
+compiler/compiler/scripts/update_compiler_bazel.sh -o compiler/compiler/out
+```
+
+- The compiler is built with Bazel (`//compiler/compiler:local_valdi_compiler`); no Swift toolchain install is required.
+- `-o compiler/compiler/out` writes the binary to `out/macos/valdi_compiler` (or `out/linux/valdi_compiler` on Linux)
+
+The `out/` directory is gitignored.
+
+To use your local build with Bazel, pass `--//bzl/valdi:use_local_compiler=true`:
+
+```sh
+bazel build //src/valdi_modules/src/valdi/jasmine --//bzl/valdi:use_local_compiler=true
+```
+
+Or via the CLI hotreload command:
+
+```sh
+valdi hotreload --local
+```
+
+See [docs/docs/workflow-bazel.md](../../docs/docs/workflow-bazel.md) for more details.
+
+## Updating the prebuilt compiler binary in the repo
+
+To update the prebuilt binary that gets downloaded by other developers (SnapCI job):
+
+```sh
+./scripts/update_compiler_bazel.sh -o bin/compiler
 ```
 
 ## Debugging C++ JNI crashes

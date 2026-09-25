@@ -85,7 +85,11 @@ Value HTTPRequestManagerModuleFactory::loadModule() {
                         parameters[1] = Value::undefined();
                     } else {
                         parameters[0] = Value::undefined();
-                        parameters[1] = Value(result.error());
+                        // Pass the text, not the Error itself. valueToJSValue raises a
+                        // ValueType::Error into the exception tracker instead of marshalling it as
+                        // an argument, so the callback would never run and the promise behind it
+                        // would stay pending. PersistentStoreModuleFactory does the same.
+                        parameters[1] = Value(result.error().toString());
                     }
 
                     (*completion)(parameters.data(), parameters.size());
@@ -96,22 +100,16 @@ Value HTTPRequestManagerModuleFactory::loadModule() {
                     std::move(url), std::move(method), std::move(headers), std::move(convertedBody), priority),
                 requestCompletion);
 
-            Value out;
-            out.setMapValue("cancel",
-                            Value(makeShared<ValueFunctionWithCallable>(
-                                [cancellable](const ValueFunctionCallContext& /*callContext*/) -> Value {
-                                    cancellable->cancel();
-                                    return Value::undefined();
-                                })));
-
-            return out;
+            return Value(makeShared<ValueFunctionWithCallable>(
+                [cancellable](const ValueFunctionCallContext& /*callContext*/) -> Value {
+                    cancellable->cancel();
+                    return Value::undefined();
+                }));
         })));
 
     return out;
 }
 
-static Valdi::RegisterModuleFactory kRegisterModule([]() {
-    return std::make_shared<HTTPRequestManagerModuleFactory>();
-});
+static auto kRegisterModule = Valdi::RegisterModuleFactory::registerTyped<HTTPRequestManagerModuleFactory>();
 
 } // namespace Valdi

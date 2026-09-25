@@ -639,7 +639,21 @@ void AssetsManager::notifyAssetConsumer(AssetsManagerTransaction& transaction,
         errorStringBox = {errorString};
     }
 
-    assetConsumer->getObserver()->onLoad(observable, Value(loadedAsset), errorStringBox);
+    // Default to sending the asset as-is
+    Value assetValue = Value(loadedAsset);
+
+    // Convert BytesAsset to ValueTypedArray for proper JavaScript marshalling
+    // Only do this for assets loaded with BYTES output type
+    if (loadedAsset != nullptr && assetConsumer->getOutputType() == snap::valdi_core::AssetOutputType::Bytes) {
+        // This was loaded as a bytes asset, try to get bytes content
+        auto bytesContentResult = loadedAsset->getBytesContent();
+        if (bytesContentResult) {
+            // Wrap in ValueTypedArray so JS receives a Uint8Array
+            assetValue = Value(makeShared<ValueTypedArray>(TypedArrayType::Uint8Array, bytesContentResult.value()));
+        }
+    }
+
+    assetConsumer->getObserver()->onLoad(observable, assetValue, errorStringBox);
 
     transaction.acquireLock();
 }
@@ -879,6 +893,47 @@ void AssetsManager::endPauseUpdates() {
                 // Flush them now
                 performUpdates(std::move(guard));
             }
+        }
+    }
+}
+
+void AssetsManager::retryFailedAssets() {
+    auto guard = lock();
+
+    // Capture before mutating _scheduledUpdates: if a pump is already pending, we only enqueue.
+    const bool needScheduleUpdates = _pauseUpdatesCount == 0 && _scheduledUpdates.empty();
+
+    bool anyReset = false;
+    for (const auto& it : _assets) {
+        const auto& managedAsset = it.second;
+        if (managedAsset->getState() != AssetStateFailedRetryable) {
+            continue;
+        }
+
+        managedAsset->setState(AssetStateInitial);
+
+        // Consumers already received the failure and are marked notified, so re-resolving alone would
+        // leave them untouched (getNextConsumerToUpdate skips notified consumers). Reset each failed
+        // consumer to its initial, un-notified state so the re-resolve re-loads and re-notifies it,
+        // exactly as a freshly added consumer would be handled.
+        for (size_t i = 0; i < managedAsset->getConsumersSize(); i++) {
+            const auto& consumer = managedAsset->getConsumer(i);
+            if (consumer->getState() == AssetConsumerStateFailed) {
+                consumer->setState(AssetConsumerStateInitial);
+                consumer->setNotified(false);
+            }
+        }
+
+        _scheduledUpdates.emplace_back(it.first);
+        anyReset = true;
+    }
+
+    if (anyReset && needScheduleUpdates) {
+        if (_mainThreadManager.currentThreadIsMainThread()) {
+            performUpdates(std::move(guard));
+        } else {
+            guard.unlock();
+            schedulePerformUpdates();
         }
     }
 }

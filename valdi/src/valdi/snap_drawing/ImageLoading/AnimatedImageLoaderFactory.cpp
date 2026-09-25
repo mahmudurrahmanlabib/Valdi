@@ -10,6 +10,10 @@
 #include "snap_drawing/cpp/Text/IFontManager.hpp"
 #include "valdi/runtime/Resources/AssetLoader.hpp"
 #include "valdi/runtime/Resources/AssetLoaderCompletion.hpp"
+#include "valdi/snap_drawing/ImageLoading/AssetSourceDescription.hpp"
+
+#include <string>
+#include <string_view>
 
 namespace snap::drawing {
 
@@ -37,11 +41,12 @@ public:
         const Valdi::Ref<Valdi::AssetLoaderCompletion>& completion) override {
         auto fontManager = associatedData.getTypedRef<IFontManager>();
 
+        auto url = requestPayload.toStringBox();
+
         return _downloader->downloadItem(
-            requestPayload.toStringBox(),
-            [weakSelf = Valdi::weakRef(this), fontManager, completion](const auto& result) {
+            url, [weakSelf = Valdi::weakRef(this), fontManager, completion, url](const auto& result) {
                 if (auto strongSelf = weakSelf.lock()) {
-                    strongSelf->onBytesLoaded(result, fontManager, completion);
+                    strongSelf->onBytesLoaded(result, fontManager, completion, url);
                 }
             });
     }
@@ -52,7 +57,8 @@ private:
 
     void onBytesLoaded(const Valdi::Result<Valdi::BytesView>& result,
                        const Valdi::Ref<IFontManager>& fontManager,
-                       const Valdi::Ref<Valdi::AssetLoaderCompletion>& completion) {
+                       const Valdi::Ref<Valdi::AssetLoaderCompletion>& completion,
+                       const Valdi::StringBox& url) {
         if (!result) {
             completion->onLoadComplete(result.error());
             return;
@@ -62,7 +68,11 @@ private:
                                          result.value().data(),
                                          result.value().size());
         if (!scene) {
-            completion->onLoadComplete(scene.error());
+            // flatten() for the same reason as the static loader: getMessage() returns only the
+            // outermost message, so a rethrown cause would be dropped. A no-op without a cause.
+            const auto message = std::string(scene.error().flatten().getMessage().toStringView()) + " [" +
+                                 describeAssetSource(url) + "]";
+            completion->onLoadComplete(Valdi::Error(std::string_view(message)));
             return;
         }
 

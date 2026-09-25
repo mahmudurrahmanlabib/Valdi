@@ -37,6 +37,9 @@ AttributeIds::AttributeIds() {
     registerDefaultAttribute(DefaultAttributeOpacity, "opacity");
     registerDefaultAttribute(DefaultAttributeEnabled, "enabled");
     registerDefaultAttribute(DefaultAttributeAccessibilityId, "accessibilityId");
+    registerDefaultAttribute(DefaultAttributeScaleX, "scaleX");
+    registerDefaultAttribute(DefaultAttributeScaleY, "scaleY");
+    registerDefaultAttribute(DefaultAttributeColorPaletteName, "colorPaletteName");
 }
 
 AttributeIds::~AttributeIds() = default;

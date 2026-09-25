@@ -1,11 +1,16 @@
 #include <gtest/gtest.h>
 
 #include "TestANRDetectorListener.hpp"
-#include "valdi/runtime/Exception.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptANRDetector.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptTaskScheduler.hpp"
 #include "valdi/runtime/Utils/AsyncGroup.hpp"
 #include "valdi_core/cpp/Utils/ConsoleLogger.hpp"
+#include "valdi_core/cpp/Utils/Exception.hpp"
+
+#include <chrono>
+#include <string>
+#include <thread>
+#include <utility>
 
 using namespace Valdi;
 
@@ -31,6 +36,13 @@ public:
         }
     }
 
+    void dispatchOnJsThread(JsThreadDispatchReason,
+                            JavaScriptTaskScheduleType scheduleType,
+                            uint32_t delayMs,
+                            JavaScriptThreadTask&& function) override {
+        dispatchOnJsThread(Ref<Context>(), scheduleType, delayMs, std::move(function));
+    }
+
     bool isInJsThread() override {
         return false;
     }
@@ -40,8 +52,19 @@ public:
     }
 
     std::vector<JavaScriptCapturedStacktrace> captureStackTraces(std::chrono::steady_clock::duration timeout) override {
+        if (_clearAttributionOnCapture) {
+            _anrAttributionInfo.clear();
+        }
         return {JavaScriptCapturedStacktrace(
             JavaScriptCapturedStacktrace::Status::RUNNING, STRING_LITERAL("A fake stacktrace"), nullptr)};
+    }
+
+    std::string getANRAttributionInfo() const override {
+        return _anrAttributionInfo;
+    }
+
+    bool isReadyForANRDetection() const override {
+        return _readyForANRDetection;
     }
 
     int getLastTaskId() {
@@ -52,9 +75,25 @@ public:
         _shouldSimulateANR = true;
     }
 
+    void setANRAttributionInfo(std::string anrAttributionInfo) {
+        _anrAttributionInfo = std::move(anrAttributionInfo);
+    }
+
+    void setReadyForANRDetection(bool ready) {
+        _readyForANRDetection = ready;
+    }
+
+    /** Simulates the native call returning while the detector waits on the capture. */
+    void setClearAttributionOnCapture() {
+        _clearAttributionOnCapture = true;
+    }
+
 private:
     std::atomic_bool _shouldSimulateANR = false;
+    std::atomic_bool _readyForANRDetection = true;
+    std::atomic_bool _clearAttributionOnCapture = false;
     std::atomic_int _taskIdSequence = 0;
+    std::string _anrAttributionInfo;
 };
 
 struct ANRDetectorTestHelper {
@@ -127,6 +166,101 @@ TEST(ANRDetector, detectsANRWhenTaskAreHanging) {
     ASSERT_EQ(static_cast<size_t>(1), anr->getCapturedStacktraces().size());
     ASSERT_EQ(STRING_LITERAL("A fake stacktrace"), anr->getCapturedStacktraces()[0].getStackTrace());
     ASSERT_EQ("Detected unattributed ANR after 1.0 ms", anr->getMessage());
+}
+
+TEST(ANRDetector, doesNotDetectANRWhileSchedulerIsNotReadyForDetection) {
+    ANRDetectorTestHelper helper;
+
+    helper.taskScheduler->setShouldSimulateANR();
+    helper.taskScheduler->setReadyForANRDetection(false);
+
+    helper.anrDetector->onEnterForeground();
+    helper.anrDetector->start(std::chrono::milliseconds(1));
+
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+
+    ASSERT_FALSE(helper.getLastANR().has_value());
+
+    helper.taskScheduler->setReadyForANRDetection(true);
+
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+
+    auto anr = helper.getLastANR();
+    ASSERT_TRUE(anr.has_value());
+    ASSERT_EQ("Detected unattributed ANR after 1.0 ms", anr->getMessage());
+}
+
+TEST(ANRDetector, givesStaleInFlightSynAFreshBudgetOnEnterForeground) {
+    ANRDetectorTestHelper helper;
+
+    helper.taskScheduler->setShouldSimulateANR();
+
+    helper.anrDetector->onEnterForeground();
+    helper.anrDetector->start(std::chrono::milliseconds(100));
+
+    // Arms a syn probe that will never be acked.
+    helper.waitForNextTick();
+
+    helper.anrDetector->onEnterBackground();
+    // Simulate a process suspension outlasting the detection threshold: the clock keeps running
+    // while ticks are paused, so the armed probe goes stale.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    helper.anrDetector->onEnterForeground();
+
+    // Without the foreground re-arm this tick would report an ANR measured across the suspension.
+    helper.waitForNextTick();
+    ASSERT_FALSE(helper.getLastANR().has_value());
+
+    // A hang that persists after resume is still detected once a full budget elapses in
+    // foreground.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    helper.waitForNextTick();
+    ASSERT_TRUE(helper.getLastANR().has_value());
+}
+
+TEST(ANRDetector, includesANRAttributionInfoInMessageWhenSet) {
+    ANRDetectorTestHelper helper;
+
+    helper.taskScheduler->setShouldSimulateANR();
+    helper.taskScheduler->setANRAttributionInfo(" [stuck-in: Graphene.partitionMakeMetric] [module: search_v2]");
+
+    helper.anrDetector->onEnterForeground();
+    helper.anrDetector->start(std::chrono::milliseconds(1));
+
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+
+    auto anr = helper.getLastANR();
+    ASSERT_TRUE(anr.has_value());
+
+    ASSERT_EQ("Detected unattributed ANR after 1.0 ms [stuck-in: Graphene.partitionMakeMetric] [module: search_v2]",
+              anr->getMessage());
+}
+
+TEST(ANRDetector, keepsANRAttributionInfoWhenNativeCallEndsDuringCapture) {
+    ANRDetectorTestHelper helper;
+
+    helper.taskScheduler->setShouldSimulateANR();
+    helper.taskScheduler->setANRAttributionInfo(" [stuck-in: runtime.loadJsModule(coreui/src/InitSemanticColors)]");
+    helper.taskScheduler->setClearAttributionOnCapture();
+
+    helper.anrDetector->onEnterForeground();
+    helper.anrDetector->start(std::chrono::milliseconds(1));
+
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+    helper.waitForNextTick();
+
+    auto anr = helper.getLastANR();
+    ASSERT_TRUE(anr.has_value());
+
+    ASSERT_EQ("Detected unattributed ANR after 1.0 ms [stuck-in: runtime.loadJsModule(coreui/src/InitSemanticColors)]",
+              anr->getMessage());
 }
 
 } // namespace ValdiTest

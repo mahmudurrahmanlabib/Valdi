@@ -11,7 +11,23 @@
 - (NSString *)_lockFreeRegisterFontWithFontName:(NSString *)fontName data:(NSData *)data error:(NSError **)error
 {
     CGDataProviderRef fontDataProvider = CGDataProviderCreateWithCFData((CFDataRef)data);
-    CGFontRef newFont = CGFontCreateWithDataProvider(fontDataProvider);
+    CGFontRef newFont = fontDataProvider ? CGFontCreateWithDataProvider(fontDataProvider) : NULL;
+
+    // A truncated or corrupt font file yields a NULL CGFont, which CoreText and CFRelease below
+    // would both dereference.
+    if (!newFont) {
+        if (fontDataProvider) {
+            CGDataProviderRelease(fontDataProvider);
+        }
+        *error = [NSError errorWithDomain:NSCocoaErrorDomain
+                                     code:NSFileReadCorruptFileError
+                                 userInfo:@{
+                                     NSLocalizedDescriptionKey : [NSString
+                                         stringWithFormat:@"Font data for '%@' could not be decoded", fontName]
+                                 }];
+        return nil;
+    }
+
     NSString *resolvedFontFullName = (NSString *)CFBridgingRelease(CGFontCopyFullName(newFont));
     CFErrorRef cfError = nil;
     BOOL success = CTFontManagerRegisterGraphicsFont(newFont, &cfError);
@@ -81,18 +97,43 @@
         UIFont *font;
         if ([fontName isEqualToString:@"system"]) {
             font = [UIFont systemFontOfSize:fontSize];
+        } else if ([fontName isEqualToString:@"system-medium"]) {
+            font = [UIFont systemFontOfSize:fontSize weight:UIFontWeightMedium];
         } else if ([fontName isEqualToString:@"system-bold"]) {
             font = [UIFont boldSystemFontOfSize:fontSize];
+        } else if ([fontName isEqualToString:@"system-demi-bold"] || [fontName isEqualToString:@"system-semibold"]) {
+            font = [UIFont systemFontOfSize:fontSize weight:UIFontWeightSemibold];
         } else if ([fontName isEqualToString:@"system-italic"]) {
             font = [UIFont italicSystemFontOfSize:fontSize];
-        } else if (_fontLoader) {
-            if ([_fontLoader shouldBypassContextForLegibilityWeight]) {
-                font = [_fontLoader loadFontWithName:fontName fontSize:fontSize legibilityWeight:legibilityWeight];
-            } else {
-                font = [_fontLoader loadFontWithName:fontName fontSize:fontSize];
-            }
+        } else if ([fontName isEqualToString:@"system-medium-italic"]) {
+            UIFontDescriptor *descriptor = [[UIFont systemFontOfSize:fontSize weight:UIFontWeightMedium].fontDescriptor
+                fontDescriptorWithSymbolicTraits:UIFontDescriptorTraitItalic];
+            font = [UIFont fontWithDescriptor:descriptor size:fontSize] ?: [UIFont italicSystemFontOfSize:fontSize];
+        } else if ([fontName isEqualToString:@"system-demi-bold-italic"] || [fontName isEqualToString:@"system-semibold-italic"]) {
+            UIFontDescriptor *descriptor = [[UIFont systemFontOfSize:fontSize weight:UIFontWeightSemibold].fontDescriptor
+                fontDescriptorWithSymbolicTraits:UIFontDescriptorTraitItalic];
+            font = [UIFont fontWithDescriptor:descriptor size:fontSize] ?: [UIFont italicSystemFontOfSize:fontSize];
+        } else if ([fontName isEqualToString:@"system-bold-italic"]) {
+            UIFontDescriptor *descriptor = [[UIFont boldSystemFontOfSize:fontSize].fontDescriptor
+                fontDescriptorWithSymbolicTraits:UIFontDescriptorTraitBold | UIFontDescriptorTraitItalic];
+            font = [UIFont fontWithDescriptor:descriptor size:fontSize] ?: [UIFont boldSystemFontOfSize:fontSize];
         } else {
-            font = [UIFont fontWithName:fontName size:fontSize];
+            UIFont *fontForName = [UIFont fontWithName:fontName size:fontSize];
+            if (fontForName && _fontLoader) {
+                if ([_fontLoader shouldBypassContextForLegibilityWeight]) {
+                    font = [_fontLoader loadFontWithName:fontName fontSize:fontSize legibilityWeight:legibilityWeight];
+                } else {
+                    font = [_fontLoader loadFontWithName:fontName fontSize:fontSize];
+                }
+            }
+
+            if (!font) {
+                font = fontForName;
+            }
+        }
+
+        if (!font) {
+            font = [UIFont systemFontOfSize:fontSize];
         }
 
         return font;
@@ -151,4 +192,3 @@
 }
 
 @end
-

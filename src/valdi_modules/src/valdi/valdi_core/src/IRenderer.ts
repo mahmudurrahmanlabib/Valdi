@@ -18,6 +18,35 @@ interface Unsubscribable {
 
 export type ComponentDisposable = (() => void) | Unsubscribable;
 
+/**
+ * A bounded, immutable view of one live virtual node for debugger consumers.
+ * `traversedLinkCount` includes both flattened slot-child links and parent
+ * links inspected while producing the snapshot.
+ */
+export interface RendererDebugVirtualNodeSnapshot {
+  readonly children: readonly IRenderedVirtualNode[];
+  readonly component: IComponent | undefined;
+  /** Internal debugger input. Consumers must serialize a detached snapshot before exposing it. */
+  readonly componentViewModel?: unknown;
+  readonly element: IRenderedElement | undefined;
+  readonly key: string;
+  readonly parent: IRenderedVirtualNode | undefined;
+  readonly traversedLinkCount: number;
+}
+
+export type RendererDebugEditableScalar = boolean | number | string;
+
+/** Internal, web-debugger-only request for replacing one exact ViewModel value. */
+export interface RendererDebugComponentPropertyEdit {
+  readonly component: IComponent;
+  readonly expectedDescriptor: PropertyDescriptor;
+  readonly expectedViewModel: object;
+  readonly expectedViewModelExtensible: boolean;
+  readonly newValue: RendererDebugEditableScalar;
+  readonly node: IRenderedVirtualNode;
+  readonly propertyName: string;
+}
+
 export interface IRenderer {
   contextId: string;
   renderComponent(component: IComponent, properties: any | undefined): void;
@@ -31,6 +60,12 @@ export interface IRenderer {
   getComponentVirtualNode(component: IComponent): IRenderedVirtualNode;
   getElementForId(elementId: number): IRenderedElement | undefined;
   getRootVirtualNode(): IRenderedVirtualNode | undefined;
+  getDebugVirtualNodeSnapshot?(
+    node: IRenderedVirtualNode,
+    maximumChildLinks: number,
+    maximumTraversalLinks: number,
+  ): RendererDebugVirtualNodeSnapshot | undefined;
+  editDebugComponentProperty?(request: RendererDebugComponentPropertyEdit): boolean;
 
   /**
    * Registers a function which will be called right after the component is destroyed.
@@ -63,6 +98,23 @@ export interface IRenderer {
    * which will be after all the frames of the elements are resolved.
    */
   onLayoutComplete(callback: () => void): void;
+
+  /**
+   * Enqueue a callback to be called after the next root draw/commit pass reaches
+   * Valdi's platform rendering callback.
+   *
+   * On Android, this runs after the traversal that reached `OnPreDraw` returns
+   * to the main queue. On iOS, it runs from the `CATransaction` completion for
+   * the root view update.
+   *
+   * This is later than `onLayoutComplete`, but it is not a guaranteed
+   * screen-presentation callback. `hookTimeMs` is a monotonic platform-thread
+   * timestamp in milliseconds captured when Valdi begins executing that native
+   * next-draw callback. On Android, this can be slightly later than
+   * `OnPreDraw` itself because the callback is posted back onto the main queue
+   * after the traversal continues.
+   */
+  onNextDraw(callback: (hookTimeMs: number) => void): void;
 
   /**
    * Enqueue a callback to be called when the next render completes.

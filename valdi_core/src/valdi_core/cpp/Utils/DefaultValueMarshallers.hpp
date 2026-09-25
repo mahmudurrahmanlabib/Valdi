@@ -7,8 +7,10 @@
 
 #pragma once
 
+#include "valdi_core/cpp/Schema/ValueSchemaRegistry.hpp"
 #include "valdi_core/cpp/Utils/DjinniUtils.hpp"
 #include "valdi_core/cpp/Utils/InlineContainerAllocator.hpp"
+#include "valdi_core/cpp/Utils/InterfaceMarshallDiagnostics.hpp"
 #include "valdi_core/cpp/Utils/PlatformObjectAttachments.hpp"
 #include "valdi_core/cpp/Utils/Promise.hpp"
 #include "valdi_core/cpp/Utils/SmallVector.hpp"
@@ -17,7 +19,10 @@
 #include "valdi_core/cpp/Utils/ValueMarshaller.hpp"
 #include "valdi_core/cpp/Utils/ValueTypedArray.hpp"
 #include "valdi_core/cpp/Utils/ValueTypedProxyObject.hpp"
+#include <atomic>
 #include <fmt/format.h>
+#include <functional>
+#include <mutex>
 
 namespace Valdi {
 
@@ -76,6 +81,11 @@ public:
                           ExceptionTracker& exceptionTracker) final {
         return Value::undefined();
     }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& /*exceptionTracker*/) final {
+        // void return: platform void, not an object null (which would fail assertFieldType).
+        return this->_delegate->newVoid();
+    }
 };
 
 template<typename ValueType>
@@ -99,6 +109,10 @@ public:
                           const ReferenceInfoBuilder& referenceInfoBuilder,
                           ExceptionTracker& exceptionTracker) final {
         return Valdi::Value(this->_delegate->valueToBool(value, exceptionTracker));
+    }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        return this->_delegate->newBool(false, exceptionTracker);
     }
 };
 
@@ -124,6 +138,10 @@ public:
                           ExceptionTracker& exceptionTracker) final {
         return Valdi::Value(this->_delegate->valueToInt(value, exceptionTracker));
     }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        return this->_delegate->newInt(0, exceptionTracker);
+    }
 };
 
 template<typename ValueType>
@@ -147,6 +165,10 @@ public:
                           const ReferenceInfoBuilder& referenceInfoBuilder,
                           ExceptionTracker& exceptionTracker) final {
         return Valdi::Value(this->_delegate->valueToLong(value, exceptionTracker));
+    }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        return this->_delegate->newLong(0, exceptionTracker);
     }
 };
 
@@ -172,6 +194,10 @@ public:
                           const ReferenceInfoBuilder& referenceInfoBuilder,
                           ExceptionTracker& exceptionTracker) final {
         return Valdi::Value(this->_delegate->valueToDouble(value, exceptionTracker));
+    }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        return this->_delegate->newDouble(0.0, exceptionTracker);
     }
 };
 
@@ -291,17 +317,7 @@ public:
         if (value.isInternedString()) {
             return this->_delegate->newStringUTF8(value.toStringBox().toStringView(), exceptionTracker);
         } else {
-            const auto* staticString = value.getStaticString();
-            switch (staticString->encoding()) {
-                case StaticString::Encoding::UTF8:
-                    return this->_delegate->newStringUTF8(staticString->utf8StringView(), exceptionTracker);
-                case StaticString::Encoding::UTF16:
-                    return this->_delegate->newStringUTF16(staticString->utf16StringView(), exceptionTracker);
-                case StaticString::Encoding::UTF32: {
-                    auto storage = staticString->utf8Storage();
-                    return this->_delegate->newStringUTF8(storage.toStringView(), exceptionTracker);
-                }
-            }
+            return this->_delegate->newString(*value.getStaticString(), exceptionTracker);
         }
     }
 
@@ -653,7 +669,8 @@ public:
                 return this->handleUnmarshallMapError(exceptionTracker);
             }
 
-            this->_delegate->setES6CollectionEntry(map, CollectionType::Map, {key, value}, exceptionTracker);
+            this->_delegate->setES6CollectionEntry(
+                map, CollectionType::Map, {std::move(key), std::move(value)}, exceptionTracker);
 
             if (!exceptionTracker) {
                 return this->handleUnmarshallMapError(exceptionTracker);
@@ -743,7 +760,7 @@ public:
             if (!exceptionTracker) {
                 return this->handleUnmarshallSetError(exceptionTracker);
             }
-            this->_delegate->setES6CollectionEntry(set, CollectionType::Set, {key}, exceptionTracker);
+            this->_delegate->setES6CollectionEntry(set, CollectionType::Set, {std::move(key)}, exceptionTracker);
             if (!exceptionTracker) {
                 return this->handleUnmarshallSetError(exceptionTracker);
             }
@@ -1007,10 +1024,16 @@ public:
         allocator.getContainerStartPtr(this)[index] = std::move(propertyMarshaller);
     }
 
+    static std::string getUnmarshallPropertyErrorMessage(ClassSchema& schema, const ClassPropertySchema& property) {
+        return fmt::format("Failed to unmarshall property '{}' of class '{}'", property.name, schema.getClassName());
+    }
+
+    static std::string getMarshallPropertyErrorMessage(ClassSchema& schema, const ClassPropertySchema& property) {
+        return fmt::format("While marshalling property '{}' of class '{}': ", property.name, schema.getClassName());
+    }
+
     ValueType handleUnmarshallPropertyError(const ClassPropertySchema& property, ExceptionTracker& exceptionTracker) {
-        return this->handleUnmarshallError(
-            exceptionTracker,
-            fmt::format("Failed to unmarshall property '{}' of class '{}'", property.name, _schema->getClassName()));
+        return this->handleUnmarshallError(exceptionTracker, getUnmarshallPropertyErrorMessage(*_schema, property));
     }
 
     ValueType doUnmarshall(const Valdi::Value& value,
@@ -1144,19 +1167,13 @@ public:
 
             auto propertyValue = _objectClass->getProperty(value, i, exceptionTracker);
             if (!exceptionTracker) {
-                return this->handleMarshallError(
-                    exceptionTracker,
-                    fmt::format(
-                        "While marshalling property '{}' of class '{}': ", property.name, _schema->getClassName()));
+                return this->handleMarshallError(exceptionTracker, getMarshallPropertyErrorMessage(*_schema, property));
             }
 
             auto marshalledPropertyValue = propertyMarshaller->marshall(
                 receiver, propertyValue, referenceInfoBuilder.withProperty(property.name), exceptionTracker);
             if (!exceptionTracker) {
-                return this->handleMarshallError(
-                    exceptionTracker,
-                    fmt::format(
-                        "While marshalling property '{}' of class '{}': ", property.name, _schema->getClassName()));
+                return this->handleMarshallError(exceptionTracker, getMarshallPropertyErrorMessage(*_schema, property));
             }
 
             typedObject->setProperty(i, marshalledPropertyValue);
@@ -1174,6 +1191,7 @@ public:
         auto attachments =
             castOrNull<PlatformObjectAttachments>(objectStore.getValueForObjectKey(value, exceptionTracker));
         if (!exceptionTracker) {
+            setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::AttachmentsLookupFailed);
             return Value();
         }
 
@@ -1181,12 +1199,14 @@ public:
         if (attachments != nullptr) {
             proxyObject = attachments->getProxyForSource(this);
             if (proxyObject != nullptr) {
+                setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::ReusedExistingProxy);
                 return Value(proxyObject);
             }
         } else {
             attachments = makeShared<PlatformObjectAttachments>();
             objectStore.setValueForObjectKey(value, attachments, exceptionTracker);
             if (!exceptionTracker) {
+                setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::AttachmentsStoreFailed);
                 return Value();
             }
         }
@@ -1195,11 +1215,13 @@ public:
 
         auto typedObjectIndex = marshallTypedObject(&value, value, referenceInfoBuilder, exceptionTracker);
         if (!exceptionTracker) {
+            setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::TypedObjectMarshallFailed);
             return Value();
         }
 
         proxyObject = _objectClass->newProxy(value, typedObjectIndex.getTypedObjectRef(), exceptionTracker);
         if (!exceptionTracker) {
+            setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::ProxyCreationFailed);
             return this->handleMarshallError(
                 exceptionTracker, fmt::format("While creating proxy object for class: {}: ", _schema->getClassName()));
         }
@@ -1218,9 +1240,11 @@ public:
          */
         objectStore.setObjectForId(proxyObject->getId(), value, exceptionTracker);
         if (!exceptionTracker) {
+            setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::ObjectStoreSetFailed);
             return Value();
         }
 
+        setLastInterfaceMarshallOutcome(InterfaceMarshallOutcome::CreatedNewProxy);
         return Value(proxyObject);
     }
 
@@ -1288,6 +1312,15 @@ public:
         return _enumClass->enumCaseToValue(value, _isBoxed, exceptionTracker);
     }
 
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        // A non-boxed enum lowers to a primitive on the platform, so an object null would fail
+        // assertFieldType. Synthesize the first case instead; nothing consumes it during teardown.
+        if (_schema->getCasesSize() == 0) {
+            return this->_delegate->newNull();
+        }
+        return _enumClass->newEnum(0, _isBoxed, exceptionTracker);
+    }
+
 protected:
     Ref<EnumSchema> _schema;
     Ref<PlatformEnumClassDelegate<ValueType>> _enumClass;
@@ -1346,6 +1379,14 @@ public:
         }
     }
 
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        // An optional indirect is nullable; otherwise the typed default is the inner's.
+        if (_optional || _inner == nullptr) {
+            return this->_delegate->newNull();
+        }
+        return _inner->makeDefaultReturnValue(exceptionTracker);
+    }
+
     ValueMarshaller<ValueType>* getInner() const {
         return _inner;
     }
@@ -1362,6 +1403,114 @@ protected:
     ValueMarshaller<ValueType>* _inner = nullptr;
     Ref<ValueMarshallerProcessor<ValueType>> _processor;
     bool _optional;
+};
+
+/**
+ ValueMarshaller that resolves its inner marshaller lazily, on the first marshall()/unmarshall() call,
+ instead of when the owning registry is built. Used for function/Provider return types so that a tool's
+ dependency type closure is not resolved+bound on the root-create / CCD critical path; the real return
+ marshaller is resolved on the first call that actually marshalls a return value, then cached.
+
+ Optionality is reported from the return schema (known statically, without forcing resolution), and the
+ resolved inner performs the actual null-handling, so runtime behaviour matches the eager path. Lazy
+ resolution mutates the registry, so it is only safe while marshalling runs on the thread that owns the
+ registry build (true for the SnapEditor first-render path, which marshalls on the Valdi JS thread); a
+ form that defers resolution across threads must lock the registry on the resolve path.
+ */
+template<typename ValueType>
+class LazyFunctionReturnValueMarshaller : public ValueMarshaller<ValueType> {
+public:
+    using Resolver = std::function<Ref<ValueMarshaller<ValueType>>(ExceptionTracker&)>;
+
+    LazyFunctionReturnValueMarshaller(const Ref<PlatformValueDelegate<ValueType>>& delegate,
+                                      bool optional,
+                                      ValueSchemaRegistry* registry,
+                                      Resolver resolver)
+        : ValueMarshaller<ValueType>(delegate),
+          _optional(optional),
+          _registry(registry),
+          _resolver(std::move(resolver)) {}
+    ~LazyFunctionReturnValueMarshaller() override = default;
+
+    // Reports the return schema's optionality, captured statically at construction (no forced
+    // resolution), so this wrapper is indistinguishable from the eager return marshaller — which for an
+    // optional return is an OptionalValueMarshaller reporting true. The resolved inner still performs the
+    // actual null handling; this only reports the contract, matching IndirectValueMarshaller and
+    // UnbalancedValueMarshaller.
+    bool isOptional() const final {
+        return _optional;
+    }
+
+    ValueType unmarshall(const Valdi::Value& value,
+                         const ReferenceInfoBuilder& referenceInfoBuilder,
+                         ExceptionTracker& exceptionTracker) final {
+        auto* inner = ensureInner(exceptionTracker);
+        if (inner == nullptr) {
+            return this->handleUnmarshallError(exceptionTracker, "Lazy ValueMarshaller failed to resolve return type");
+        }
+        return inner->unmarshall(value, referenceInfoBuilder, exceptionTracker);
+    }
+
+    Valdi::Value marshall(const ValueType* receiver,
+                          const ValueType& value,
+                          const ReferenceInfoBuilder& referenceInfoBuilder,
+                          ExceptionTracker& exceptionTracker) final {
+        auto* inner = ensureInner(exceptionTracker);
+        if (inner == nullptr) {
+            return this->handleMarshallError(exceptionTracker, "Lazy ValueMarshaller failed to resolve return type");
+        }
+        return inner->marshall(receiver, value, referenceInfoBuilder, exceptionTracker);
+    }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        // Function/Provider return types resolve through here, so a primitive-returning function
+        // skipped during teardown must get the inner's typed default, not an object null.
+        if (_optional) {
+            return this->_delegate->newNull();
+        }
+        auto* inner = ensureInner(exceptionTracker);
+        if (inner == nullptr) {
+            return this->_delegate->newNull();
+        }
+        return inner->makeDefaultReturnValue(exceptionTracker);
+    }
+
+private:
+    // Resolves and caches the inner marshaller on first use. Resolution mutates the shared registry
+    // (getValueMarshaller writes _valueMarshallerBySchemaKey / flushes indirects) and can run on any
+    // thread — a synchronous value return is unmarshalled on the caller's thread, e.g. a Java thread in
+    // the JNI bridge, not necessarily the Valdi JS thread. So it is serialized under the schema
+    // registry's recursive_mutex, the same lock every eager registration path holds; recursive, so a
+    // nested resolve on a thread already holding it is safe. Double-checked: the resolved pointer is
+    // published atomically so steady-state calls take neither the lock nor the branch.
+    ValueMarshaller<ValueType>* ensureInner(ExceptionTracker& exceptionTracker) {
+        if (auto* resolved = _resolvedInner.load(std::memory_order_acquire)) {
+            return resolved;
+        }
+
+        std::unique_lock<std::recursive_mutex> lock;
+        if (_registry != nullptr) {
+            lock = _registry->lock();
+        }
+
+        if (_inner == nullptr && _resolver) {
+            _inner = _resolver(exceptionTracker);
+            // Resolve once: drop the closure (and its captured registry key + schema) whether resolution
+            // succeeded or failed. A failure here would also have failed the eager registration path
+            // deterministically, so we don't re-run it — and its repeated JNI fetches — on every
+            // subsequent call; callers keep getting the same failure without the retry cost.
+            _resolver = nullptr;
+        }
+        _resolvedInner.store(_inner.get(), std::memory_order_release);
+        return _inner.get();
+    }
+
+    bool _optional;
+    ValueSchemaRegistry* _registry;
+    Resolver _resolver;
+    Ref<ValueMarshaller<ValueType>> _inner;
+    // Lock-free fast path once resolved; also the publish point for the double-checked resolution above.
+    std::atomic<ValueMarshaller<ValueType>*> _resolvedInner{nullptr};
 };
 
 /**
@@ -1390,6 +1539,14 @@ public:
                           const ReferenceInfoBuilder& referenceInfoBuilder,
                           ExceptionTracker& exceptionTracker) final {
         return _marshaller->marshall(receiver, value, referenceInfoBuilder, exceptionTracker);
+    }
+
+    ValueType makeDefaultReturnValue(ExceptionTracker& exceptionTracker) final {
+        // Returns flow through the unmarshaller, so its typed default is the right one.
+        if (_unmarshaller == nullptr) {
+            return this->_delegate->newNull();
+        }
+        return _unmarshaller->makeDefaultReturnValue(exceptionTracker);
     }
 
     void setMarshaller(const Ref<ValueMarshaller<ValueType>>& marshaller) {

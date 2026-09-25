@@ -6,9 +6,9 @@
 #include "valdi/runtime/Context/IViewNodesAssetTracker.hpp"
 #include "valdi/runtime/Context/ViewNodeAssetHandler.hpp"
 #include "valdi/runtime/Context/ViewNodeScrollState.hpp"
-#include "valdi/runtime/Exception.hpp"
 #include "valdi/runtime/Interfaces/ITweakValueProvider.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptANRDetector.hpp"
+#include "valdi/runtime/JavaScript/JavaScriptMessagePort.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptUtils.hpp"
 #include "valdi/runtime/JavaScript/ValueFunctionWithJSValue.hpp"
 #include "valdi/runtime/JavaScript/WrappedJSValueRef.hpp"
@@ -19,9 +19,11 @@
 #include "valdi/runtime/Runtime.hpp"
 #include "valdi/runtime/ValdiRuntimeTweaks.hpp"
 #include "valdi_core/cpp/Attributes/TextAttributeValue.hpp"
+#include "valdi_core/cpp/Constants.hpp"
 #include "valdi_core/cpp/JavaScript/ModuleFactoryRegistry.hpp"
 #include "valdi_core/cpp/Schema/ValueSchemaRegistry.hpp"
 #include "valdi_core/cpp/Schema/ValueSchemaTypeResolver.hpp"
+#include "valdi_core/cpp/Utils/Exception.hpp"
 #include "valdi_core/cpp/Utils/ValueArrayBuilder.hpp"
 
 #include "valdi/jsbridge/JavaScriptBridge.hpp"
@@ -36,6 +38,7 @@
 #include "valdi/standalone_runtime/StandaloneNodeRef.hpp"
 #include "valdi/standalone_runtime/StandaloneView.hpp"
 #include "valdi/standalone_runtime/StandaloneViewManager.hpp"
+#include "valdi/standalone_runtime/StandaloneViewTransaction.hpp"
 #include "valdi_core/AssetLoadObserver.hpp"
 #include "valdi_core/cpp/JavaScript/JavaScriptPathResolver.hpp"
 #include "valdi_core/cpp/Resources/Asset.hpp"
@@ -49,7 +52,11 @@
 #include "valdi_core/cpp/Utils/ValueTypedProxyObject.hpp"
 #include "valdi_test_utils.hpp"
 #include "gtest/gtest.h"
-#include <yoga/YGNode.h>
+#include <yoga/Yoga.h>
+#include <yoga/node/Node.h>
+
+#include "valdi_core/cpp/Marshalling/RegisteredCppGeneratedClass.hpp"
+#include "valdi_modules/test/test.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -61,6 +68,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace Valdi;
@@ -91,6 +99,10 @@ public:
 
     float getFloat(const StringBox& key, float fallback) override {
         return config.getMapValue(key).toFloat();
+    }
+
+    int32_t getInt(const StringBox& key, int32_t fallback) override {
+        return config.getMapValue(key).toInt();
     }
 
     Value getBinary(const StringBox& key, const Value& fallback) override {
@@ -130,6 +142,10 @@ public:
 class RuntimeFixture : public JSBridgeTestFixture {
 protected:
     void SetUp() override {
+        JSBridgeTestFixture::SetUp();
+        if (IsSkipped()) {
+            return;
+        }
         auto* jsBridge = getJsBridge();
         wrapper = RuntimeWrapper(jsBridge, getTSNMode());
     }
@@ -147,7 +163,7 @@ protected:
 
 static Result<Value> getJsModuleWithSchema(
     Runtime* runtime,
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     ValueSchemaRegistry* registry,
     std::string_view moduleName,
     const ValueSchema& schema) {
@@ -177,7 +193,7 @@ static Result<Value> getJsModuleWithSchema(
 
 static Result<Value> getJsModulePropertyWithSchema(
     Runtime* runtime,
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     ValueSchemaRegistry* registry,
     std::string_view moduleName,
     std::string_view propertyName,
@@ -209,7 +225,7 @@ static Result<Value> getJsModulePropertyWithSchema(Runtime* runtime,
 
 static Result<Value> getJsModulePropertyAsValue(
     Runtime* runtime,
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     std::string_view moduleName,
     std::string_view propertyName) {
     return getJsModulePropertyWithSchema(runtime, nativeObjectsManager, nullptr, moduleName, propertyName, "u");
@@ -217,7 +233,7 @@ static Result<Value> getJsModulePropertyAsValue(
 
 static Result<Ref<ValueFunction>> getJsModulePropertyAsUntypedFunction(
     Runtime* runtime,
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     std::string_view moduleName,
     std::string_view propertyName) {
     auto value = getJsModulePropertyAsValue(runtime, nativeObjectsManager, moduleName, propertyName);
@@ -232,7 +248,7 @@ static Result<Ref<ValueFunction>> getJsModulePropertyAsUntypedFunction(
 
 static Result<Value> callFunctionSync(
     RuntimeWrapper& wrapper,
-    const std::shared_ptr<snap::valdi::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
+    const std::shared_ptr<snap::valdi_core::JSRuntimeNativeObjectsManager>& nativeObjectsManager,
     std::string_view moduleName,
     std::string_view functionName,
     std::vector<Value> params) {
@@ -250,6 +266,51 @@ static Result<Value> callFunctionSync(RuntimeWrapper& wrapper,
                                       std::string_view functionName,
                                       std::vector<Value> params) {
     return callFunctionSync(wrapper, nullptr, moduleName, functionName, std::move(params));
+}
+
+TEST_P(RuntimeFixture, exposesDefaultApiVersion) {
+    std::string evalBody = "return runtime.apiVersion;";
+
+    auto evalResult = wrapper.runtime->getJavaScriptRuntime()->evaluateScript(
+        makeShared<ByteBuffer>(evalBody)->toBytesView(), STRING_LITERAL("eval.js"));
+
+    ASSERT_TRUE(evalResult) << evalResult.description();
+    ASSERT_EQ(0, evalResult.value().toInt());
+}
+
+TEST_P(RuntimeFixture, traceProxyRetainsCallbackAcrossGC) {
+    // Regression: JavaScriptRuntimeTraceProxyCallable used to hold its wrapped callback as a bare,
+    // non-owning JSValue. Under Hermes the callback's pooled value could be collected and its slot
+    // recycled while the proxy still referenced it, so invoking the proxy hit a dangling handle and
+    // threw "Value is not a function". The proxy must retain the callback for its own lifetime.
+    auto javaScriptRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    // makeTraceProxy is only bound when tracing is compiled in (kTracingEnabled); skip otherwise.
+    auto probe = javaScriptRuntime->evaluateScript(
+        makeShared<ByteBuffer>(std::string("return typeof runtime.makeTraceProxy === 'function' ? 1 : 0;"))
+            ->toBytesView(),
+        STRING_LITERAL("eval.js"));
+    ASSERT_TRUE(probe) << probe.description();
+    if (probe.value().toInt() != 1) {
+        GTEST_SKIP() << "tracing disabled in this build (runtime.makeTraceProxy not bound)";
+    }
+
+    // The closure has no JS reference other than the trace proxy itself.
+    std::string setupBody = "globalThis.__traceProxy = runtime.makeTraceProxy('regressionTag', () => 42); return 0;";
+    auto setupResult =
+        javaScriptRuntime->evaluateScript(makeShared<ByteBuffer>(setupBody)->toBytesView(), STRING_LITERAL("eval.js"));
+    ASSERT_TRUE(setupResult) << setupResult.description();
+
+    // Force GC: pre-fix the unrooted closure is collected and its slot recycled.
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+
+    // Invoke through the proxy: it must still resolve to the original callback.
+    std::string callBody = "return __traceProxy();";
+    auto callResult =
+        javaScriptRuntime->evaluateScript(makeShared<ByteBuffer>(callBody)->toBytesView(), STRING_LITERAL("eval.js"));
+    ASSERT_TRUE(callResult) << callResult.description();
+    ASSERT_EQ(42, callResult.value().toInt());
 }
 
 TEST_P(RuntimeFixture, canLoadSimpleViewTree) {
@@ -1109,26 +1170,26 @@ TEST_P(RuntimeFixture, canSetupFlexboxTree) {
     wrapper.waitUntilAllUpdatesCompleted();
 
     auto rootViewNode = tree->getRootViewNode();
-    auto rootYogaNode = rootViewNode->getYogaNode();
+    auto* rootYogaNode = facebook::yoga::resolveRef(rootViewNode->getYogaNode());
 
     ASSERT_NE(nullptr, rootYogaNode);
     ASSERT_EQ(rootViewNode.get(), Valdi::Yoga::getAttachedViewNode(rootYogaNode));
 
     ASSERT_EQ(2, static_cast<int>(rootYogaNode->getChildren().size()));
 
-    auto firstChild = rootYogaNode->getChild(0);
+    auto* firstChild = rootYogaNode->getChild(0);
     ASSERT_EQ(rootViewNode->copyChildren()[0].get(), Valdi::Yoga::getAttachedViewNode(firstChild));
 
     ASSERT_EQ(0, static_cast<int>(firstChild->getChildren().size()));
 
-    auto secondChild = rootYogaNode->getChild(1);
+    auto* secondChild = rootYogaNode->getChild(1);
     auto secondChildNode = rootViewNode->copyChildren()[1];
 
     ASSERT_EQ(secondChildNode.get(), Valdi::Yoga::getAttachedViewNode(secondChild));
     ASSERT_EQ(3, static_cast<int>(secondChild->getChildren().size()));
 
     size_t i = 0;
-    for (const auto& child : secondChild->getChildren()) {
+    for (auto* child : secondChild->getChildren()) {
         ASSERT_EQ(secondChildNode->copyChildren()[i].get(), Valdi::Yoga::getAttachedViewNode(child));
 
         ASSERT_EQ(0, static_cast<int>(child->getChildren().size()));
@@ -1147,7 +1208,7 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithChildDocument) {
     wrapper.waitUntilAllUpdatesCompleted();
 
     auto rootViewNode = tree->getRootViewNode();
-    auto rootYogaNode = rootViewNode->getYogaNode();
+    auto* rootYogaNode = facebook::yoga::resolveRef(rootViewNode->getYogaNode());
 
     ASSERT_NE(nullptr, rootYogaNode);
     ASSERT_EQ(rootViewNode.get(), Valdi::Yoga::getAttachedViewNode(rootYogaNode));
@@ -1164,7 +1225,7 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithChildDocument) {
     ASSERT_EQ(1, static_cast<int>(rootYogaNode->getChildren().size()));
 
     auto containerViewNode = rootViewNode->copyChildren()[0];
-    auto containerYogaNode = rootYogaNode->getChild(0);
+    auto* containerYogaNode = rootYogaNode->getChild(0);
 
     ASSERT_EQ(containerViewNode.get(), Valdi::Yoga::getAttachedViewNode(containerYogaNode));
 
@@ -1177,24 +1238,24 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithChildDocument) {
 
     // We should have the full flexbox tree of the child context attached to this flexbox node tree
 
-    auto childRootYogaNode = containerYogaNode->getChild(0);
+    auto* childRootYogaNode = containerYogaNode->getChild(0);
 
     ASSERT_EQ(2, static_cast<int>(childRootYogaNode->getChildren().size()));
 
-    auto firstChild = childRootYogaNode->getChild(0);
+    auto* firstChild = childRootYogaNode->getChild(0);
 
     ASSERT_EQ(childContextViewNode->copyChildren()[0].get(), Valdi::Yoga::getAttachedViewNode(firstChild));
 
     ASSERT_EQ(0, static_cast<int>(firstChild->getChildren().size()));
 
-    auto secondChild = childRootYogaNode->getChild(1);
+    auto* secondChild = childRootYogaNode->getChild(1);
     auto secondChildNode = childContextViewNode->copyChildren()[1];
 
     ASSERT_EQ(secondChildNode.get(), Valdi::Yoga::getAttachedViewNode(secondChild));
     ASSERT_EQ(3, static_cast<int>(secondChild->getChildren().size()));
 
     size_t i = 0;
-    for (const auto& child : secondChild->getChildren()) {
+    for (auto* child : secondChild->getChildren()) {
         ASSERT_EQ(secondChildNode->copyChildren()[i].get(), Valdi::Yoga::getAttachedViewNode(child));
 
         ASSERT_EQ(0, static_cast<int>(child->getChildren().size()));
@@ -1343,7 +1404,7 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithRenderIfs) {
     wrapper.waitUntilAllUpdatesCompleted();
 
     auto rootViewNode = tree->getRootViewNode();
-    auto rootYogaNode = rootViewNode->getYogaNode();
+    auto* rootYogaNode = facebook::yoga::resolveRef(rootViewNode->getYogaNode());
 
     // All ViewNodes should be generated
 
@@ -1364,11 +1425,11 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithRenderIfs) {
 
     ASSERT_EQ(2, static_cast<int>(rootYogaNode->getChildren().size()));
 
-    auto child2YogaNode = rootYogaNode->getChild(0);
-    auto child4YogaNode = rootYogaNode->getChild(1);
+    auto* child2YogaNode = rootYogaNode->getChild(0);
+    auto* child4YogaNode = rootYogaNode->getChild(1);
 
-    ASSERT_EQ(child2YogaNode, child2ViewNode->getYogaNode());
-    ASSERT_EQ(child4YogaNode, child4ViewNode->getYogaNode());
+    ASSERT_EQ(child2ViewNode->getYogaNode(), static_cast<YGNode*>(child2YogaNode));
+    ASSERT_EQ(child4ViewNode->getYogaNode(), static_cast<YGNode*>(child4YogaNode));
 
     // We then add child3
 
@@ -1382,9 +1443,9 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithRenderIfs) {
     auto child3ViewNode = child3ViewNodes[0];
 
     ASSERT_EQ(3, static_cast<int>(rootYogaNode->getChildren().size()));
-    ASSERT_EQ(child2ViewNode->getYogaNode(), rootYogaNode->getChild(0));
-    ASSERT_EQ(child3ViewNode->getYogaNode(), rootYogaNode->getChild(1));
-    ASSERT_EQ(child4ViewNode->getYogaNode(), rootYogaNode->getChild(2));
+    ASSERT_EQ(child2ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(0)));
+    ASSERT_EQ(child3ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(1)));
+    ASSERT_EQ(child4ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(2)));
 
     // We now insert the last child, child1
 
@@ -1398,10 +1459,10 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithRenderIfs) {
     auto child1ViewNode = child1ViewNodes[0];
 
     ASSERT_EQ(4, static_cast<int>(rootYogaNode->getChildren().size()));
-    ASSERT_EQ(child1ViewNode->getYogaNode(), rootYogaNode->getChild(0));
-    ASSERT_EQ(child2ViewNode->getYogaNode(), rootYogaNode->getChild(1));
-    ASSERT_EQ(child3ViewNode->getYogaNode(), rootYogaNode->getChild(2));
-    ASSERT_EQ(child4ViewNode->getYogaNode(), rootYogaNode->getChild(3));
+    ASSERT_EQ(child1ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(0)));
+    ASSERT_EQ(child2ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(1)));
+    ASSERT_EQ(child3ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(2)));
+    ASSERT_EQ(child4ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(3)));
 
     // Now removing all the render-if nodes
 
@@ -1411,8 +1472,8 @@ TEST_P(RuntimeFixture, canSetupFlexboxTreeWithRenderIfs) {
     wrapper.waitUntilAllUpdatesCompleted();
 
     ASSERT_EQ(2, static_cast<int>(rootYogaNode->getChildren().size()));
-    ASSERT_EQ(child2ViewNode->getYogaNode(), rootYogaNode->getChild(0));
-    ASSERT_EQ(child4ViewNode->getYogaNode(), rootYogaNode->getChild(1));
+    ASSERT_EQ(child2ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(0)));
+    ASSERT_EQ(child4ViewNode->getYogaNode(), static_cast<YGNode*>(rootYogaNode->getChild(1)));
 }
 
 TEST_P(RuntimeFixture, jsCanAttachToMainThread) {
@@ -1509,6 +1570,151 @@ TEST_P(RuntimeFixture, canGCSelfReferencingMainThreadCallback) {
     wrapper.flushQueues();
 
     ASSERT_EQ(1, receiver.use_count());
+}
+
+TEST_P(RuntimeFixture, messagePortListenerKeepsReceivingPortAliveUntilClosed) {
+    auto* javaScriptRuntime = wrapper.runtime->getJavaScriptRuntime();
+    Weak<JavaScriptMessagePort> receivingPort;
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        auto portValue = jsEntry.jsContext.evaluate(R"""(
+            (() => {
+                const channel = new MessageChannel();
+                globalThis.messagePortSender = channel.port1;
+                globalThis.receivedPortMessages = [];
+                channel.port2.onmessage = event => globalThis.receivedPortMessages.push(event.data);
+                return channel.port2;
+            })()
+        )""",
+                                                    "message-port-lifetime.js",
+                                                    jsEntry.exceptionTracker);
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+
+        auto port = castOrNull<JavaScriptMessagePort>(
+            jsEntry.jsContext.valueToWrappedObject(portValue.get(), jsEntry.exceptionTracker));
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+        ASSERT_NE(nullptr, port);
+        receivingPort = weakRef(port.get());
+    });
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+    ASSERT_NE(nullptr, receivingPort.lock());
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        jsEntry.jsContext.evaluate("globalThis.messagePortSender.postMessage('still alive')",
+                                   "message-port-send.js",
+                                   jsEntry.exceptionTracker);
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+    });
+    wrapper.flushQueues();
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        auto message = jsEntry.jsContext.evaluate(
+            "globalThis.receivedPortMessages[0]", "message-port-receive.js", jsEntry.exceptionTracker);
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+        EXPECT_EQ(STRING_LITERAL("still alive"),
+                  jsEntry.jsContext.valueToString(message.get(), jsEntry.exceptionTracker));
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+
+        auto port = Ref<JavaScriptMessagePort>(receivingPort.lock());
+        ASSERT_NE(nullptr, port);
+        port->close();
+    });
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+    EXPECT_EQ(nullptr, receivingPort.lock());
+}
+
+TEST_P(RuntimeFixture, messagePortReleasedWhenListenerCleared) {
+    auto* javaScriptRuntime = wrapper.runtime->getJavaScriptRuntime();
+    Weak<JavaScriptMessagePort> receivingPort;
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        auto portValue = jsEntry.jsContext.evaluate(R"""(
+            (() => {
+                const channel = new MessageChannel();
+                globalThis.messagePortSender = channel.port1;
+                channel.port2.onmessage = () => {};
+                return channel.port2;
+            })()
+        )""",
+                                                    "message-port-clear-listener.js",
+                                                    jsEntry.exceptionTracker);
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+
+        auto port = castOrNull<JavaScriptMessagePort>(
+            jsEntry.jsContext.valueToWrappedObject(portValue.get(), jsEntry.exceptionTracker));
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+        ASSERT_NE(nullptr, port);
+        receivingPort = weakRef(port.get());
+    });
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+    ASSERT_NE(nullptr, receivingPort.lock());
+
+    // Clearing the listener must release the endpoint's retained handle so the port can be collected,
+    // otherwise a port that sets and then clears onmessage would leak for the lifetime of the context.
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        auto port = Ref<JavaScriptMessagePort>(receivingPort.lock());
+        ASSERT_NE(nullptr, port);
+        port->setOnMessage(nullptr);
+    });
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+    EXPECT_EQ(nullptr, receivingPort.lock());
+}
+
+TEST_P(RuntimeFixture, messagePortReleasedWhenPeerCloses) {
+    if (isHermes()) {
+        // The retention release is verified on QuickJS/QuickJSWithTSN/JSCore. Hermes' single-pass
+        // garbageCollect() does not reliably reclaim the port wrapper while its (now-closed) peer is still
+        // referenced, and Hermes is not shipped internally.
+        GTEST_SKIP() << "Hermes garbageCollect() is not deterministic for this object graph";
+    }
+
+    auto* javaScriptRuntime = wrapper.runtime->getJavaScriptRuntime();
+    Weak<JavaScriptMessagePort> receivingPort;
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        auto portValue = jsEntry.jsContext.evaluate(R"""(
+            (() => {
+                const channel = new MessageChannel();
+                globalThis.messagePortSender = channel.port1;
+                channel.port2.onmessage = () => {};
+                return channel.port2;
+            })()
+        )""",
+                                                    "message-port-peer-close.js",
+                                                    jsEntry.exceptionTracker);
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+
+        auto port = castOrNull<JavaScriptMessagePort>(
+            jsEntry.jsContext.valueToWrappedObject(portValue.get(), jsEntry.exceptionTracker));
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+        ASSERT_NE(nullptr, port);
+        receivingPort = weakRef(port.get());
+    });
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+    ASSERT_NE(nullptr, receivingPort.lock());
+
+    // Closing the peer means the receiving port can never receive again, so its listener-based retention
+    // must be released (the peer notifies it via onPeerClosed) and the port becomes collectible.
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+        jsEntry.jsContext.evaluate(
+            "globalThis.messagePortSender.close()", "message-port-peer-close-call.js", jsEntry.exceptionTracker);
+        ASSERT_TRUE(jsEntry.exceptionTracker);
+    });
+    wrapper.flushQueues();
+
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                       [](auto& jsEntry) { jsEntry.jsContext.garbageCollect(); });
+    EXPECT_EQ(nullptr, receivingPort.lock());
 }
 
 TEST_P(RuntimeFixture, canHandleDynamicChildDocument) {
@@ -2831,15 +3037,27 @@ TEST_P(RuntimeFixture, handlesTranslationsInLimitToViewport) {
     ASSERT_EQ(0.0, childViewNode->getTranslationY());
     ASSERT_TRUE(childViewNode->isVisibleInViewport());
 
-    auto renderFunc = Function<void(double, double)>([&](double translationX, double translationY) {
+    auto renderFunc = [&](Value translationX, Value translationY) {
         auto viewModel = makeShared<ValueMap>();
-        (*viewModel)[STRING_LITERAL("translationX")] = Value(translationX);
-        (*viewModel)[STRING_LITERAL("translationY")] = Value(translationY);
+        (*viewModel)[STRING_LITERAL("translationX")] = std::move(translationX);
+        (*viewModel)[STRING_LITERAL("translationY")] = std::move(translationY);
         wrapper.setViewModel(tree->getContext(), Value(std::move(viewModel)));
         wrapper.waitUntilAllUpdatesCompleted();
-    });
+    };
 
-    renderFunc(50, 50);
+    renderFunc(Value(STRING_LITERAL("40%")), Value(25.0));
+
+    ASSERT_EQ(20.0, childViewNode->getTranslationX());
+    ASSERT_EQ(25.0, childViewNode->getTranslationY());
+    ASSERT_TRUE(childViewNode->isVisibleInViewport());
+
+    renderFunc(Value(25.0), Value(STRING_LITERAL("-40%")));
+
+    ASSERT_EQ(25.0, childViewNode->getTranslationX());
+    ASSERT_EQ(-20.0, childViewNode->getTranslationY());
+    ASSERT_TRUE(childViewNode->isVisibleInViewport());
+
+    renderFunc(Value(50.0), Value(50.0));
 
     ASSERT_EQ(50.0, childViewNode->getTranslationX());
     ASSERT_EQ(50.0, childViewNode->getTranslationY());
@@ -2850,7 +3068,7 @@ TEST_P(RuntimeFixture, handlesTranslationsInLimitToViewport) {
             .addChild(DummyView("SCValdiView").addAttribute("translationX", 50.0).addAttribute("translationY", 50.0)),
         getRootView(tree));
 
-    renderFunc(100, 100);
+    renderFunc(Value(100.0), Value(100.0));
 
     ASSERT_EQ(100.0, childViewNode->getTranslationX());
     ASSERT_EQ(100.0, childViewNode->getTranslationY());
@@ -2858,7 +3076,7 @@ TEST_P(RuntimeFixture, handlesTranslationsInLimitToViewport) {
 
     ASSERT_EQ(DummyView("SCValdiView"), getRootView(tree));
 
-    renderFunc(99, 99);
+    renderFunc(Value(99.0), Value(99.0));
 
     ASSERT_EQ(99.0, childViewNode->getTranslationX());
     ASSERT_EQ(99.0, childViewNode->getTranslationY());
@@ -2868,6 +3086,29 @@ TEST_P(RuntimeFixture, handlesTranslationsInLimitToViewport) {
         DummyView("SCValdiView")
             .addChild(DummyView("SCValdiView").addAttribute("translationX", 99.0).addAttribute("translationY", 99.0)),
         getRootView(tree));
+}
+
+TEST_P(RuntimeFixture, handlesNegativeScaleYInLimitToViewport) {
+    wrapper.runtime->setLimitToViewportDisabled(false);
+
+    // scaleY=1.0: bottom-child at local y=150..200, outside 100×100 viewport → no view created
+    auto viewModel = makeShared<ValueMap>();
+    (*viewModel)[STRING_LITERAL("scaleY")] = Value(1.0f);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ScaleTransformViewport@test/src/ScaleTransformViewport"), Value(viewModel), Value::undefined());
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(100, 100), LayoutDirectionLTR);
+
+    ASSERT_EQ(nullptr, tree->getViewForNodePath(parseNodePath("bottom-child")));
+
+    // scaleY=-1.0: container flips, bottom-child appears at visual y=0..50 → inside viewport → view created
+    auto viewModel2 = makeShared<ValueMap>();
+    (*viewModel2)[STRING_LITERAL("scaleY")] = Value(-1.0f);
+    wrapper.setViewModel(tree->getContext(), Value(std::move(viewModel2)));
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    ASSERT_NE(nullptr, tree->getViewForNodePath(parseNodePath("bottom-child")));
 }
 
 TEST_P(RuntimeFixture, slotCanApplyAttributeDynamicallyToChild) {
@@ -4181,11 +4422,14 @@ TEST_P(RuntimeFixture, renderRequestCanRetainAndReleaseItsEntries) {
         makeShared<ValueFunctionWithCallable>([](const auto& /*parameters*/) { return Value(); });
     auto layoutCompletionCallback =
         makeShared<ValueFunctionWithCallable>([](const auto& /*parameters*/) { return Value(); });
+    auto drawCompletionCallback =
+        makeShared<ValueFunctionWithCallable>([](const auto& /*parameters*/) { return Value(); });
 
     ASSERT_EQ(1, viewClass.getInternedString().use_count());
     ASSERT_EQ(1, attributeValue.use_count());
     ASSERT_EQ(1, animationsCompletionCallback.use_count());
     ASSERT_EQ(1, layoutCompletionCallback.use_count());
+    ASSERT_EQ(1, drawCompletionCallback.use_count());
 
     auto renderRequest = Valdi::makeShared<RenderRequest>();
 
@@ -4207,10 +4451,14 @@ TEST_P(RuntimeFixture, renderRequestCanRetainAndReleaseItsEntries) {
     auto* onLayoutComplete = renderRequest->appendOnLayoutComplete();
     onLayoutComplete->setCallback(layoutCompletionCallback);
 
+    auto* onNextDraw = renderRequest->appendOnNextDraw();
+    onNextDraw->setCallback(drawCompletionCallback);
+
     ASSERT_EQ(2, viewClass.getInternedString().use_count());
     ASSERT_EQ(2, attributeValue.use_count());
     ASSERT_EQ(2, animationsCompletionCallback.use_count());
     ASSERT_EQ(2, layoutCompletionCallback.use_count());
+    ASSERT_EQ(2, drawCompletionCallback.use_count());
 
     renderRequest = nullptr;
 
@@ -4218,6 +4466,7 @@ TEST_P(RuntimeFixture, renderRequestCanRetainAndReleaseItsEntries) {
     ASSERT_EQ(1, attributeValue.use_count());
     ASSERT_EQ(1, animationsCompletionCallback.use_count());
     ASSERT_EQ(1, layoutCompletionCallback.use_count());
+    ASSERT_EQ(1, drawCompletionCallback.use_count());
 }
 
 struct Visitor {
@@ -4244,6 +4493,7 @@ TEST_P(RuntimeFixture, renderRequestVisitHandlesAlignment) {
     renderRequest->appendStartAnimations();
     renderRequest->appendEndAnimations();
     renderRequest->appendOnLayoutComplete();
+    renderRequest->appendOnNextDraw();
 
     Visitor visitor;
     renderRequest->visitEntries(visitor);
@@ -4293,6 +4543,9 @@ TEST_P(RuntimeFixture, renderRequestCanSerialize) {
     auto* onLayoutComplete = renderRequest->appendOnLayoutComplete();
     onLayoutComplete->setCallback(callback);
 
+    auto* onNextDraw = renderRequest->appendOnNextDraw();
+    onNextDraw->setCallback(callback);
+
     auto result = renderRequest->serialize(attributeIds);
 
     auto expectedCreateElement = Value()
@@ -4331,6 +4584,8 @@ TEST_P(RuntimeFixture, renderRequestCanSerialize) {
     auto expectedEndAnimations = Value().setMapValue("type", Value(STRING_LITERAL("EndAnimations")));
     auto expectedOnLayoutComplete =
         Value().setMapValue("type", Value(STRING_LITERAL("OnLayoutComplete"))).setMapValue("callback", Value(callback));
+    auto expectedOnNextDraw =
+        Value().setMapValue("type", Value(STRING_LITERAL("OnNextDraw"))).setMapValue("callback", Value(callback));
 
     auto expectedEntries = ValueArray::make({expectedCreateElement,
                                              expectedDestroyElement,
@@ -4339,11 +4594,77 @@ TEST_P(RuntimeFixture, renderRequestCanSerialize) {
                                              expectedSetElementAttribute,
                                              expectedStartAnimations,
                                              expectedEndAnimations,
-                                             expectedOnLayoutComplete});
+                                             expectedOnLayoutComplete,
+                                             expectedOnNextDraw});
 
     auto expectedResult = Value().setMapValue("contextID", Value(1)).setMapValue("entries", Value(expectedEntries));
 
     ASSERT_EQ(expectedResult, result);
+}
+
+TEST_P(RuntimeFixture, standaloneViewTransactionRunsOnNextDrawCallbacksAfterRootUpdate) {
+    StandaloneViewTransaction transaction;
+    auto rootView = makeShared<StandaloneView>(STRING_LITERAL("View"));
+
+    int callbackCount = 0;
+    transaction.scheduleOnNextDraw(rootView, [&]() { callbackCount += 1; });
+    transaction.scheduleOnNextDraw(rootView, [&]() { callbackCount += 10; });
+
+    ASSERT_EQ(0, callbackCount);
+
+    transaction.didUpdateRootView(rootView, true);
+
+    ASSERT_EQ(11, callbackCount);
+    ASSERT_EQ(1, rootView->getLayoutDidBecomeDirtyCount());
+
+    transaction.didUpdateRootView(rootView, false);
+
+    ASSERT_EQ(11, callbackCount);
+}
+
+TEST_P(RuntimeFixture, standaloneViewTransactionDefersCallbacksScheduledDuringOnNextDrawUntilNextRootUpdate) {
+    StandaloneViewTransaction transaction;
+    auto rootView = makeShared<StandaloneView>(STRING_LITERAL("View"));
+
+    int callbackCount = 0;
+    transaction.scheduleOnNextDraw(rootView, [&]() {
+        callbackCount += 1;
+        transaction.scheduleOnNextDraw(rootView, [&]() { callbackCount += 10; });
+    });
+
+    transaction.didUpdateRootView(rootView, false);
+
+    ASSERT_EQ(1, callbackCount);
+
+    transaction.didUpdateRootView(rootView, false);
+
+    ASSERT_EQ(11, callbackCount);
+}
+
+TEST_P(RuntimeFixture, viewNodeTreeOnNextDrawCallbacksWaitForRootView) {
+    auto rootView = Valdi::makeShared<StandaloneView>(STRING_LITERAL("MyRootView"));
+
+    auto tree = wrapper.runtime->createViewNodeTreeAndContext(wrapper.standaloneRuntime->getViewManagerContext(),
+                                                              STRING_LITERAL("test/src/BasicViewTree.valdi"));
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    int callbackCount = 0;
+    auto callback = makeShared<ValueFunctionWithCallable>([&](const auto& /*callContext*/) -> Value {
+        callbackCount += 1;
+        return Value::undefined();
+    });
+
+    tree->onNextDraw(callback);
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    ASSERT_EQ(0, callbackCount);
+
+    tree->setRootView(rootView);
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    ASSERT_EQ(1, callbackCount);
 }
 
 class TestBridgedClass : public ValdiObject {
@@ -4421,7 +4742,7 @@ TEST_P(RuntimeFixture, unwrapsProxyObjectThroughUntypedUnmarshalling) {
     auto schema = ValueSchema::cls(STRING_LITERAL("MyClass"), true, {});
     auto proxyObject = makeShared<TestValueTypedProxyObject>(ValueTypedObject::make(schema.getClassRef()));
 
-    auto objectsManager = wrapper.runtime->getJavaScriptRuntime()->createNativeObjectsManager();
+    auto objectsManager = wrapper.runtime->getJavaScriptRuntime()->createNativeObjectsManager("");
 
     auto jsResult = callFunctionSync(wrapper, "test/src/WrapNativeObject", "wrapper", {Value(proxyObject)});
 
@@ -4738,6 +5059,23 @@ TEST_P(RuntimeFixture, canPausePreloading) {
     stats = viewManagerContext->getViewPoolsStats();
 
     ASSERT_EQ(5, getNumberOfPooledViews(viewClassName, stats));
+}
+
+TEST_P(RuntimeFixture, viewClassReplacementReusesExistingViewFactory) {
+    auto replacementClassName = STRING_LITERAL("ValdiView");
+    auto aliasClassName = STRING_LITERAL("ReplacedValdiView");
+
+    auto viewManagerContext = wrapper.standaloneRuntime->getViewManagerContext();
+    const auto& globalViewFactories = viewManagerContext->getGlobalViewFactories();
+
+    // The replacement class already has a factory before the alias is first resolved
+    auto viewFactory = globalViewFactories->getViewFactory(replacementClassName);
+
+    viewManagerContext->registerViewClassReplacement(aliasClassName, replacementClassName);
+
+    // Both names must resolve to the pre-existing factory so they share a single view pool
+    ASSERT_EQ(viewFactory.get(), globalViewFactories->getViewFactory(aliasClassName).get());
+    ASSERT_EQ(viewFactory.get(), globalViewFactories->getViewFactory(replacementClassName).get());
 }
 
 TEST_P(RuntimeFixture, canResolveJsImportPath) {
@@ -5127,6 +5465,18 @@ TEST_P(RuntimeFixture, canUnregisterFromLoadedAssetFromTSSide) {
     ASSERT_FALSE(assetsManager->isAssetAlive(assetKey));
 }
 
+TEST_P(RuntimeFixture, preloadBatchIsolatesThrowingModules) {
+    auto jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    // ErrorModule throws at evaluation; the batch must continue to the next entry instead
+    // of aborting.
+    jsRuntime->preloadModules({STRING_LITERAL("test/src/ErrorModule"), STRING_LITERAL("test/src/DirectionalAsset")}, 0);
+
+    ASSERT_FALSE(jsRuntime->isJsModuleLoaded(ResourceId(STRING_LITERAL("test"), STRING_LITERAL("src/ErrorModule"))));
+    ASSERT_TRUE(
+        jsRuntime->isJsModuleLoaded(ResourceId(STRING_LITERAL("test"), STRING_LITERAL("src/DirectionalAsset"))));
+}
+
 TEST_P(RuntimeFixture, supportsModulePreloading) {
     // "test/src/DirectionAsset" module imports "valdi_core/src/Asset"
     ASSERT_FALSE(wrapper.runtime->getJavaScriptRuntime()->isJsModuleLoaded(
@@ -5208,6 +5558,106 @@ TEST_P(RuntimeFixture, supportsPlatformSpecificAsset) {
     ASSERT_EQ(iOSAssetUrl, asset->getIdentifier());
 }
 
+TEST_P(RuntimeFixture, supportsThemableAsset) {
+    auto lightAssetUrl = STRING_LITERAL("file://light.png");
+    auto darkAssetUrl = STRING_LITERAL("file://dark.png");
+    wrapper.diskCache->store(Path(URL(lightAssetUrl).getPath()), BytesView()).ensureSuccess();
+    wrapper.diskCache->store(Path(URL(darkAssetUrl).getPath()), BytesView()).ensureSuccess();
+
+    auto viewModel = Value()
+                         .setMapValue("lightAsset", Value(lightAssetUrl))
+                         .setMapValue("darkAsset", Value(darkAssetUrl))
+                         .setMapValue("includeDarkAsset", Value(true));
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ThemableAsset@test/src/ThemableAsset"), viewModel, Value());
+
+    tree->setLayoutSpecs(Size(1.0f, 1.0f), LayoutDirectionLTR);
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    auto rootNode = tree->getRootViewNode();
+    ASSERT_TRUE(rootNode != nullptr);
+
+    auto rootAsset = getSrcAssetFromNode(*rootNode->getChildAt(0));
+    ASSERT_TRUE(rootAsset != nullptr);
+    ASSERT_EQ(lightAssetUrl, rootAsset->getIdentifier());
+
+    auto overriddenAsset = getSrcAssetFromNode(*rootNode->getChildAt(1)->getChildAt(0));
+    ASSERT_TRUE(overriddenAsset != nullptr);
+    ASSERT_EQ(darkAssetUrl, overriddenAsset->getIdentifier());
+
+    auto nestedAsset = getSrcAssetFromNode(*rootNode->getChildAt(2));
+    ASSERT_TRUE(nestedAsset != nullptr);
+    ASSERT_EQ(lightAssetUrl, nestedAsset->getIdentifier());
+}
+
+TEST_P(RuntimeFixture, canSwitchActiveColorPaletteForThemableAsset) {
+    auto lightAssetUrl = STRING_LITERAL("file://light.png");
+    auto darkAssetUrl = STRING_LITERAL("file://dark.png");
+    wrapper.diskCache->store(Path(URL(lightAssetUrl).getPath()), BytesView()).ensureSuccess();
+    wrapper.diskCache->store(Path(URL(darkAssetUrl).getPath()), BytesView()).ensureSuccess();
+
+    auto viewModel = Value()
+                         .setMapValue("lightAsset", Value(lightAssetUrl))
+                         .setMapValue("darkAsset", Value(darkAssetUrl))
+                         .setMapValue("includeDarkAsset", Value(true));
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ThemableAsset@test/src/ThemableAsset"), viewModel, Value());
+
+    tree->setLayoutSpecs(Size(1.0f, 1.0f), LayoutDirectionLTR);
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("setDarkColorPalette"));
+
+    wrapper.flushQueues();
+
+    auto rootNode = tree->getRootViewNode();
+    ASSERT_TRUE(rootNode != nullptr);
+
+    auto asset = getSrcAssetFromNode(*rootNode->getChildAt(0));
+    ASSERT_TRUE(asset != nullptr);
+    ASSERT_EQ(darkAssetUrl, asset->getIdentifier());
+
+    auto nestedAsset = getSrcAssetFromNode(*rootNode->getChildAt(2));
+    ASSERT_TRUE(nestedAsset != nullptr);
+    ASSERT_EQ(darkAssetUrl, nestedAsset->getIdentifier());
+}
+
+TEST_P(RuntimeFixture, missingThemableAssetPaletteClearsAsset) {
+    auto lightAssetUrl = STRING_LITERAL("file://light.png");
+    auto darkAssetUrl = STRING_LITERAL("file://dark.png");
+    wrapper.diskCache->store(Path(URL(lightAssetUrl).getPath()), BytesView()).ensureSuccess();
+    wrapper.diskCache->store(Path(URL(darkAssetUrl).getPath()), BytesView()).ensureSuccess();
+
+    auto viewModel = Value()
+                         .setMapValue("lightAsset", Value(lightAssetUrl))
+                         .setMapValue("darkAsset", Value(darkAssetUrl))
+                         .setMapValue("includeDarkAsset", Value(false));
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ThemableAsset@test/src/ThemableAsset"), viewModel, Value());
+
+    tree->setLayoutSpecs(Size(1.0f, 1.0f), LayoutDirectionLTR);
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("setDarkColorPalette"));
+
+    wrapper.flushQueues();
+
+    auto rootNode = tree->getRootViewNode();
+    ASSERT_TRUE(rootNode != nullptr);
+
+    ASSERT_EQ(nullptr, getSrcAssetFromNode(*rootNode->getChildAt(0)));
+    ASSERT_EQ(nullptr, getSrcAssetFromNode(*rootNode->getChildAt(1)->getChildAt(0)));
+    ASSERT_EQ(nullptr, getSrcAssetFromNode(*rootNode->getChildAt(2)));
+}
+
 TEST_P(RuntimeFixture, canHotReloadAsset) {
     auto assets = registerAssets(wrapper);
 
@@ -5260,10 +5710,11 @@ static void registerAssetArchives(RuntimeWrapper& wrapper,
     for (const auto& path : paths) {
         auto entry = deserializedArchive.value().getEntry(path);
         if (entry) {
+            auto entryBytes = BytesView(archive.value().getSource(), entry.value().data, entry.value().size);
             requestManager.addMockedResponse(
-                STRING_FORMAT("http://localhost/{}", path),
-                STRING_LITERAL("GET"),
-                BytesView(archive.value().getSource(), entry.value().data, entry.value().size));
+                STRING_FORMAT("http://localhost/{}", path), STRING_LITERAL("GET"), entryBytes);
+            requestManager.addMockedResponseForURLSuffix(
+                STRING_FORMAT("/ComposerArtifactManagement/{}", path), STRING_LITERAL("GET"), entryBytes);
         }
     }
 }
@@ -5958,9 +6409,9 @@ TEST_P(RuntimeFixture, supportsTextAttribute) {
 
     ASSERT_TRUE(attributedText != nullptr);
 
-    ASSERT_EQ("Hello World!?!", attributedText->toString());
+    ASSERT_EQ("Hello World Code!?!", attributedText->toString());
 
-    ASSERT_EQ(static_cast<size_t>(6), attributedText->getPartsSize());
+    ASSERT_EQ(static_cast<size_t>(8), attributedText->getPartsSize());
 
     {
         ASSERT_EQ(STRING_LITERAL("Hello"), attributedText->getContentAtIndex(0));
@@ -5969,6 +6420,7 @@ TEST_P(RuntimeFixture, supportsTextAttribute) {
         ASSERT_EQ(std::nullopt, style.font);
         ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
         ASSERT_EQ(std::nullopt, style.color);
+        ASSERT_EQ(nullptr, style.background);
         ASSERT_EQ(nullptr, style.onTap);
     }
 
@@ -5977,8 +6429,12 @@ TEST_P(RuntimeFixture, supportsTextAttribute) {
         const auto& style = attributedText->getStyleAtIndex(1);
 
         ASSERT_EQ(std::make_optional(STRING_LITERAL("title")), style.font);
-        ASSERT_EQ(TextDecoration::Underline, style.textDecoration);
+        ASSERT_EQ(TextDecoration::DashedUnderline, style.textDecoration);
         ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0xFF0000FF))), style.color);
+        ASSERT_NE(nullptr, style.background);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0xFFFF00FF))), style.background->color);
+        ASSERT_EQ((Valdi::TextBackgroundPadding{1, 2, 3, 4}), style.background->padding);
+        ASSERT_EQ((Valdi::Dimension{5, Valdi::Dimension::Unit::Percent}), style.background->borderRadius);
         ASSERT_EQ(nullptr, style.onTap);
     }
 
@@ -5987,28 +6443,36 @@ TEST_P(RuntimeFixture, supportsTextAttribute) {
         const auto& style = attributedText->getStyleAtIndex(2);
 
         ASSERT_EQ(std::make_optional(STRING_LITERAL("title")), style.font);
-        ASSERT_EQ(TextDecoration::Underline, style.textDecoration);
+        ASSERT_EQ(TextDecoration::DashedUnderline, style.textDecoration);
         ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0xFF0000FF))), style.color);
+        ASSERT_NE(nullptr, style.background);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0xFFFF00FF))), style.background->color);
+        ASSERT_EQ((Valdi::TextBackgroundPadding{1, 2, 3, 4}), style.background->padding);
+        ASSERT_EQ((Valdi::Dimension{5, Valdi::Dimension::Unit::Percent}), style.background->borderRadius);
         ASSERT_EQ(nullptr, style.onTap);
     }
 
     {
-        ASSERT_EQ(STRING_LITERAL("!"), attributedText->getContentAtIndex(3));
+        ASSERT_EQ(STRING_LITERAL(" "), attributedText->getContentAtIndex(3));
         const auto& style = attributedText->getStyleAtIndex(3);
 
         ASSERT_EQ(std::nullopt, style.font);
         ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
-        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x0000FFFF))), style.color);
+        ASSERT_EQ(std::nullopt, style.color);
+        ASSERT_EQ(nullptr, style.background);
         ASSERT_EQ(nullptr, style.onTap);
     }
 
     {
-        ASSERT_EQ(STRING_LITERAL("?"), attributedText->getContentAtIndex(4));
+        ASSERT_EQ(STRING_LITERAL("Code"), attributedText->getContentAtIndex(4));
         const auto& style = attributedText->getStyleAtIndex(4);
 
         ASSERT_EQ(std::nullopt, style.font);
         ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
-        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x008000FF))), style.color);
+        ASSERT_EQ(std::nullopt, style.color);
+        ASSERT_NE(nullptr, style.background);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0xFFFF00FF))), style.background->color);
+        ASSERT_EQ((Valdi::TextBackgroundPadding{6, 6, 6, 6}), style.background->padding);
         ASSERT_EQ(nullptr, style.onTap);
     }
 
@@ -6019,8 +6483,314 @@ TEST_P(RuntimeFixture, supportsTextAttribute) {
         ASSERT_EQ(std::nullopt, style.font);
         ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
         ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x0000FFFF))), style.color);
+        ASSERT_EQ(nullptr, style.background);
         ASSERT_EQ(nullptr, style.onTap);
     }
+
+    {
+        ASSERT_EQ(STRING_LITERAL("?"), attributedText->getContentAtIndex(6));
+        const auto& style = attributedText->getStyleAtIndex(6);
+
+        ASSERT_EQ(std::nullopt, style.font);
+        ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x008000FF))), style.color);
+        ASSERT_EQ(nullptr, style.background);
+        ASSERT_EQ(nullptr, style.onTap);
+    }
+
+    {
+        ASSERT_EQ(STRING_LITERAL("!"), attributedText->getContentAtIndex(7));
+        const auto& style = attributedText->getStyleAtIndex(7);
+
+        ASSERT_EQ(std::nullopt, style.font);
+        ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x0000FFFF))), style.color);
+        ASSERT_EQ(nullptr, style.background);
+        ASSERT_EQ(nullptr, style.onTap);
+    }
+
+    {
+        ASSERT_EQ(STRING_LITERAL("?"), attributedText->getContentAtIndex(6));
+        const auto& style = attributedText->getStyleAtIndex(6);
+
+        ASSERT_EQ(std::nullopt, style.font);
+        ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x008000FF))), style.color);
+        ASSERT_EQ(nullptr, style.background);
+        ASSERT_EQ(nullptr, style.onTap);
+    }
+
+    {
+        ASSERT_EQ(STRING_LITERAL("!"), attributedText->getContentAtIndex(7));
+        const auto& style = attributedText->getStyleAtIndex(7);
+
+        ASSERT_EQ(std::nullopt, style.font);
+        ASSERT_EQ(TextDecoration::Unset, style.textDecoration);
+        ASSERT_EQ(std::make_optional(Valdi::Color(static_cast<int64_t>(0x0000FFFF))), style.color);
+        ASSERT_EQ(nullptr, style.background);
+        ASSERT_EQ(nullptr, style.onTap);
+    }
+}
+
+static Ref<TextAttributeValue> getTextAttributeValueFromNode(ViewNode* viewNode) {
+    auto view = StandaloneView::unwrap(viewNode->getView());
+    EXPECT_TRUE(view != nullptr);
+    if (view == nullptr) {
+        return nullptr;
+    }
+
+    auto value = view->getAttribute(STRING_LITERAL("value"));
+    EXPECT_EQ(ValueType::ValdiObject, value.getType());
+    auto attributedText = value.getTypedRef<TextAttributeValue>();
+    EXPECT_TRUE(attributedText != nullptr);
+    return attributedText;
+}
+
+static std::vector<Ref<TextInlineAttachment>> getInlineViewAttachments(const Ref<TextAttributeValue>& attributedText) {
+    std::vector<Ref<TextInlineAttachment>> attachments;
+    if (attributedText == nullptr) {
+        return attachments;
+    }
+
+    for (size_t i = 0; i < attributedText->getPartsSize(); i++) {
+        const auto& attachment = attributedText->getStyleAtIndex(i).inlineViewAttachment;
+        if (attachment != nullptr) {
+            attachments.push_back(attachment);
+        }
+    }
+    return attachments;
+}
+
+static Value inlineViewDynamicSizeViewModel(double width, double height) {
+    return Value().setMapValue("childWidth", Value(width)).setMapValue("childHeight", Value(height));
+}
+
+TEST_P(RuntimeFixture, supportsManagedChildFrameViewClasses) {
+    wrapper.standaloneRuntime->getViewManager().setManagesChildFramesForClass(STRING_LITERAL("ManagedChildFrameView"),
+                                                                              true);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ManagedChildFrames@test/src/ManagedChildFrames"), Value(), Value());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto managedNodes = findViewNodesWithId(tree->getRootViewNode(), "managed");
+    auto childNodes = findViewNodesWithId(tree->getRootViewNode(), "managedChild");
+    ASSERT_EQ(static_cast<size_t>(1), managedNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), childNodes.size());
+
+    auto* managedNode = managedNodes[0];
+    auto* childNode = childNodes[0];
+    ASSERT_TRUE(managedNode->managesChildFrames());
+    ASSERT_TRUE(childNode->parentManagesChildFrames());
+    ASSERT_EQ(YGPositionTypeAbsolute, YGNodeStyleGetPositionType(childNode->getYogaNode()));
+    ASSERT_EQ(Frame(10, 0, 30, 20), childNode->getCalculatedFrame());
+
+    auto childView = StandaloneView::unwrap(childNode->getView());
+    ASSERT_TRUE(childView != nullptr);
+    ASSERT_EQ(Frame(), childView->getFrame());
+}
+
+TEST_P(RuntimeFixture, resolvesInlineViewAttachmentsFromTextChildren) {
+    wrapper.standaloneRuntime->getViewManager().setManagesChildFramesForClass(STRING_LITERAL("SCValdiLabel"), true);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("InlineViewTextAttribute@test/src/ManagedChildFrames"), Value(), Value());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto labelNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineLabel");
+    auto childNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineChild");
+    ASSERT_EQ(static_cast<size_t>(1), labelNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), childNodes.size());
+
+    auto* labelNode = labelNodes[0];
+    auto* childNode = childNodes[0];
+    ASSERT_TRUE(labelNode->managesChildFrames());
+    ASSERT_TRUE(childNode->parentManagesChildFrames());
+    ASSERT_EQ(Frame(0, 0, 18, 12), childNode->getCalculatedFrame());
+
+    auto labelView = StandaloneView::unwrap(labelNode->getView());
+    ASSERT_TRUE(labelView != nullptr);
+
+    auto value = labelView->getAttribute(STRING_LITERAL("value"));
+    ASSERT_EQ(ValueType::ValdiObject, value.getType());
+
+    auto attributedText = value.getTypedRef<TextAttributeValue>();
+    ASSERT_TRUE(attributedText != nullptr);
+    ASSERT_EQ(static_cast<size_t>(3), attributedText->getPartsSize());
+    ASSERT_EQ(STRING_LITERAL("Before "), attributedText->getContentAtIndex(0));
+    ASSERT_EQ(STRING_LITERAL(" after"), attributedText->getContentAtIndex(2));
+
+    const auto& inlineStyle = attributedText->getStyleAtIndex(1);
+    ASSERT_TRUE(inlineStyle.inlineViewAttachment != nullptr);
+    ASSERT_EQ(static_cast<size_t>(0), inlineStyle.inlineViewAttachment->getChildIndex());
+    ASSERT_EQ(InlineViewVerticalAlignment::Bottom, inlineStyle.inlineViewAttachment->getVerticalAlignment());
+    ASSERT_EQ(Size(18, 12), inlineStyle.inlineViewAttachment->getSize());
+
+    auto childView = StandaloneView::unwrap(childNode->getView());
+    ASSERT_TRUE(childView != nullptr);
+    ASSERT_EQ(Frame(), childView->getFrame());
+}
+
+TEST_P(RuntimeFixture, resolvesInlineViewVerticalAlignmentEnumValuesFromTS) {
+    wrapper.standaloneRuntime->getViewManager().setManagesChildFramesForClass(STRING_LITERAL("SCValdiLabel"), true);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("InlineViewVerticalAlignmentTextAttribute@test/src/ManagedChildFrames"), Value(), Value());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto labelNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineLabel");
+    auto topNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineTop");
+    auto centerNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineCenter");
+    auto bottomNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineBottom");
+    auto baselineNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineBaseline");
+    ASSERT_EQ(static_cast<size_t>(1), labelNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), topNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), centerNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), bottomNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), baselineNodes.size());
+
+    auto* labelNode = labelNodes[0];
+    ASSERT_TRUE(labelNode->managesChildFrames());
+    ASSERT_TRUE(topNodes[0]->parentManagesChildFrames());
+    ASSERT_TRUE(centerNodes[0]->parentManagesChildFrames());
+    ASSERT_TRUE(bottomNodes[0]->parentManagesChildFrames());
+    ASSERT_TRUE(baselineNodes[0]->parentManagesChildFrames());
+
+    ASSERT_EQ(Frame(0, 0, 11, 12), topNodes[0]->getCalculatedFrame());
+    ASSERT_EQ(Frame(0, 0, 22, 24), centerNodes[0]->getCalculatedFrame());
+    ASSERT_EQ(Frame(0, 0, 33, 36), bottomNodes[0]->getCalculatedFrame());
+    ASSERT_EQ(Frame(0, 0, 44, 14), baselineNodes[0]->getCalculatedFrame());
+
+    auto attributedText = getTextAttributeValueFromNode(labelNode);
+    ASSERT_TRUE(attributedText != nullptr);
+    ASSERT_EQ(static_cast<size_t>(9), attributedText->getPartsSize());
+    ASSERT_EQ(STRING_LITERAL("A"), attributedText->getContentAtIndex(0));
+    ASSERT_EQ(STRING_LITERAL("B"), attributedText->getContentAtIndex(2));
+    ASSERT_EQ(STRING_LITERAL("C"), attributedText->getContentAtIndex(4));
+    ASSERT_EQ(STRING_LITERAL("D"), attributedText->getContentAtIndex(6));
+    ASSERT_EQ(STRING_LITERAL("E"), attributedText->getContentAtIndex(8));
+
+    auto attachments = getInlineViewAttachments(attributedText);
+    ASSERT_EQ(static_cast<size_t>(4), attachments.size());
+    ASSERT_EQ(static_cast<size_t>(0), attachments[0]->getChildIndex());
+    ASSERT_EQ(InlineViewVerticalAlignment::Top, attachments[0]->getVerticalAlignment());
+    ASSERT_EQ(Size(11, 12), attachments[0]->getSize());
+    ASSERT_EQ(static_cast<size_t>(1), attachments[1]->getChildIndex());
+    ASSERT_EQ(InlineViewVerticalAlignment::Center, attachments[1]->getVerticalAlignment());
+    ASSERT_EQ(Size(22, 24), attachments[1]->getSize());
+    ASSERT_EQ(static_cast<size_t>(2), attachments[2]->getChildIndex());
+    ASSERT_EQ(InlineViewVerticalAlignment::Bottom, attachments[2]->getVerticalAlignment());
+    ASSERT_EQ(Size(33, 36), attachments[2]->getSize());
+    ASSERT_EQ(static_cast<size_t>(3), attachments[3]->getChildIndex());
+    ASSERT_EQ(InlineViewVerticalAlignment::Baseline, attachments[3]->getVerticalAlignment());
+    ASSERT_EQ(Size(44, 14), attachments[3]->getSize());
+}
+
+TEST_P(RuntimeFixture, resolvesInlineViewAttachmentsForTextViewChildren) {
+    wrapper.standaloneRuntime->getViewManager().setManagesChildFramesForClass(STRING_LITERAL("SCValdiTextView"), true);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("InlineViewTextViewAttribute@test/src/ManagedChildFrames"), Value(), Value());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto textViewNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineTextView");
+    auto childNodes = findViewNodesWithId(tree->getRootViewNode(), "textViewInlineChild");
+    ASSERT_EQ(static_cast<size_t>(1), textViewNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), childNodes.size());
+
+    auto* textViewNode = textViewNodes[0];
+    auto* childNode = childNodes[0];
+    ASSERT_TRUE(textViewNode->managesChildFrames());
+    ASSERT_TRUE(childNode->parentManagesChildFrames());
+    ASSERT_EQ(YGPositionTypeAbsolute, YGNodeStyleGetPositionType(childNode->getYogaNode()));
+    ASSERT_EQ(Frame(0, 0, 26, 16), childNode->getCalculatedFrame());
+
+    auto attributedText = getTextAttributeValueFromNode(textViewNode);
+    auto attachments = getInlineViewAttachments(attributedText);
+    ASSERT_EQ(static_cast<size_t>(1), attachments.size());
+    ASSERT_EQ(static_cast<size_t>(0), attachments[0]->getChildIndex());
+    ASSERT_EQ(InlineViewVerticalAlignment::Top, attachments[0]->getVerticalAlignment());
+    ASSERT_EQ(Size(26, 16), attachments[0]->getSize());
+
+    auto childView = StandaloneView::unwrap(childNode->getView());
+    ASSERT_TRUE(childView != nullptr);
+    ASSERT_EQ(Frame(), childView->getFrame());
+}
+
+TEST_P(RuntimeFixture, rejectsInvalidInlineViewChildIndexesFromTSAttributedText) {
+    wrapper.standaloneRuntime->getViewManager().setManagesChildFramesForClass(STRING_LITERAL("SCValdiLabel"), true);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("InlineViewInvalidChildIndexAttribute@test/src/ManagedChildFrames"), Value(), Value());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto labelNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineLabel");
+    auto childNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineChild");
+    ASSERT_EQ(static_cast<size_t>(1), labelNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), childNodes.size());
+    ASSERT_TRUE(labelNodes[0]->managesChildFrames());
+    ASSERT_TRUE(childNodes[0]->parentManagesChildFrames());
+
+    auto labelView = StandaloneView::unwrap(labelNodes[0]->getView());
+    ASSERT_TRUE(labelView != nullptr);
+    ASSERT_TRUE(labelView->getAttribute(STRING_LITERAL("value")).isUndefined());
+}
+
+TEST_P(RuntimeFixture, inlineViewAttachmentSizeProviderTracksChildLayoutChanges) {
+    wrapper.standaloneRuntime->getViewManager().setManagesChildFramesForClass(STRING_LITERAL("SCValdiLabel"), true);
+
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("InlineViewDynamicSizeAttribute@test/src/ManagedChildFrames"),
+        inlineViewDynamicSizeViewModel(18, 12),
+        Value());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto labelNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineLabel");
+    auto childNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineChild");
+    ASSERT_EQ(static_cast<size_t>(1), labelNodes.size());
+    ASSERT_EQ(static_cast<size_t>(1), childNodes.size());
+    ASSERT_EQ(Frame(0, 0, 18, 12), childNodes[0]->getCalculatedFrame());
+
+    auto attributedText = getTextAttributeValueFromNode(labelNodes[0]);
+    auto attachments = getInlineViewAttachments(attributedText);
+    ASSERT_EQ(static_cast<size_t>(1), attachments.size());
+    auto attachment = attachments[0];
+    ASSERT_EQ(Size(18, 12), attachment->getSize());
+
+    auto labelView = StandaloneView::unwrap(labelNodes[0]->getView());
+    ASSERT_TRUE(labelView != nullptr);
+    auto invalidateLayoutCountBeforeSizeChange = labelView->getInvalidateLayoutCount();
+
+    wrapper.setViewModel(tree->getContext(), inlineViewDynamicSizeViewModel(31, 17));
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    ASSERT_EQ(Frame(0, 0, 31, 17), childNodes[0]->getCalculatedFrame());
+    ASSERT_EQ(Size(31, 17), attachment->getSize());
+
+    tree->setLayoutSpecs(Size(200, 200), LayoutDirectionLTR);
+
+    auto updatedChildNodes = findViewNodesWithId(tree->getRootViewNode(), "inlineChild");
+    ASSERT_EQ(static_cast<size_t>(1), updatedChildNodes.size());
+    ASSERT_EQ(Frame(0, 0, 31, 17), updatedChildNodes[0]->getCalculatedFrame());
+    ASSERT_EQ(Size(31, 17), attachment->getSize());
+
+    auto updatedAttributedText = getTextAttributeValueFromNode(labelNodes[0]);
+    auto updatedAttachments = getInlineViewAttachments(updatedAttributedText);
+    ASSERT_EQ(static_cast<size_t>(1), updatedAttachments.size());
+    ASSERT_EQ(Size(31, 17), updatedAttachments[0]->getSize());
+    ASSERT_GT(labelView->getInvalidateLayoutCount(), invalidateLayoutCountBeforeSizeChange);
 }
 
 TEST_P(RuntimeFixture, supportsAccesibilityValueInTextAttribute) {
@@ -6036,7 +6806,7 @@ TEST_P(RuntimeFixture, supportsAccesibilityValueInTextAttribute) {
     auto labelViewNode = rootViewNode->getChildAt(0);
     auto accessibilityValue = labelViewNode->getAccessibilityValue();
 
-    ASSERT_EQ(STRING_LITERAL("Hello World!?!"), accessibilityValue);
+    ASSERT_EQ(STRING_LITERAL("Hello World Code!?!"), accessibilityValue);
 }
 
 TEST_P(RuntimeFixture, FLAKY_workerWorks) {
@@ -6063,7 +6833,88 @@ TEST_P(RuntimeFixture, FLAKY_workerWorks) {
     ASSERT_EQ(res.toString(), "works");
 }
 
-TEST_P(RuntimeFixture, canLockAllJSContexts) {
+static Value callWorkerTestMethod(RuntimeWrapper& wrapper, const Ref<Context>& context, const StringBox& methodName) {
+    auto valuePromise = std::make_shared<std::promise<Value>>();
+    auto completed = std::make_shared<std::atomic_bool>(false);
+    auto valueFuture = valuePromise->get_future();
+    auto callback = makeShared<ValueFunctionWithCallable>([valuePromise, completed](const auto& callContext) {
+        if (!completed->exchange(true)) {
+            valuePromise->set_value(callContext.getParameter(0));
+        }
+        return Value::undefined();
+    });
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(
+        context, methodName, ValueArray::make({Value(callback)}));
+
+    auto status = valueFuture.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, status);
+    if (status != std::future_status::ready) {
+        return Value::undefined();
+    }
+    return valueFuture.get();
+}
+
+TEST_P(RuntimeFixture, workerCanBeTerminatedBeforeInitialization) {
+    auto tree =
+        wrapper.createViewNodeTreeAndContext(STRING_LITERAL("WorkerTest@test/src/WorkerTest"), Value(), Value());
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    auto result = callWorkerTestMethod(wrapper, tree->getContext(), STRING_LITERAL("terminateBeforeInitialization"));
+    ASSERT_TRUE(result.isString());
+    EXPECT_EQ("works", result.toString());
+}
+
+TEST_P(RuntimeFixture, busyWorkerCanBeTerminated) {
+    if (isJSCore()) {
+        GTEST_SKIP() << "JavaScriptCore cannot interrupt a pure JavaScript loop through its public API";
+    }
+
+    auto tree =
+        wrapper.createViewNodeTreeAndContext(STRING_LITERAL("WorkerTest@test/src/WorkerTest"), Value(), Value());
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    auto result = callWorkerTestMethod(wrapper, tree->getContext(), STRING_LITERAL("terminateBusyWorker"));
+    ASSERT_TRUE(result.isString());
+    EXPECT_EQ("works", result.toString());
+}
+
+TEST_P(RuntimeFixture, busyWorkerWithTransferredPortCanBeTerminated) {
+    if (isJSCore()) {
+        GTEST_SKIP() << "JavaScriptCore cannot interrupt a pure JavaScript loop through its public API";
+    }
+
+    auto tree =
+        wrapper.createViewNodeTreeAndContext(STRING_LITERAL("WorkerTest@test/src/WorkerTest"), Value(), Value());
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    // Transfers a MessagePort to a worker that spins forever after acknowledging it, then terminates the
+    // worker mid-loop. Exercises aggressive termination and cross-runtime port teardown together: the host
+    // end of the transferred channel must survive the abort and a replacement worker must still run.
+    auto result = callWorkerTestMethod(wrapper, tree->getContext(), STRING_LITERAL("terminateBusyWorkerWithPort"));
+    ASSERT_TRUE(result.isString());
+    EXPECT_EQ("works", result.toString());
+}
+
+TEST_P(RuntimeFixture, idleWorkerCanBeTerminated) {
+    auto tree =
+        wrapper.createViewNodeTreeAndContext(STRING_LITERAL("WorkerTest@test/src/WorkerTest"), Value(), Value());
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    // Terminating an idle (non-spinning) worker drives the runtime teardown path
+    // (JavaScriptRuntime::teardownOnJsThread -> GCDDispatchQueue::fullTeardown() isCurrent()) on every
+    // engine, including JavaScriptCore where the busyWorker* variants skip because JSCore cannot
+    // interrupt a running loop. On Apple hosts the worker queue is a GCDDispatchQueue, so this guards
+    // the iOS runtime-shutdown rework. The host must survive teardown and still run a replacement worker.
+    auto result = callWorkerTestMethod(wrapper, tree->getContext(), STRING_LITERAL("terminateIdleWorker"));
+    ASSERT_TRUE(result.isString());
+    EXPECT_EQ("works", result.toString());
+}
+
+// Disabled because the standalone runtime runs the root JS runtime on the test main thread, while
+// lockAllJSContexts synchronously locks worker runtimes and the runtime forbids main-thread-to-worker dispatch.
+// Kept disabled through the #127 import: this is a pre-existing full-suite abort on master (disabled in
+// PR #119775) that #127 does not fix, so the upstream PR's enabled copy is intentionally not taken here.
+TEST_P(RuntimeFixture, DISABLED_canLockAllJSContexts) {
     auto tree1 =
         wrapper.createViewNodeTreeAndContext(STRING_LITERAL("WorkerTest@test/src/WorkerTest"), Value(), Value());
     auto tree2 =
@@ -6106,6 +6957,396 @@ TEST_P(RuntimeFixture, supportsLoadStrategy) {
     ASSERT_TRUE(wrapper.runtime->getResourceManager().isBundleLoaded(STRING_LITERAL("test2")));
 }
 
+TEST_P(RuntimeFixture, supportsNativeModule) {
+    auto result = callFunctionSync(wrapper, "test/src/NativeModule", "compute", {});
+
+    ASSERT_TRUE(result) << result.description();
+
+    ASSERT_TRUE(result.value().isNumber());
+    ASSERT_EQ(50.0, result.value().toDouble());
+}
+
+// Integration coverage for the sync-teardown guard against a live JS engine, complementing the
+// ValueMarshallerRegistry unit tests that pin forwardCall()'s graceful-null behavior. Reproduces
+// the two facts the guard relies on: once the owning JS runtime is disposed (e.g. by worker
+// termination), a JS-backed function (1) reports ownerIsTearingDown() == true, and (2) a
+// synchronous call is skipped and yields 'undefined' rather than running. Before the guard,
+// unmarshalling that 'undefined' into compute()'s number return raised an uncatchable error at
+// the call site.
+TEST_P(RuntimeFixture, jsFunctionReportsOwnerTearingDownAndSkipsSyncCallAfterRuntimeDisposed) {
+    auto fnResult = getJsModulePropertyAsUntypedFunction(wrapper.runtime, nullptr, "test/src/NativeModule", "compute");
+    ASSERT_TRUE(fnResult) << fnResult.description();
+    auto function = fnResult.value();
+
+    // While the runtime is live: not tearing down, and a sync call runs and returns a real number.
+    ASSERT_FALSE(function->ownerIsTearingDown());
+    auto liveResult = function->call(ValueFunctionFlagsCallSync, nullptr, 0);
+    ASSERT_TRUE(liveResult) << liveResult.description();
+    ASSERT_TRUE(liveResult.value().isNumber());
+
+    // Dispose the JS runtime (logout / aggressive worker termination equivalent).
+    wrapper.teardown();
+
+    // The owner now reports tearing-down, and the sync call is skipped -> undefined. This is the
+    // exact state that crashed forwardCall() before the guard; here we assert the JS layer's half.
+    ASSERT_TRUE(function->ownerIsTearingDown());
+    auto skippedResult = function->call(ValueFunctionFlagsCallSync, nullptr, 0);
+    ASSERT_TRUE(skippedResult) << skippedResult.description();
+    ASSERT_TRUE(skippedResult.value().isUndefined());
+}
+
+namespace {
+struct DeadlineCircuitBreakerDisabledScope {
+    DeadlineCircuitBreakerDisabledScope() {
+        ValueFunctionWithJSValue::setDeadlineCircuitBreakerDisabled(true);
+    }
+    ~DeadlineCircuitBreakerDisabledScope() {
+        ValueFunctionWithJSValue::setDeadlineCircuitBreakerDisabled(false);
+    }
+};
+
+// Parks the JS thread until the returned promise is fulfilled.
+std::promise<void> stallJsThread(RuntimeWrapper& wrapper) {
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThreadAsync(
+        nullptr, [released](auto& /*jsEntry*/) { released.wait(); });
+    return release;
+}
+
+// test/src/NativeModule's countSyncCall: returns how many times it has run, so a call that was
+// skipped after its deadline is distinguishable from one that ran late.
+Result<Ref<ValueFunction>> getCountSyncCallFunction(RuntimeWrapper& wrapper) {
+    return getJsModulePropertyAsUntypedFunction(wrapper.runtime, nullptr, "test/src/NativeModule", "countSyncCall");
+}
+
+double countSyncCalls(const Ref<ValueFunction>& function) {
+    auto result = function->callSyncWithDeadline(std::chrono::seconds(10), nullptr, 0);
+    EXPECT_TRUE(result) << result.description();
+    return result ? result.value().toDouble() : -1.0;
+}
+} // namespace
+
+// A deadline-bounded call whose JS thread is stalled must (1) time out, (2) make later bounded
+// calls fail without waiting while the timed-out call is still queued, and (3) with
+// SkipIfTimedOut, skip the abandoned calls when the JS thread finally drains, so a burst of
+// dropped input does not turn into a backlog of stale JS work. Regression coverage for the
+// PREVIEW-32262 shape: per-call deadlines held while the aggregate wait across a touch burst
+// exceeded the ANR threshold.
+TEST_P(RuntimeFixture, callSyncWithDeadlineFailsFastAndSkipsAbandonedCallsWhileJsThreadIsStalled) {
+    auto fnResult = getCountSyncCallFunction(wrapper);
+    ASSERT_TRUE(fnResult) << fnResult.description();
+    auto function = fnResult.value();
+    ASSERT_EQ(1.0, countSyncCalls(function));
+
+    auto release = stallJsThread(wrapper);
+
+    auto timedOut = function->callSyncWithDeadline(
+        std::chrono::milliseconds(50), nullptr, 0, SyncCallTimeoutPolicy::SkipIfTimedOut);
+    ASSERT_FALSE(timedOut);
+
+    // A generous deadline that must not be waited for: the breaker is open.
+    auto fastFailStart = std::chrono::steady_clock::now();
+    auto failedFast =
+        function->callSyncWithDeadline(std::chrono::seconds(10), nullptr, 0, SyncCallTimeoutPolicy::SkipIfTimedOut);
+    ASSERT_FALSE(failedFast);
+    ASSERT_LT(std::chrono::steady_clock::now() - fastFailStart, std::chrono::seconds(5));
+
+    release.set_value();
+    wrapper.flushJsQueue();
+
+    // Neither the abandoned nor the fast-failed call ran, and the JS thread is trusted again.
+    ASSERT_EQ(2.0, countSyncCalls(function));
+}
+
+// The default policy keeps the original contract: a call that timed out, and a call that failed
+// fast behind it, both still run once the JS thread drains. Only their return values are lost.
+TEST_P(RuntimeFixture, callSyncWithDeadlineRunsTimedOutCallsLateByDefault) {
+    auto fnResult = getCountSyncCallFunction(wrapper);
+    ASSERT_TRUE(fnResult) << fnResult.description();
+    auto function = fnResult.value();
+    ASSERT_EQ(1.0, countSyncCalls(function));
+
+    auto release = stallJsThread(wrapper);
+
+    ASSERT_FALSE(function->callSyncWithDeadline(std::chrono::milliseconds(50), nullptr, 0));
+
+    auto fastFailStart = std::chrono::steady_clock::now();
+    ASSERT_FALSE(function->callSyncWithDeadline(std::chrono::seconds(10), nullptr, 0));
+    ASSERT_LT(std::chrono::steady_clock::now() - fastFailStart, std::chrono::seconds(5));
+
+    release.set_value();
+    wrapper.flushJsQueue();
+
+    // Both queued calls ran late, so this is the fourth execution.
+    ASSERT_EQ(4.0, countSyncCalls(function));
+}
+
+// The bounded main-thread action arm (handlers exported with makeMainThreadCallback and called
+// with ValueFunctionFlagsBoundedMainThreadSync) fails fast like a predicate but must never drop a
+// side effect: every call still reaches JS.
+TEST_P(RuntimeFixture, boundedMainThreadSyncCallsFailFastButStillRunWhileJsThreadIsStalled) {
+    ASSERT_TRUE(wrapper.runtime->getMainThreadManager().currentThreadIsMainThread());
+
+    auto fnResult = getCountSyncCallFunction(wrapper);
+    ASSERT_TRUE(fnResult) << fnResult.description();
+    auto function = fnResult.value();
+    auto* jsFunction = dynamic_cast<ValueFunctionWithJSValue*>(function.get());
+    ASSERT_NE(nullptr, jsFunction);
+    jsFunction->setShouldBlockMainThread(true);
+    ASSERT_EQ(1.0, countSyncCalls(function));
+
+    auto release = stallJsThread(wrapper);
+
+    // First call parks for kInputSyncCallDeadline and gives up; the second must not wait.
+    auto first = function->call(ValueFunctionFlagsBoundedMainThreadSync, nullptr, 0);
+    ASSERT_TRUE(first) << first.description();
+    ASSERT_TRUE(first.value().isUndefined());
+
+    auto fastFailStart = std::chrono::steady_clock::now();
+    auto second = function->call(ValueFunctionFlagsBoundedMainThreadSync, nullptr, 0);
+    ASSERT_TRUE(second) << second.description();
+    ASSERT_TRUE(second.value().isUndefined());
+    ASSERT_LT(std::chrono::steady_clock::now() - fastFailStart, kInputSyncCallDeadline);
+
+    release.set_value();
+    wrapper.flushJsQueue();
+
+    // Both bounded calls ran despite being given up on.
+    ASSERT_EQ(4.0, countSyncCalls(function));
+}
+
+// With the killswitch on, the pre-breaker path is used unchanged: every bounded call waits its
+// own full deadline and every timed-out call runs late, whatever the policy says.
+TEST_P(RuntimeFixture, callSyncWithDeadlineWaitsFullDeadlineWhenCircuitBreakerDisabled) {
+    DeadlineCircuitBreakerDisabledScope breakerDisabled;
+
+    auto fnResult = getCountSyncCallFunction(wrapper);
+    ASSERT_TRUE(fnResult) << fnResult.description();
+    auto function = fnResult.value();
+    ASSERT_EQ(1.0, countSyncCalls(function));
+
+    auto release = stallJsThread(wrapper);
+
+    ASSERT_FALSE(function->callSyncWithDeadline(
+        std::chrono::milliseconds(20), nullptr, 0, SyncCallTimeoutPolicy::SkipIfTimedOut));
+
+    const auto secondDeadline = std::chrono::milliseconds(100);
+    auto secondStart = std::chrono::steady_clock::now();
+    ASSERT_FALSE(function->callSyncWithDeadline(secondDeadline, nullptr, 0, SyncCallTimeoutPolicy::SkipIfTimedOut));
+    ASSERT_GE(std::chrono::steady_clock::now() - secondStart, secondDeadline);
+
+    release.set_value();
+    wrapper.flushJsQueue();
+
+    // Both timed-out calls ran late.
+    ASSERT_EQ(4.0, countSyncCalls(function));
+}
+
+// The teardown case (resolving after the runtime is disposed reports the distinguishable
+// kResolutionSkippedDuringTeardownErrorCode) is covered end-to-end by the iOS
+// SCValdiJSRuntimeModuleErrorTests teardown regression, which induces disposal on the correct
+// thread. Inducing it here from the test thread races the JS-thread teardown and trips the
+// runtime's thread-access checker, so only the live-runtime control is asserted at this layer.
+
+// Control: a genuine resolution failure against a LIVE runtime — a module that
+// does not exist — must still surface as an error, and must NOT be mislabeled as the teardown
+// sentinel. Guards against the fix masking real resolution bugs.
+TEST_P(RuntimeFixture, pushModuleToMarshallerStillErrorsForMissingModuleWhenRuntimeLive) {
+    SimpleExceptionTracker exceptionTracker;
+    Marshaller marshaller(exceptionTracker);
+    wrapper.runtime->getJavaScriptRuntime()->pushModuleToMarshaller(
+        nullptr, STRING_LITERAL("test/src/ThisModuleDoesNotExist"), marshaller);
+
+    ASSERT_FALSE(exceptionTracker) << "Resolving a non-existent module on a live runtime must report an error";
+    auto error = exceptionTracker.extractError();
+    EXPECT_NE(Valdi::kResolutionSkippedDuringTeardownErrorCode, error.getErrorCode())
+        << "A genuine resolution failure must not be labeled as a teardown skip: " << error.toString();
+}
+
+// Cooperative termination mode (the default) must DRAIN: a task dispatched while the runtime is
+// disposed but its context is still alive still runs, rather than being silently skipped (a skip
+// drops an in-flight bridge call and crashes its caller on the undefined result). Aggressive mode
+// skips it (the pre-fix host-teardown behavior). Uses setDisposedForTesting to hold the
+// disposed-but-context-alive window deterministically without running teardown.
+TEST_P(RuntimeFixture, cooperativeTeardownDrainsInFlightWorkAggressiveSkipsIt) {
+    auto* javaScriptRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    // Cooperative (default): disposed-but-context-alive work runs.
+    {
+        bool ran = false;
+        javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto&) {
+            javaScriptRuntime->setDisposedForTesting(true);
+            javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                               [&](auto&) { ran = true; });
+            javaScriptRuntime->setDisposedForTesting(false);
+        });
+        EXPECT_TRUE(ran) << "cooperative mode must drain in-flight work during the teardown window";
+    }
+
+    // Aggressive: disposed work is skipped (restore cooperative afterward for clean fixture teardown).
+    javaScriptRuntime->setCooperativeTermination(false);
+    {
+        bool ran = false;
+        javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto&) {
+            javaScriptRuntime->setDisposedForTesting(true);
+            javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"),
+                                                               [&](auto&) { ran = true; });
+            javaScriptRuntime->setDisposedForTesting(false);
+        });
+        EXPECT_FALSE(ran) << "aggressive mode skips disposed work";
+    }
+    javaScriptRuntime->setCooperativeTermination(true);
+}
+
+// onInitError (module-loader init failure) clears _running while the context is still non-null.
+// teardownOnJsThread does NOT clear _running, so !_running uniquely identifies that init-failure
+// state, and the dispatch guard must refuse queued work against a runtime that never finished
+// initializing -- even under cooperative termination (the default), whose _isDisposed drain is a
+// separate window. The teardown drain itself keeps _running true and is covered by
+// cooperativeTeardownDrainsInFlightWorkAggressiveSkipsIt above. Uses setRunningForTesting to hold
+// the init-failure state deterministically without driving a real init failure.
+TEST_P(RuntimeFixture, initFailedRuntimeSkipsQueuedWorkWhileContextAlive) {
+    auto* javaScriptRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    bool ran = false;
+    javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto&) {
+        javaScriptRuntime->setRunningForTesting(false);
+        javaScriptRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto&) { ran = true; });
+        javaScriptRuntime->setRunningForTesting(true);
+    });
+    EXPECT_FALSE(ran) << "queued work must be skipped while _running is cleared (module-loader init failed) even "
+                         "though the context is still alive";
+}
+
+// Mechanism repro for the JS-runtime teardown use-after-free (ASan-only; DISABLED so CI never runs
+// it). Reproduces the exact memory violation the ~JavaScriptRuntime join fix prevents:
+// _moduleResourceTracker is a lock-free
+// vector that loadJsModule mutates only on the JS thread, but the destructor frees it during member
+// destruction on whatever thread drops the last ref (in production the djinni GC thread). Here the JS
+// thread takes a pointer into the buffer (as loadJsModule holds .back()) and parks; another thread
+// frees the buffer (modelling the destructor); the JS thread then writes through it. Enable with
+// --gtest_also_run_disabled_tests under ASan on a ThreadedDispatchQueue engine (e.g. QuickJS) to see
+// the heap-use-after-free. It is NOT a fix gate (it frees via a seam, bypassing the destructor); a
+// destructor-gated red/green test needs to own a runtime via the djinni/worker path (follow-up).
+// WARNING: the write below is a deliberate use-after-free -- it corrupts the heap without ASan.
+TEST_P(RuntimeFixture, DISABLED_moduleResourceTrackerFreedUnderJsThreadIsUseAfterFree) {
+    auto* jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    std::promise<void> parked;
+    std::promise<void> freed;
+
+    std::thread jsSide([&] {
+        jsRuntime->dispatchSynchronouslyOnJsThread(STRING_LITERAL("test.runtime"), [&](auto&) {
+            auto* elem = jsRuntime->mutateAndGetModuleResourceTrackerBackForTesting();
+            parked.set_value();
+            freed.get_future().wait();
+            elem->memoryWaterMark = 42; // heap-use-after-free: the buffer was freed on the main thread
+        });
+    });
+
+    parked.get_future().wait();
+    jsRuntime->freeModuleResourceTrackerForTesting();
+    freed.set_value();
+    jsSide.join();
+}
+
+// Verifies that a sync JS call from the main thread triggers the assertion when the module has
+// async_strict_mode and the function is not annotated with @AllowSyncCall. Uses a dedicated
+// test_async_strict module (async_strict_mode=True) so the main test module can stay non-strict.
+TEST_P(RuntimeFixture, AsyncStrictModeSyncCallAssertsOnMainThread) {
+    // This fixture owns a live runtime with several worker/JS threads. The default "fast"
+    // death-test style fork()s in place, so the child inherits those threads frozen mid-flight;
+    // on loaded CI runners the child then stalls for ~90s on an orphaned lock before the assert's
+    // abort() completes, and the parameterized variants blow the suite timeout. "threadsafe"
+    // re-execs a fresh process for the death check, so no locked mutexes are inherited.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+
+    wrapper.flushQueues();
+
+    // test_async_strict has async_strict_mode=True; compute() has no @AllowSyncCall.
+    // Schema "f|b|():u" = bansync (`b`) so that CallSync triggers the assertion.
+    auto functionValue = getJsModulePropertyWithSchema(
+        wrapper.runtime, nullptr, nullptr, "test_async_strict/src/AsyncStrictModule", "compute", "f|b|():u");
+    ASSERT_TRUE(functionValue) << "getJsModulePropertyWithSchema failed: " << functionValue.description();
+
+    Valdi::SimpleExceptionTracker exceptionTracker;
+    auto valueFunction = functionValue.value().checkedTo<Ref<Valdi::ValueFunction>>(exceptionTracker);
+    ASSERT_TRUE(exceptionTracker) << "compute is not a function";
+
+    // Verify only that the disallowed sync call terminates the process; don't pin the signal or
+    // the abort message. The SC_ASSERT fires as expected, but the two platforms report it
+    // differently: macOS aborts cleanly (SIGABRT with message), while on Linux/glibc the assert
+    // fires and then glibc's own failure reporter segfaults (SIGSEGV) while formatting the message
+    // — so nothing reaches the child's stderr and the exact signal differs. Matching ".*" keeps the
+    // real guarantee (a disallowed sync call must not silently proceed) portable across both.
+    EXPECT_DEATH(
+        {
+            wrapper.runtime->getMainThreadManager().markCurrentThreadIsMainThread();
+            (void)valueFunction->call(Valdi::ValueFunctionFlagsCallSync, nullptr, 0);
+        },
+        ".*");
+}
+
+TEST_P(RuntimeFixture, supportsExportedFunction) {
+    auto result = snap::valdi_modules::test::MakeCalculator::resolve(*wrapper.runtime->getJavaScriptRuntime(), nullptr);
+    ASSERT_TRUE(result) << result.description();
+
+    auto calculator = result.value()();
+
+    calculator->add(10);
+
+    ASSERT_EQ(10.0, calculator->total());
+
+    calculator->mul(3.0);
+
+    ASSERT_EQ(30.0, calculator->total());
+
+    ASSERT_EQ(StringBox::fromCString("30.0"),
+              calculator->toString(snap::valdi_modules::test::CalculatorToStringFormat::DECIMAL));
+    ASSERT_EQ(StringBox::fromCString("30"),
+              calculator->toString(snap::valdi_modules::test::CalculatorToStringFormat::INTEGER));
+}
+
+TEST_P(RuntimeFixture, resolveAsTypedObjectReturnsTypedObject) {
+    auto result = snap::valdi_modules::test::MakeCalculator::resolveAsTypedObject(
+        *wrapper.runtime->getJavaScriptRuntime(), nullptr);
+    ASSERT_TRUE(result) << result.description();
+
+    auto typedObject = result.value();
+    ASSERT_NE(typedObject, nullptr);
+
+    // The TypedObject wraps a class schema named "MakeCalculator" with one property (the function).
+    ASSERT_EQ(typedObject->getClassName(), StringBox::fromCString("MakeCalculator"));
+    ASSERT_EQ(typedObject->getPropertiesSize(), 1u);
+
+    // Property 0 should be the callable function.
+    const auto& functionValue = typedObject->getProperty(0);
+    ASSERT_TRUE(functionValue.isFunction());
+}
+
+TEST_P(RuntimeFixture, registeredSchemaReturnsValidSchema) {
+    auto& schema = snap::valdi_modules::test::MakeCalculator::registeredSchema();
+    ASSERT_EQ(schema.getClassName(), StringBox::fromCString("MakeCalculator"));
+
+    auto classSchemaResult = schema.getResolvedClassSchema();
+    ASSERT_TRUE(classSchemaResult) << classSchemaResult.description();
+
+    auto classSchema = classSchemaResult.value();
+    ASSERT_EQ(classSchema->getClassName(), StringBox::fromCString("MakeCalculator"));
+
+    // MakeCalculator has one property: the makeCalculator function itself.
+    ASSERT_EQ(classSchema->getPropertiesSize(), 1u);
+    const auto& prop = classSchema->getProperty(0);
+    ASSERT_EQ(prop.name, StringBox::fromCString("makeCalculator"));
+    ASSERT_TRUE(prop.schema.isFunction());
+
+    // makeCalculator() takes 0 parameters.
+    auto* funcSchema = prop.schema.getFunction();
+    ASSERT_NE(funcSchema, nullptr);
+    ASSERT_EQ(funcSchema->getParametersSize(), 0u);
+}
+
 TEST_P(RuntimeFixture, supportsLongObject) {
     auto parseResult =
         callFunctionSync(wrapper, "test/src/LongTest", "parse", {Value(STRING_LITERAL("3670116110564327421"))});
@@ -6123,7 +7364,7 @@ class MyNativeObject : public ValdiObject {
 TEST_P(RuntimeFixture, supportsUserCreatedNativeObjects) {
     Ref<MyNativeObject> nativeObject = makeShared<MyNativeObject>();
 
-    auto objectsManager = wrapper.runtime->getJavaScriptRuntime()->createNativeObjectsManager();
+    auto objectsManager = wrapper.runtime->getJavaScriptRuntime()->createNativeObjectsManager("");
 
     ASSERT_EQ(1, nativeObject.use_count());
 
@@ -6156,10 +7397,11 @@ TEST_P(RuntimeFixture, supportsUserCreatedNativeObjects) {
 
     // Now we dispose the objects manager
 
-    wrapper.runtime->getJavaScriptRuntime()->dispatchSynchronouslyOnJsThread([&](auto& jsEntry) {
-        wrapper.runtime->getJavaScriptRuntime()->destroyNativeObjectsManager(objectsManager);
-        return;
-    });
+    wrapper.runtime->getJavaScriptRuntime()->dispatchSynchronouslyOnJsThread(
+        STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+            wrapper.runtime->getJavaScriptRuntime()->destroyNativeObjectsManager(objectsManager);
+            return;
+        });
 
     // The reference should have been released
     ASSERT_EQ(1, nativeObject.use_count());
@@ -6168,6 +7410,34 @@ TEST_P(RuntimeFixture, supportsUserCreatedNativeObjects) {
     retValue = unwrapObject();
 
     ASSERT_TRUE(retValue.isUndefined());
+}
+
+TEST_P(RuntimeFixture, destroysNativeRefsWhenUserCreatedContextIsDestroyed) {
+    Ref<MyNativeObject> nativeObject = makeShared<MyNativeObject>();
+
+    auto jsResult = callFunctionSync(wrapper,
+                                     nullptr,
+                                     "test/src/DestroyRefOnChildContext",
+                                     "createChildContext",
+                                     {Value(makeShared<ValueFunctionWithCallable>(
+                                         [nativeObject = nativeObject.get()](const auto& callContext) -> Value {
+                                             return Value(Ref<ValdiObject>(nativeObject));
+                                         }))});
+
+    ASSERT_TRUE(jsResult) << jsResult.description();
+
+    auto contextId = static_cast<ContextId>(jsResult.value().getMapValue("contextId").toInt());
+
+    ASSERT_EQ(2, contextId);
+
+    // 1 ref in the test, 1 in JS
+    ASSERT_EQ(2, nativeObject.use_count());
+
+    wrapper.runtime->getContextManager().destroyContext(contextId);
+    wrapper.flushQueues();
+
+    // The native reference should have been released
+    ASSERT_EQ(1, nativeObject.use_count());
 }
 
 TEST_P(RuntimeFixture, canDumpLogs) {
@@ -6637,7 +7907,7 @@ TEST_P(RuntimeFixture, attributesHotReloadErrorOnContext) {
 }
 
 TEST_P(RuntimeFixture, showStackTraceResponsibleForEmittingDanglingReference) {
-    wrapper.runtime->getJavaScriptRuntime()->setEnableStackTraceCapture(true);
+    wrapper.runtime->getJavaScriptRuntime()->setForceStackTraceCapture(true);
 
     auto messageHandler = makeShared<MockRuntimeMessageHandler>();
     wrapper.runtime->setRuntimeMessageHandler(messageHandler);
@@ -6699,6 +7969,44 @@ TEST_P(RuntimeFixture, showStackTraceResponsibleForEmittingDanglingReference) {
     }
 
     ASSERT_EQ(static_cast<size_t>(1), messageHandler->messages().debugMessages.size());
+}
+
+TEST_P(RuntimeFixture, scopeNameAppearsInDisposedReferenceError) {
+    auto messageHandler = makeShared<MockRuntimeMessageHandler>();
+    wrapper.runtime->setRuntimeMessageHandler(messageHandler);
+
+    Ref<MyNativeObject> nativeObject = makeShared<MyNativeObject>();
+
+    // Create objectsManager with a specific scopeName
+    auto objectsManager = wrapper.runtime->getJavaScriptRuntime()->createNativeObjectsManager("MyFeature.MyCallsite");
+
+    // Wrap native object in JS
+    auto jsResult =
+        callFunctionSync(wrapper, objectsManager, "test/src/WrapNativeObject", "wrapper", {Value(nativeObject)});
+    ASSERT_TRUE(jsResult) << jsResult.description();
+
+    auto unwrapObject = [&]() {
+        // Call the function - we expect it to fail, so don't call .value() on the result
+        // The error will be logged to messageHandler
+        (void)jsResult.value().getFunction()->call(Valdi::ValueFunctionFlagsCallSync, {});
+    };
+
+    // Dispose the objectsManager
+    wrapper.runtime->getJavaScriptRuntime()->dispatchSynchronouslyOnJsThread(
+        STRING_LITERAL("test.runtime"), [&](auto& jsEntry) {
+            wrapper.runtime->getJavaScriptRuntime()->destroyNativeObjectsManager(objectsManager);
+            return;
+        });
+
+    // Try to unwrap - should trigger error with scopeName (error is logged, not thrown)
+    unwrapObject();
+    wrapper.flushQueues();
+
+    // Verify error contains scopeName
+    ASSERT_GE(messageHandler->messages().errors.size(), static_cast<size_t>(1));
+    auto errorMessage = messageHandler->messages().errors[0].second;
+    ASSERT_TRUE(errorMessage.contains("MyFeature.MyCallsite"))
+        << "Expected error message to contain scopeName 'MyFeature.MyCallsite', got: " << errorMessage.slowToString();
 }
 
 TEST_P(RuntimeFixture, supportsSingleCallJsFunction) {
@@ -7135,7 +8443,7 @@ TEST_P(RuntimeFixture, canSymbolicateError) {
     auto finalError = Error("Invalid error");
 
     wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThread(
-        nullptr, JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
+        STRING_LITERAL("test.runtime"), JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
             auto error = entry.jsContext.newError("This is an error", std::nullopt, entry.exceptionTracker);
             if (!entry.exceptionTracker) {
                 return;
@@ -7166,7 +8474,7 @@ TEST_P(RuntimeFixture, handlesFailureSafelyInSymbolication) {
     ASSERT_EQ(static_cast<size_t>(0), messageHandler->messages().errors.size());
 
     wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThread(
-        nullptr, JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
+        STRING_LITERAL("test.runtime"), JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
             auto error = entry.jsContext.newError("This is an error", std::nullopt, entry.exceptionTracker);
             if (!entry.exceptionTracker) {
                 return;
@@ -7183,6 +8491,78 @@ TEST_P(RuntimeFixture, handlesFailureSafelyInSymbolication) {
     ASSERT_EQ(static_cast<size_t>(1), messageHandler->messages().errors.size());
     ASSERT_TRUE(messageHandler->messages().errors[0].second.hasPrefix(
         "Recoverable JS Error while performing action 'symbolicateError'\n[caused by]: I Am Broken"));
+}
+
+TEST_P(RuntimeFixture, convertJSErrorFallsBackToValueStringForEmptyMessage) {
+    auto finalError = Error("Invalid error");
+
+    wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThread(
+        STRING_LITERAL("test.runtime"), JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
+            auto error = entry.jsContext.newError("", std::nullopt, entry.exceptionTracker);
+            if (!entry.exceptionTracker) {
+                return;
+            }
+            auto retainedError = JSValueRef::makeRetained(entry.jsContext, error.get());
+
+            finalError = convertJSErrorToValdiError(entry.jsContext, retainedError, nullptr);
+        });
+
+    ASSERT_FALSE(finalError.toStringBox().contains("Unable to build exception message"));
+    ASSERT_TRUE(finalError.toStringBox().hasPrefix("Error"));
+}
+
+TEST_P(RuntimeFixture, convertJSErrorFallsBackToValueStringWhenMessageGetterThrows) {
+    std::string symbolicateModuleBody = R"""(
+    module.exports.symbolicate = function(error) {
+        return { get message() { throw new Error('unreadable'); } };
+    };
+    )""";
+
+    wrapper.hotReload(STRING_LITERAL("valdi_core"), STRING_LITERAL("src/Symbolicator.js"), symbolicateModuleBody);
+
+    auto finalError = Error("Invalid error");
+
+    wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThread(
+        STRING_LITERAL("test.runtime"), JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
+            auto error = entry.jsContext.newError("This is an error", std::nullopt, entry.exceptionTracker);
+            if (!entry.exceptionTracker) {
+                return;
+            }
+            auto retainedError = JSValueRef::makeRetained(entry.jsContext, error.get());
+
+            finalError = convertJSErrorToValdiError(entry.jsContext, retainedError, nullptr);
+        });
+
+    ASSERT_FALSE(finalError.toStringBox().contains("Unable to build exception message"));
+    ASSERT_TRUE(finalError.toStringBox().hasPrefix("[object Object]"));
+}
+
+TEST_P(RuntimeFixture, convertJSErrorReportsValueTypeWhenUnstringifiable) {
+    std::string symbolicateModuleBody = R"""(
+    module.exports.symbolicate = function(error) {
+        return {
+            get message() { throw new Error('unreadable'); },
+            toString: function() { throw new Error('unstringifiable'); }
+        };
+    };
+    )""";
+
+    wrapper.hotReload(STRING_LITERAL("valdi_core"), STRING_LITERAL("src/Symbolicator.js"), symbolicateModuleBody);
+
+    auto finalError = Error("Invalid error");
+
+    wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThread(
+        STRING_LITERAL("test.runtime"), JavaScriptTaskScheduleTypeAlwaysSync, 0, [&](JavaScriptEntryParameters& entry) {
+            auto error = entry.jsContext.newError("This is an error", std::nullopt, entry.exceptionTracker);
+            if (!entry.exceptionTracker) {
+                return;
+            }
+            auto retainedError = JSValueRef::makeRetained(entry.jsContext, error.get());
+
+            finalError = convertJSErrorToValdiError(entry.jsContext, retainedError, nullptr);
+        });
+
+    ASSERT_TRUE(finalError.toStringBox().hasPrefix("Unable to build exception message (thrown value type:"));
 }
 
 TEST_P(RuntimeFixture, supportsUncaughtExceptionHandler) {
@@ -7281,6 +8661,19 @@ TEST_P(RuntimeFixture, supportsNotifyWithUncaughtErrorHandler) {
     ASSERT_TRUE(result.isError());
 }
 
+static DummyView makeColorPaletteTestView(int64_t borderColor, int64_t backgroundColor) {
+    return DummyView("SCValdiView")
+        .addAttribute("border", Value(ValueArray::make({Value(1.0), Value(borderColor)})))
+        .addChild(DummyView("SCValdiView")
+                      .addAttribute("background",
+                                    Value(ValueArray::make({
+                                        Value(ValueArray::make({Value(backgroundColor)})),
+                                        Value(ValueArray::make({})),
+                                        Value(static_cast<int32_t>(0)),
+                                        Value(false),
+                                    }))));
+}
+
 TEST_P(RuntimeFixture, supportsCustomColorPalette) {
     auto tree = wrapper.createViewNodeTreeAndContext(STRING_LITERAL("ColorPaletteTest@test/src/ColorPaletteTest"),
                                                      Value(makeShared<ValueMap>()),
@@ -7288,20 +8681,29 @@ TEST_P(RuntimeFixture, supportsCustomColorPalette) {
 
     wrapper.waitUntilAllUpdatesCompleted();
 
-    ASSERT_EQ(DummyView("SCValdiView")
-                  .addAttribute("border", Value(ValueArray::make({Value(1.0), Value(65535)})))
-                  .addChild(DummyView("SCValdiView")
-                                .addAttribute("background",
-                                              Value(ValueArray::make({
-                                                  Value(ValueArray::make({Value(8388863)})),
-                                                  Value(ValueArray::make({})),
-                                                  Value(static_cast<int32_t>(0)),
-                                                  Value(false),
-                                              })))),
-              getRootView(tree));
+    ASSERT_EQ(makeColorPaletteTestView(65535, 8388863), getRootView(tree));
 }
 
-TEST_P(RuntimeFixture, canUpdateCustomColorPalette) {
+TEST_P(RuntimeFixture, colorPaletteManagerRemainsUsableAfterRuntimeManagerTeardown) {
+    Ref<ColorPaletteManager> colorPaletteManager;
+    {
+        RuntimeWrapper temporaryWrapper(getJsBridge(), getTSNMode());
+        colorPaletteManager = temporaryWrapper.standaloneRuntime->getViewManagerContext()
+                                  ->getAttributesManager()
+                                  .getColorPaletteManager();
+        temporaryWrapper.teardown();
+    }
+
+    colorPaletteManager->configureColorPalette(STRING_LITERAL("dark"),
+                                               {{STRING_LITERAL("background"), Color::rgba(255, 0, 0, 1.0)}});
+    colorPaletteManager->setActiveColorPalette(STRING_LITERAL("dark"));
+
+    ASSERT_EQ(STRING_LITERAL("dark"), colorPaletteManager->getActiveColorPalette()->getName());
+    ASSERT_EQ(Color::rgba(255, 0, 0, 1.0),
+              colorPaletteManager->getActiveColorPalette()->getColorForName(STRING_LITERAL("background")).value());
+}
+
+TEST_P(RuntimeFixture, canSwitchActiveCustomColorPalette) {
     auto tree = wrapper.createViewNodeTreeAndContext(STRING_LITERAL("ColorPaletteTest@test/src/ColorPaletteTest"),
                                                      Value(makeShared<ValueMap>()),
                                                      Value::undefined());
@@ -7309,22 +8711,148 @@ TEST_P(RuntimeFixture, canUpdateCustomColorPalette) {
     wrapper.waitUntilAllUpdatesCompleted();
 
     wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
-                                                                   STRING_LITERAL("updateColorPalette"));
+                                                                   STRING_LITERAL("setDarkColorPalette"));
 
     wrapper.flushQueues();
 
-    ASSERT_EQ(
-        DummyView("SCValdiView")
-            .addAttribute("border", Value(ValueArray::make({Value(1.0), Value(static_cast<int64_t>(4278190335))})))
-            .addChild(DummyView("SCValdiView")
-                          .addAttribute("background",
-                                        Value(ValueArray::make({
-                                            Value(ValueArray::make({Value(static_cast<int64_t>(4294902015))})),
-                                            Value(ValueArray::make({})),
-                                            Value(static_cast<int32_t>(0)),
-                                            Value(false),
-                                        })))),
-        getRootView(tree));
+    ASSERT_EQ(makeColorPaletteTestView(4278190335, 4294902015), getRootView(tree));
+}
+
+TEST_P(RuntimeFixture, doesNotReapplyCustomColorPaletteWhenInactivePaletteChanges) {
+    auto tree = wrapper.createViewNodeTreeAndContext(STRING_LITERAL("ColorPaletteTest@test/src/ColorPaletteTest"),
+                                                     Value(makeShared<ValueMap>()),
+                                                     Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("updateDarkColorPalette"));
+
+    wrapper.flushQueues();
+
+    ASSERT_EQ(makeColorPaletteTestView(65535, 8388863), getRootView(tree));
+}
+
+TEST_P(RuntimeFixture, reappliesCustomColorPaletteWhenActivePaletteChanges) {
+    auto tree = wrapper.createViewNodeTreeAndContext(STRING_LITERAL("ColorPaletteTest@test/src/ColorPaletteTest"),
+                                                     Value(makeShared<ValueMap>()),
+                                                     Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("updateLightColorPalette"));
+
+    wrapper.flushQueues();
+
+    ASSERT_EQ(makeColorPaletteTestView(4278190335, 4294902015), getRootView(tree));
+}
+
+static DummyView makeColorPaletteOverrideTestView(int64_t rootBackgroundColor,
+                                                  int64_t overrideBackgroundColor,
+                                                  int64_t overrideChildBackgroundColor,
+                                                  int64_t siblingBackgroundColor) {
+    auto makeBackground = [](int64_t color) {
+        return Value(ValueArray::make({
+            Value(ValueArray::make({Value(color)})),
+            Value(ValueArray::make({})),
+            Value(static_cast<int32_t>(0)),
+            Value(false),
+        }));
+    };
+
+    return DummyView("SCValdiView")
+        .addAttribute("background", makeBackground(rootBackgroundColor))
+        .addChild(
+            DummyView("SCValdiView")
+                .addAttribute("background", makeBackground(overrideBackgroundColor))
+                .addChild(
+                    DummyView("SCValdiView").addAttribute("background", makeBackground(overrideChildBackgroundColor))))
+        .addChild(DummyView("SCValdiView").addAttribute("background", makeBackground(siblingBackgroundColor)));
+}
+
+TEST_P(RuntimeFixture, supportsPerViewNodeColorPaletteOverride) {
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ColorPaletteOverrideTest@test/src/ColorPaletteOverrideTest"),
+        Value(makeShared<ValueMap>()),
+        Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    ASSERT_EQ(makeColorPaletteOverrideTestView(65535, 4278190335, 4294902015, 8388863), getRootView(tree));
+}
+
+TEST_P(RuntimeFixture, switchingActiveColorPaletteDoesNotChangeOverriddenSubtree) {
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ColorPaletteOverrideTest@test/src/ColorPaletteOverrideTest"),
+        Value(makeShared<ValueMap>()),
+        Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("setDarkActiveColorPalette"));
+
+    wrapper.flushQueues();
+
+    ASSERT_EQ(makeColorPaletteOverrideTestView(4278190335, 4278190335, 4294902015, 4294902015), getRootView(tree));
+}
+
+TEST_P(RuntimeFixture, clearingRootColorPaletteOverrideFallsBackToActivePalette) {
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ColorPaletteOverrideTest@test/src/ColorPaletteOverrideTest"),
+        Value(makeShared<ValueMap>()),
+        Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    auto root = tree->getRootViewNode();
+    ASSERT_NE(nullptr, root);
+    ASSERT_EQ(STRING_LITERAL("light"), root->getResolvedColorPalette()->getName());
+
+    tree->scheduleExclusiveUpdate(
+        [&]() { root->setColorPaletteName(tree->getCurrentViewTransactionScope(), STRING_LITERAL("dark")); });
+    wrapper.flushQueues();
+    ASSERT_EQ(STRING_LITERAL("dark"), root->getResolvedColorPalette()->getName());
+
+    tree->scheduleExclusiveUpdate(
+        [&]() { root->setColorPaletteName(tree->getCurrentViewTransactionScope(), StringBox()); });
+    wrapper.flushQueues();
+
+    ASSERT_NE(nullptr, root->getResolvedColorPalette());
+    ASSERT_EQ(STRING_LITERAL("light"), root->getResolvedColorPalette()->getName());
+}
+
+TEST_P(RuntimeFixture, mutatingOverriddenColorPaletteUpdatesOverriddenSubtree) {
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ColorPaletteOverrideTest@test/src/ColorPaletteOverrideTest"),
+        Value(makeShared<ValueMap>()),
+        Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("updateDarkColorPalette"));
+
+    wrapper.flushQueues();
+
+    ASSERT_EQ(makeColorPaletteOverrideTestView(65535, 255, 4294967295, 8388863), getRootView(tree));
+}
+
+TEST_P(RuntimeFixture, mutatingUnusedColorPaletteDoesNotChangeRenderedAttributes) {
+    auto tree = wrapper.createViewNodeTreeAndContext(
+        STRING_LITERAL("ColorPaletteOverrideTest@test/src/ColorPaletteOverrideTest"),
+        Value(makeShared<ValueMap>()),
+        Value::undefined());
+
+    wrapper.waitUntilAllUpdatesCompleted();
+
+    wrapper.runtime->getJavaScriptRuntime()->callComponentFunction(tree->getContext(),
+                                                                   STRING_LITERAL("updateUnusedColorPalette"));
+
+    wrapper.flushQueues();
+
+    ASSERT_EQ(makeColorPaletteOverrideTestView(65535, 4278190335, 4294902015, 8388863), getRootView(tree));
 }
 
 static Result<Value> postprocessArrayValueToLength(ViewNode& viewNode, const Value& in) {
@@ -8176,6 +9704,217 @@ TEST_P(RuntimeFixture, supportsCommonJsStyleModuleLoading) {
     ASSERT_EQ(Value(STRING_LITERAL("number")), scopedJsResult.value());
 }
 
+TEST_P(RuntimeFixture, recordsRuntimeBuiltinWithModulePathForANRAttribution) {
+    wrapper.teardown();
+
+    auto tweakModule = makeShared<TestTweakValueProvider>().toShared();
+    tweakModule->config.setMapValue("VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS", Valdi::Value(static_cast<bool>(true)));
+
+    wrapper = RuntimeWrapper(getJsBridge(), getTSNMode(), false, tweakModule);
+
+    auto* jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    // Spins on a builtin whose load always fails until the gate bundle exists, keeping the JS
+    // thread inside runtime.loadJsModule long enough for the observer below to catch the
+    // recorded name mid-call. The gate is flipped off the JS thread (worker queue), which is
+    // the only way to release the loop while the JS thread never yields.
+    std::string evalBody = "while (!runtime.isModuleLoaded('anr_attribution_gate')) {"
+                           "  try { runtime.loadJsModule('test/src/AnrAttributionMissing'); } catch (e) {}"
+                           "}"
+                           "return 0;";
+
+    Result<Value> evalResult;
+    std::thread evalThread([&] {
+        evalResult = jsRuntime->evaluateScript(makeShared<ByteBuffer>(evalBody)->toBytesView(),
+                                               STRING_LITERAL("anr_attribution_eval.js"));
+    });
+
+    const std::string expected = "[stuck-in: runtime.loadJsModule(test/src/AnrAttributionMissing)]";
+    std::string observed;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto info = jsRuntime->getANRAttributionInfo();
+        if (info.find(expected) != std::string::npos) {
+            observed = info;
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    // Registering the gate bundle makes isModuleLoaded return true, releasing the JS loop.
+    wrapper.loadModule(STRING_LITERAL("anr_attribution_gate"), ResourceManagerLoadModuleType::Sources);
+    evalThread.join();
+
+    ASSERT_TRUE(evalResult) << evalResult.description();
+    EXPECT_NE(std::string::npos, observed.find(expected)) << "observed: '" << observed << "'";
+    // The [module:] suffix may legitimately remain (last dispatched context), but the in-flight
+    // native call must have unwound.
+    EXPECT_EQ(std::string::npos, jsRuntime->getANRAttributionInfo().find("[stuck-in:"));
+}
+
+// Spins the JS thread inside `spinBody` until `gateBundle` is registered, and returns the first
+// ANR attribution info observed from another thread that contains `expected` (empty on timeout).
+static std::string observeANRAttributionWhileSpinning(RuntimeWrapper& wrapper,
+                                                      const std::string& spinBody,
+                                                      const char* gateBundle,
+                                                      const std::string& expected) {
+    auto* jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    Result<Value> evalResult;
+    std::thread evalThread([&] {
+        evalResult = jsRuntime->evaluateScript(makeShared<ByteBuffer>(spinBody)->toBytesView(),
+                                               STRING_LITERAL("anr_attribution_eval.js"));
+    });
+
+    std::string observed;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto info = jsRuntime->getANRAttributionInfo();
+        if (info.find(expected) != std::string::npos) {
+            observed = info;
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    // Registering the gate bundle makes isModuleLoaded return true, releasing the JS loop.
+    wrapper.loadModule(StringBox::fromCString(gateBundle), ResourceManagerLoadModuleType::Sources);
+    evalThread.join();
+    EXPECT_TRUE(evalResult) << evalResult.description();
+    return observed;
+}
+
+static bool isRuntimeTraceBound(JavaScriptRuntime& jsRuntime) {
+    auto probe = jsRuntime.evaluateScript(
+        makeShared<ByteBuffer>(std::string("return typeof runtime.trace === 'function' ? 1 : 0;"))->toBytesView(),
+        STRING_LITERAL("eval.js"));
+    return probe && probe.value().toInt() == 1;
+}
+
+// A trace span runs its callback synchronously inside runtime.trace, so the breadcrumb used to
+// read "[stuck-in: runtime.trace]" for the whole span. It must name the span instead.
+TEST_P(RuntimeFixture, recordsTraceSpanTagForANRAttribution) {
+    wrapper.teardown();
+
+    auto tweakModule = makeShared<TestTweakValueProvider>().toShared();
+    tweakModule->config.setMapValue("VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS", Valdi::Value(static_cast<bool>(true)));
+    wrapper = RuntimeWrapper(getJsBridge(), getTSNMode(), false, tweakModule);
+
+    auto* jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+    if (!isRuntimeTraceBound(*jsRuntime)) {
+        GTEST_SKIP() << "tracing disabled in this build (runtime.trace not bound)";
+    }
+
+    std::string spinBody = "runtime.trace('renderComponent.AnrAttributionProbe', () => {"
+                           "  while (!runtime.isModuleLoaded('anr_attribution_gate_span')) {}"
+                           "});"
+                           "return 0;";
+    const std::string expected = "[stuck-in: renderComponent.AnrAttributionProbe]";
+    auto observed = observeANRAttributionWhileSpinning(wrapper, spinBody, "anr_attribution_gate_span", expected);
+
+    EXPECT_NE(std::string::npos, observed.find(expected)) << "observed: '" << observed << "'";
+    EXPECT_EQ(std::string::npos, observed.find("runtime.trace")) << "observed: '" << observed << "'";
+    EXPECT_EQ(std::string::npos, jsRuntime->getANRAttributionInfo().find("[stuck-in:"));
+}
+
+TEST_P(RuntimeFixture, recordsScheduledWorkItemForANRAttribution) {
+    wrapper.teardown();
+
+    auto tweakModule = makeShared<TestTweakValueProvider>().toShared();
+    tweakModule->config.setMapValue("VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS", Valdi::Value(static_cast<bool>(true)));
+    wrapper = RuntimeWrapper(getJsBridge(), getTSNMode(), false, tweakModule);
+
+    std::string spinBody = "runtime.scheduleWorkItem(() => {"
+                           "  while (!runtime.isModuleLoaded('anr_attribution_gate_work_item')) {}"
+                           "}, 0);"
+                           "return 0;";
+    const std::string expected = "[stuck-in: runtime.scheduleWorkItem]";
+    auto observed = observeANRAttributionWhileSpinning(wrapper, spinBody, "anr_attribution_gate_work_item", expected);
+
+    EXPECT_NE(std::string::npos, observed.find(expected)) << "observed: '" << observed << "'";
+    EXPECT_EQ(std::string::npos, wrapper.runtime->getJavaScriptRuntime()->getANRAttributionInfo().find("[stuck-in:"));
+}
+
+TEST(JavaScriptRuntimeANRAttribution, traceSpanNameKeepsStaticPrefixOnly) {
+    EXPECT_EQ(STRING_LITERAL("renderComponent.SendToRecipientList"),
+              JavaScriptRuntime::anrNativeCallNameForTraceSpan(STRING_LITERAL("renderComponent.SendToRecipientList")));
+    EXPECT_EQ(
+        STRING_LITERAL("DatabaseSync - Save Sync Token"),
+        JavaScriptRuntime::anrNativeCallNameForTraceSpan(STRING_LITERAL("DatabaseSync - Save Sync Token: client-a")));
+    EXPECT_TRUE(JavaScriptRuntime::anrNativeCallNameForTraceSpan(STRING_LITERAL(": dynamic-only")).isEmpty());
+    EXPECT_EQ(128u,
+              JavaScriptRuntime::anrNativeCallNameForTraceSpan(StringBox::fromString(std::string(200, 'x'))).length());
+}
+
+TEST_P(RuntimeFixture, acceptsEmptyOwnerlessAttributionWhenDiagnosticsAreDisabled) {
+    auto* jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+    ASSERT_FALSE(jsRuntime->anrDiagnosticsEnabled());
+
+    bool ran = false;
+    jsRuntime->dispatchSynchronouslyOnJsThread(StringBox(), [&](JavaScriptEntryParameters& /*entry*/) { ran = true; });
+
+    EXPECT_TRUE(ran);
+}
+
+TEST_P(RuntimeFixture, recordsAttributionForOwnerlessJsThreadDispatch) {
+    wrapper.teardown();
+
+    auto tweakModule = makeShared<TestTweakValueProvider>().toShared();
+    tweakModule->config.setMapValue("VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS", Valdi::Value(static_cast<bool>(true)));
+
+    wrapper = RuntimeWrapper(getJsBridge(), getTSNMode(), false, tweakModule);
+
+    auto* jsRuntime = wrapper.runtime->getJavaScriptRuntime();
+
+    EXPECT_DEATH(
+        {
+            jsRuntime->dispatchOnJsThread(
+                StringBox(), JavaScriptTaskScheduleTypeDefault, 0, [](JavaScriptEntryParameters& /*entry*/) {});
+        },
+        ".*");
+
+    auto verifyAttribution = [&](const std::string& expected, const auto& dispatch) {
+        std::atomic<bool> taskStarted = false;
+        std::atomic<bool> releaseTask = false;
+
+        std::thread dispatchThread([&] {
+            dispatch([&](JavaScriptEntryParameters& /*entry*/) {
+                taskStarted = true;
+                while (!releaseTask) {
+                    std::this_thread::yield();
+                }
+            });
+        });
+
+        std::string observed;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto attributionInfo = jsRuntime->getANRAttributionInfo();
+            if (taskStarted && attributionInfo.find(expected) != std::string::npos) {
+                observed = std::move(attributionInfo);
+                break;
+            }
+            std::this_thread::yield();
+        }
+
+        releaseTask = true;
+        dispatchThread.join();
+
+        EXPECT_NE(std::string::npos, observed.find(expected)) << "observed: '" << observed << "'";
+        EXPECT_EQ(std::string::npos, jsRuntime->getANRAttributionInfo().find("[stuck-in:"));
+    };
+
+    verifyAttribution("[stuck-in: test.nativeRunnable]", [&](JavaScriptThreadTask&& task) {
+        jsRuntime->dispatchOnJsThread(
+            STRING_LITERAL("test.nativeRunnable"), JavaScriptTaskScheduleTypeAlwaysSync, 0, std::move(task));
+    });
+
+    verifyAttribution("[stuck-in: runtime.performGc]", [&](JavaScriptThreadTask&& task) {
+        jsRuntime->dispatchOnJsThread(
+            JsThreadDispatchReason::PerformGc, JavaScriptTaskScheduleTypeAlwaysSync, 0, std::move(task));
+    });
+}
+
 TEST_P(RuntimeFixture, canGetFileEntry) {
     auto jsResult = callFunctionSync(wrapper, "test/src/LoadFile", "loadFromString", {});
     ASSERT_TRUE(jsResult) << jsResult.value();
@@ -8396,7 +10135,7 @@ TEST_P(RuntimeFixture, cancelsComponentCreationIfDestroyIsCalledBeforeComponentI
     group->enter();
 
     wrapper.runtime->getJavaScriptRuntime()->dispatchOnJsThreadAsync(
-        nullptr, [group](JavaScriptEntryParameters& entry) { group->blockingWait(); });
+        STRING_LITERAL("test.runtime"), [group](JavaScriptEntryParameters& entry) { group->blockingWait(); });
 
     auto callback = makeShared<ValueFunctionWithCallable>([&](const auto& callContext) -> Value {
         onRenderCalled = true;
@@ -8535,9 +10274,66 @@ public:
     }
 };
 
-RegisterModuleFactory registerTestModule([]() { return std::make_shared<TestModuleFactory>(); });
+class NativeCalculator : public snap::valdi_modules::test::ICalculator {
+public:
+    NativeCalculator() = default;
+    ~NativeCalculator() override = default;
 
-RegisterModuleFactory registerTestModule2([]() { return std::make_shared<TestModule2Factory>(); });
+    void add(double value) final {
+        _value += value;
+    }
+
+    void sub(double value) final {
+        _value -= value;
+    }
+
+    void mul(double value) final {
+        _value *= value;
+    }
+
+    void div(double value) final {
+        _value /= value;
+    }
+
+    double total() final {
+        return _value;
+    }
+
+    Valdi::StringBox toString(snap::valdi_modules::test::CalculatorToStringFormat format) final {
+        switch (format) {
+            case snap::valdi_modules::test::CalculatorToStringFormat::DECIMAL:
+                return Valdi::StringBox::fromString(std::to_string(_value));
+            case snap::valdi_modules::test::CalculatorToStringFormat::INTEGER:
+                return Valdi::StringBox::fromString(std::to_string(static_cast<int64_t>(_value)));
+        }
+    }
+
+private:
+    double _value = 0;
+};
+
+class NativeCalculatorModuleFactoryImpl : public snap::valdi_modules::test::NativeCalculatorModuleFactory {
+public:
+    NativeCalculatorModuleFactoryImpl() = default;
+
+    Ref<snap::valdi_modules::test::NativeCalculatorModule> onLoadModule() final {
+        class NativeCalculatorModuleImpl : public snap::valdi_modules::test::NativeCalculatorModule {
+        public:
+            NativeCalculatorModuleImpl() = default;
+            ~NativeCalculatorModuleImpl() override = default;
+
+            Ref<snap::valdi_modules::test::ICalculator> makeCalculator() final {
+                return makeShared<NativeCalculator>();
+            }
+        };
+
+        return makeShared<NativeCalculatorModuleImpl>();
+    }
+};
+auto registerNativeCalculatorModule = RegisterModuleFactory::registerTyped<NativeCalculatorModuleFactoryImpl>();
+
+auto registerTestModule = RegisterModuleFactory::registerTyped<TestModuleFactory>();
+auto registerTestModule2 = RegisterModuleFactory::registerTyped<TestModule2Factory>();
 
 TEST_P(RuntimeFixture, supportsModuleRegisteredThroughModuleRegistry) {
     std::string evalBody = "return global.require(\"my_module/src/TestModule\").CONSTANT * 2;";

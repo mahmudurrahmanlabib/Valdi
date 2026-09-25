@@ -148,6 +148,7 @@ public:
 
     DECLARE_JAVA_CLASS(ValdiException)
     DECLARE_JAVA_METHOD(ValdiException, Constructor, ConstructorType, String)
+    DECLARE_JAVA_METHOD(ValdiException, ConstructorWithErrorCode, ConstructorType, String, int32_t)
     DECLARE_JAVA_CLASS(MarshallerException)
 
     DECLARE_JAVA_CLASS(ValdiThread)
@@ -166,6 +167,7 @@ public:
     DECLARE_JAVA_CLASS(ViewFactory)
     DECLARE_JAVA_METHOD(ViewFactory, CreateView, ViewType, JavaObject)
     DECLARE_JAVA_METHOD(ViewFactory, BindAttributes, VoidType, int64_t)
+    DECLARE_JAVA_METHOD(ViewFactory, ManagesChildFrames, bool)
 
     DECLARE_JAVA_CLASS(ViewRef)
     DECLARE_JAVA_METHOD(ViewRef, InvalidateLayout, VoidType)

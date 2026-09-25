@@ -12,15 +12,32 @@
 #include "valdi/runtime/JavaScript/JavaScriptTaskScheduler.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptUtils.hpp"
 #include "valdi/runtime/Utils/MainThreadManager.hpp"
+#include "valdi_core/cpp/Constants.hpp"
+#include "valdi_core/cpp/Utils/LoggerUtils.hpp"
 #include "valdi_core/cpp/Utils/ResolvablePromise.hpp"
 #include "valdi_core/cpp/Utils/SmallVector.hpp"
 #include "valdi_core/cpp/Utils/Trace.hpp"
+#include "valdi_core/cpp/Utils/TrackedLock.hpp"
+#include "valdi_core/cpp/Utils/Value.hpp"
 
+#include "utils/debugging/Assert.hpp"
+
+#include <atomic>
 #include <future>
 
 namespace Valdi {
 
 constexpr size_t kMaxMainThreadWaitTimeMs = 100;
+
+static std::atomic<bool> s_deadlineCircuitBreakerDisabled{false};
+
+void ValueFunctionWithJSValue::setDeadlineCircuitBreakerDisabled(bool disabled) {
+    s_deadlineCircuitBreakerDisabled.store(disabled, std::memory_order_relaxed);
+}
+
+bool ValueFunctionWithJSValue::isDeadlineCircuitBreakerDisabled() {
+    return s_deadlineCircuitBreakerDisabled.load(std::memory_order_relaxed);
+}
 
 ValueFunctionWithJSValue::ValueFunctionWithJSValue(IJavaScriptContext& context,
                                                    const JSValue& value,
@@ -30,6 +47,7 @@ ValueFunctionWithJSValue::ValueFunctionWithJSValue(IJavaScriptContext& context,
     : JSValueRefHolder(context, value, referenceInfo, exceptionTracker, true),
       _callSequence(0),
       _mainThreadManager(context.getListener() != nullptr ? context.getListener()->getMainThreadManager() : nullptr),
+      _creationContext(weakRef(Context::current())),
       _isSingleCall(isSingleCall) {}
 
 // See explanation in JSValueRefHolder.cpp
@@ -47,8 +65,36 @@ bool ValueFunctionWithJSValue::prefersSyncCalls() const {
     return _shouldBlockMainThread;
 }
 
+bool ValueFunctionWithJSValue::ownerIsTearingDown() const {
+    // A sync call yields 'undefined' with a clean tracker exactly when operator() would skip it,
+    // so this must mirror operator()'s skip conditions. Two families: (1) the JS runtime is
+    // disposed - expired() covers a gone task scheduler and _isDisposed set from any thread during
+    // teardown / aggressive worker termination (the makeJsThreadDispatchFunction early-return);
+    // (2) the owning Valdi context is destroyed, but only when _ignoreIfValdiContextIsDestroyed is
+    // set, and an expired _creationContext weak pointer counts as destroyed. Gated so a live
+    // context that legitimately returns 'undefined' still surfaces as an error downstream.
+    if (expired()) {
+        return true;
+    }
+    if (_ignoreIfValdiContextIsDestroyed) {
+        if (Context::isDestroyedContextFixEnabled()) {
+            auto creationContext = _creationContext.lock();
+            if (creationContext == nullptr || creationContext->isDestroyed()) {
+                return true;
+            }
+        } else if (getContext()->isDestroyed()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ValueFunctionWithJSValue::setShouldBlockMainThread(bool shouldBlockMainThread) {
     _shouldBlockMainThread = shouldBlockMainThread;
+}
+
+void ValueFunctionWithJSValue::setAllowSyncCall(bool allowSyncCall) {
+    _allowSyncCall = allowSyncCall;
 }
 
 bool ValueFunctionWithJSValue::isSingleCall() const {
@@ -75,6 +121,13 @@ bool ValueFunctionWithJSValue::shouldCallSync(ValueFunctionFlags callFlags,
     }
 
     return (callFlags & ValueFunctionFlagsCallSync) != ValueFunctionFlagsNone || _shouldBlockMainThread;
+}
+
+bool ValueFunctionWithJSValue::isSyncCallAllowed(ValueFunctionFlags flags) const {
+    if ((flags & ValueFunctionFlagsCallSync) == ValueFunctionFlagsNone && !_shouldBlockMainThread) {
+        return true;
+    }
+    return _allowSyncCall;
 }
 
 Value ValueFunctionWithJSValue::doJsCall(JavaScriptEntryParameters& jsEntry,
@@ -128,6 +181,145 @@ struct MainThreadThrottledCall : public SimpleRefCountable {
     ~MainThreadThrottledCall() override = default;
 };
 
+Result<Value> ValueFunctionWithJSValue::dispatchAndWaitOnJsThread(const Ref<JavaScriptTaskScheduler>& taskScheduler,
+                                                                  const std::chrono::steady_clock::time_point& deadline,
+                                                                  const Value* parameters,
+                                                                  size_t parametersSize) {
+    auto promise = std::make_shared<std::promise<Result<Value>>>();
+    auto future = promise->get_future();
+
+    // The JS callback may need locks this thread holds (e.g. the ViewNodeTree lock when the call
+    // originates from the scroll path); suspend them while parked so the JS thread can make
+    // progress instead of stalling until the deadline. Same pattern as
+    // DeferredViewTransaction::flush before dispatchSync.
+    DropAllTrackedLocks dropAllTrackedLocks;
+
+    taskScheduler->dispatchOnJsThreadAsync(
+        getContext(),
+        [self = strongSmallRef(this), parameters = captureParameters(parameters, parametersSize), promise](
+            auto& jsEntry) {
+            MainThreadBatchAllowScope mainThreadBatchAllowScope;
+            auto result = self->doJsCall(jsEntry, parameters.data(), parameters.size(), nullptr, false);
+            promise->set_value(Result(std::move(result)));
+        });
+
+    if (std::future_status::ready == future.wait_until(deadline)) {
+        return future.get();
+    }
+
+    return Error("JS function timeout");
+}
+
+// State shared between the thread parked on a deadline-bounded call and the JS task that runs it.
+// Exactly one side wins the Pending transition: the JS task (Completed, the waiter reads the
+// result) or the waiter (TimedOut, the task is now overdue and reports back when it runs).
+struct DeadlineCall {
+    enum class State : uint8_t { Pending, Completed, TimedOut };
+
+    std::promise<Result<Value>> promise;
+    std::atomic<State> state{State::Pending};
+    std::chrono::steady_clock::time_point dispatchedAt = std::chrono::steady_clock::now();
+};
+
+Result<Value> ValueFunctionWithJSValue::dispatchAndWaitOnJsThreadWithCircuitBreaker(
+    const Ref<JavaScriptTaskScheduler>& taskScheduler,
+    const std::chrono::steady_clock::time_point& deadline,
+    const Value* parameters,
+    size_t parametersSize,
+    SyncCallTimeoutPolicy timeoutPolicy) {
+    auto skipIfTimedOut = timeoutPolicy == SyncCallTimeoutPolicy::SkipIfTimedOut;
+
+    if (taskScheduler->hasOverdueDeadlineCalls()) {
+        // An earlier bounded call is still queued behind whatever the JS thread is stuck on, so this
+        // one would only burn its full deadline too. Waiting per call is what lets a burst of input
+        // hold the main thread for seconds while each individual wait stays within budget.
+        taskScheduler->onDeadlineCallFailedFast();
+        if (!skipIfTimedOut) {
+            taskScheduler->dispatchOnJsThreadAsync(
+                getContext(),
+                [self = strongSmallRef(this),
+                 parameters = captureParameters(parameters, parametersSize)](auto& jsEntry) {
+                    MainThreadBatchAllowScope mainThreadBatchAllowScope;
+                    self->doJsCall(jsEntry, parameters.data(), parameters.size(), nullptr, true);
+                });
+        }
+        return Error("JS function skipped: JS thread has an overdue sync call");
+    }
+
+    auto call = std::make_shared<DeadlineCall>();
+    auto future = call->promise.get_future();
+
+    // See dispatchAndWaitOnJsThread for why the tracked locks are dropped while parked.
+    DropAllTrackedLocks dropAllTrackedLocks;
+
+    taskScheduler->dispatchOnJsThreadAsync(
+        getContext(),
+        [self = strongSmallRef(this),
+         taskScheduler,
+         parameters = captureParameters(parameters, parametersSize),
+         call,
+         skipIfTimedOut](auto& jsEntry) {
+            auto abandoned = call->state.load(std::memory_order_acquire) == DeadlineCall::State::TimedOut;
+            auto result = Value::undefined();
+            if (!abandoned || !skipIfTimedOut) {
+                MainThreadBatchAllowScope mainThreadBatchAllowScope;
+                result = self->doJsCall(jsEntry, parameters.data(), parameters.size(), nullptr, abandoned);
+            }
+
+            auto expected = DeadlineCall::State::Pending;
+            if (call->state.compare_exchange_strong(expected, DeadlineCall::State::Completed)) {
+                call->promise.set_value(Result(std::move(result)));
+                return;
+            }
+
+            // The waiter gave up on this call. It only fails later calls fast while we are overdue,
+            // so this is where the JS thread proves it is responsive again. getFunctionName() is
+            // safe here: this is the JS thread, the only writer of its lazy cache.
+            auto stillOverdue = taskScheduler->onOverdueDeadlineCallCompleted();
+            if (stillOverdue == 0) {
+                [[maybe_unused]] auto failedFast = taskScheduler->takeFastFailedDeadlineCalls();
+                [[maybe_unused]] auto lateByMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     std::chrono::steady_clock::now() - call->dispatchedAt)
+                                                     .count();
+                VALDI_WARN(self->getContext()->getLogger(),
+                           "JS thread caught up on overdue sync call to '{}' {}ms after dispatch; {} bounded calls "
+                           "were failed fast meanwhile",
+                           self->getFunctionName(),
+                           lateByMs,
+                           failedFast);
+            }
+        });
+
+    if (std::future_status::ready == future.wait_until(deadline)) {
+        return future.get();
+    }
+
+    // Count before claiming the timeout so the JS task, which decrements only after it observes
+    // TimedOut, can never see the counter at zero.
+    taskScheduler->onDeadlineCallTimedOut();
+    auto expected = DeadlineCall::State::Pending;
+    if (!call->state.compare_exchange_strong(expected, DeadlineCall::State::TimedOut)) {
+        taskScheduler->onOverdueDeadlineCallCompleted();
+        return future.get();
+    }
+
+    // Name what the JS thread is doing instead of running us. The attribution only has content
+    // when ANR diagnostics are on, and it is the one signal that tells a slow JS thread apart from
+    // a JS thread that is itself blocked on the main thread.
+    // Built from the immutable ReferenceInfo rather than getFunctionName(): that cache is lazily
+    // written on the JS thread (doJsCall), which may be initializing it right now.
+    [[maybe_unused]] auto waitedMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - call->dispatchedAt)
+            .count();
+    VALDI_WARN(getContext()->getLogger(),
+               "Sync JS call to '{}' exceeded its deadline after {}ms, JS thread has not run it yet{}",
+               getReferenceInfo().toFunctionIdentifier(),
+               waitedMs,
+               taskScheduler->getANRAttributionInfo());
+
+    return Error("JS function timeout");
+}
+
 Value ValueFunctionWithJSValue::callSync(ValueFunctionFlags flags,
                                          const Ref<JavaScriptTaskScheduler>& taskScheduler,
                                          const ValueFunctionCallContext& callContext) {
@@ -165,6 +357,25 @@ Value ValueFunctionWithJSValue::callSync(ValueFunctionFlags flags,
                     });
 
                 future.wait_for(std::chrono::milliseconds(kMaxMainThreadWaitTimeMs));
+            } else if ((flags & ValueFunctionFlagsBoundedMainThreadSync) != ValueFunctionFlagsNone) {
+                // The main thread must not be held for an unbounded time waiting on the JS queue.
+                // Unlike the throttled path above, the call is never coalesced away, so nothing is
+                // dropped, only the return value on timeout. Uses the longer shared input deadline
+                // rather than the throttled bound: a throttled call is fire-and-forget by design,
+                // whereas these carry side effects the caller wants to land.
+                auto deadline = std::chrono::steady_clock::now() + kInputSyncCallDeadline;
+                auto result =
+                    isDeadlineCircuitBreakerDisabled() ?
+                        dispatchAndWaitOnJsThread(
+                            taskScheduler, deadline, callContext.getParameters(), callContext.getParametersSize()) :
+                        dispatchAndWaitOnJsThreadWithCircuitBreaker(taskScheduler,
+                                                                    deadline,
+                                                                    callContext.getParameters(),
+                                                                    callContext.getParametersSize(),
+                                                                    SyncCallTimeoutPolicy::RunLate);
+                if (result.success()) {
+                    retValue = result.value();
+                }
             } else {
                 taskScheduler->dispatchOnJsThreadSync(getContext(), [&](auto& jsEntry) {
                     MainThreadBatchAllowScope mainThreadBatchAllowScope;
@@ -196,8 +407,23 @@ Value ValueFunctionWithJSValue::operator()(const ValueFunctionCallContext& callC
     if (taskScheduler == nullptr) {
         return Value::undefined();
     }
-    if (_ignoreIfValdiContextIsDestroyed && getContext()->isDestroyed()) {
-        return Value::undefined();
+    if (_ignoreIfValdiContextIsDestroyed) {
+        if (Context::isDestroyedContextFixEnabled()) {
+            auto ctx = _creationContext.lock();
+            if (ctx == nullptr || ctx->isDestroyed()) {
+                VALDI_WARN(getContext()->getLogger(),
+                           "Function call skipped: creation context {} is destroyed (function: {})",
+                           ctx != nullptr ? std::to_string(ctx->getContextId()) : "expired",
+                           getReferenceInfo().toString());
+                return Value::undefined();
+            }
+        } else if (getContext()->isDestroyed()) {
+            VALDI_WARN(getContext()->getLogger(),
+                       "Function call skipped: ValdiContext {} is destroyed (function: {})",
+                       getContext()->getContextId(),
+                       getReferenceInfo().toString());
+            return Value::undefined();
+        }
     }
 
     auto flags = callContext.getFlags();
@@ -208,6 +434,17 @@ Value ValueFunctionWithJSValue::operator()(const ValueFunctionCallContext& callC
     // later. In the mean time this allows native to return values to JS which is very useful.
 
     if (shouldCallSync(flags, *taskScheduler)) {
+        // Only assert on main thread: sync JS calls from main thread can cause ANR; worker threads are less
+        // problematic.
+        if (_mainThreadManager != nullptr && _mainThreadManager->currentThreadIsMainThread()) {
+            if (!isSyncCallAllowed(flags)) {
+                SC_ASSERT(
+                    false &&
+                    "Sync JS call is not allowed: this module has async_strict_mode enabled and the function is not "
+                    "annotated with @AllowSyncCall. Consider making the function return Promise or void, or add "
+                    "@AllowSyncCall to allow blocking the JS thread.");
+            }
+        }
         return callSync(flags, taskScheduler, callContext);
     } else if ((flags & ValueFunctionFlagsAllowThrottling) != ValueFunctionFlagsNone) {
         auto callId = ++_callSequence;
@@ -249,6 +486,15 @@ Value ValueFunctionWithJSValue::callPromise(const Ref<JavaScriptTaskScheduler>& 
                 return;
             }
 
+            // When an interruptible callback is skipped (Valdi context destroyed), doJsCall returns
+            // undefined. Fulfilling the promise with undefined would cause native unmarshalling to
+            // fail (e.g. expected NativeSnapDoc). Reject the promise so the caller can handle it.
+            if (result.getType() == ValueType::Undefined && self->_ignoreIfValdiContextIsDestroyed &&
+                self->getContext() != nullptr && self->getContext()->isDestroyed()) {
+                promise->fulfill(Result<Value>(Error("Valdi context destroyed")));
+                return;
+            }
+
             auto nestedPromise = result.getTypedRef<Promise>();
             if (nestedPromise != nullptr) {
                 // Flatten one level of promise, since we already returned a promise to the caller
@@ -267,30 +513,32 @@ std::string_view ValueFunctionWithJSValue::getFunctionType() const {
 
 Result<Value> ValueFunctionWithJSValue::callSyncWithDeadline(const std::chrono::steady_clock::time_point& deadline,
                                                              Value* parameters,
-                                                             size_t size) noexcept {
+                                                             size_t size,
+                                                             SyncCallTimeoutPolicy timeoutPolicy) noexcept {
     auto taskScheduler = getTaskScheduler();
     if (taskScheduler == nullptr) {
         return Value::undefined();
     }
-    auto promise = std::make_shared<std::promise<Result<Value>>>();
-    auto future = promise->get_future();
 
-    SimpleExceptionTracker exceptionTracker;
-    ValueFunctionCallContext callContext(
-        ValueFunctionFlags::ValueFunctionFlagsCallSync, parameters, size, exceptionTracker);
-
-    taskScheduler->dispatchOnJsThreadAsync(
-        getContext(),
-        [self = strongSmallRef(this), parameters = captureParameters(callContext), promise](auto& jsEntry) {
-            auto result = self->doJsCall(jsEntry, parameters.data(), parameters.size(), nullptr, false);
-            promise->set_value(Result(std::move(result)));
-        });
-
-    if (std::future_status::ready == future.wait_until(deadline)) {
-        return future.get();
-    } else {
-        return Error("JS function timeout");
+    // Batch the main thread work the JS call requests while we are parked on the future. Without a
+    // batch, a sync main thread hop from the JS thread (e.g. a placeholder view measure during
+    // layout) cannot be serviced until we give up at the deadline, turning every such call into a
+    // full-deadline stall.
+    auto shouldStartMainThreadBatch = _mainThreadManager != nullptr && _mainThreadManager->currentThreadIsMainThread();
+    if (shouldStartMainThreadBatch) {
+        _mainThreadManager->beginBatch();
     }
+
+    auto result =
+        isDeadlineCircuitBreakerDisabled() ?
+            dispatchAndWaitOnJsThread(taskScheduler, deadline, parameters, size) :
+            dispatchAndWaitOnJsThreadWithCircuitBreaker(taskScheduler, deadline, parameters, size, timeoutPolicy);
+
+    if (shouldStartMainThreadBatch) {
+        _mainThreadManager->endBatch();
+    }
+
+    return result;
 }
 
 UntypedValueFunctionWithJSValue::UntypedValueFunctionWithJSValue(IJavaScriptContext& context,

@@ -1,10 +1,14 @@
-# Valdi
+<h1 id="valdi">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/docs/assets/branding/lockup-yellow-white.svg">
+    <img width="320" src="./docs/docs/assets/branding/lockup-black.svg" alt="Valdi" />
+  </picture>
+</h1>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE.md)
 [![Platforms](https://img.shields.io/badge/platform-iOS%20%7C%20Android%20%7C%20macOS-lightgrey)](./docs/INSTALL.md)
 [![Status](https://img.shields.io/badge/status-beta-yellow)]()
-[![Discord](https://img.shields.io/discord/1285677307163574322?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.gg/uJyNEeYX2U)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue?logo=typescript)](https://www.typescriptlang.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue?logo=typescript)](https://www.typescriptlang.org/)
 [![Documentation](https://img.shields.io/badge/docs-available-brightgreen)](./docs/README.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](./CONTRIBUTING.md)
 
@@ -34,6 +38,26 @@ class HelloWorld extends Component {
   <img src="./docs/docs/assets/start-about/IMG_1445.jpg" width="400" alt="Hello World example running on iOS" />
 </p>
 
+## Quick Start
+
+**Prerequisites:** Xcode (macOS only) - everything else is automatic!
+
+```bash
+# Install Valdi CLI
+npm install -g @snap/valdi
+
+# One-command setup (installs all dependencies)
+valdi dev_setup
+
+# Create your first project
+mkdir my_project && cd my_project
+valdi bootstrap
+valdi install ios  # or android
+```
+
+> [!TIP]
+> **Editor Extensions:** For the best development experience, install the [Valdi VSCode/Cursor extensions](./docs/INSTALL.md#vscodecursor-setup-optional-but-recommended) for syntax highlighting, debugging, and device logs during hot reload.
+
 ## Quick Links
 
 - [Getting Started Guide](./docs/INSTALL.md)
@@ -42,6 +66,21 @@ class HelloWorld extends Component {
 - [API Reference](./docs/api/api-quick-reference.md)
 - [Frequently Asked Questions](./docs/docs/faq.md)
 - [Component Library](https://github.com/Snapchat/Valdi_Widgets)
+- [GitHub Discussions](https://github.com/Snapchat/Valdi/discussions)
+- [Roadmap](./ROADMAP.md)
+
+## Example Apps
+
+The [`apps/`](./apps) directory contains runnable examples:
+
+| App | What it shows |
+|-----|---------------|
+| [helloworld](./apps/helloworld) | Minimal component — the fastest way to get something on screen |
+| [navigation_example](./apps/navigation_example) | Screen navigation patterns |
+| [managed_context_example](./apps/managed_context_example) | Sharing state across components with managed context |
+| [valdi_gpt](./apps/valdi_gpt) | AI-driven dynamic UI — Valdi rendering UI described at runtime |
+| [cli_example](./apps/cli_example) | Building a Valdi CLI application |
+| [benchmark](./apps/benchmark) | Performance benchmarks |
 
 ## Why Choose Valdi?
 
@@ -102,9 +141,11 @@ Valdi generates type-safe bindings between TypeScript and native platforms:
 Please refer to  [installation guide](https://github.com/YahyaMokhlis/Valdi/blob/main/docs/INSTALL.md) for detailed setup instructions
 
 
+
 ## Need Help?
 
-Join our [Discord](https://discord.gg/uJyNEeYX2U) for support.
+- **[GitHub Discussions](https://github.com/Snapchat/Valdi/discussions)** — ask questions and share what you're building
+- **[GitHub Issues](https://github.com/Snapchat/Valdi/issues)** — report bugs and request features
 
 ## Contributing
 

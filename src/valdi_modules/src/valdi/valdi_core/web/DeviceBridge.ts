@@ -109,6 +109,11 @@ export function getDisplayScale(): number {
   return DPR;
 }
 
+export function getDynamicTypeScale(): number {
+  // Web has no Valdi dynamic-type scaling; treat as unscaled.
+  return 1;
+}
+
 export function getWindowWidth(): number {
   if (!isBrowser) return 0;
   return Math.max(0, Math.floor(window.innerWidth));
@@ -257,6 +262,10 @@ export function observeDarkMode(observe: (isDarkMode: boolean) => void): DeviceC
 export function isDesktop(): boolean {
   if (!isBrowser) return true;
   return !(isIOS || isAndroid);
+}
+
+export function isWeb(): boolean {
+  return isBrowser;
 }
 
 // On web there is no native back button; some apps emulate via history.

@@ -220,6 +220,7 @@ IMPLEMENT_JAVA_CLASS(UndefinedValue, "com/snapchat/client/valdi/UndefinedValue")
 
 IMPLEMENT_JAVA_CLASS(ValdiException, "com/snap/valdi/exceptions/ValdiException")
 IMPLEMENT_JAVA_METHOD(ValdiException, Constructor, kJniSigConstructor, ConstructorType, String)
+IMPLEMENT_JAVA_METHOD(ValdiException, ConstructorWithErrorCode, kJniSigConstructor, ConstructorType, String, int32_t)
 IMPLEMENT_JAVA_CLASS(MarshallerException, "com/snap/valdi/exceptions/MarshallerException")
 
 IMPLEMENT_JAVA_CLASS(CppObjectWrapper, "com/snapchat/client/valdi/utils/CppObjectWrapper")
@@ -248,6 +249,7 @@ IMPLEMENT_JAVA_METHOD(ValdiThread, UpdateQoS, "updateQoS", VoidType, int32_t)
 IMPLEMENT_JAVA_CLASS(ViewFactory, "com/snap/valdi/ViewFactoryPrivate")
 IMPLEMENT_JAVA_METHOD(ViewFactory, CreateView, "createView", ViewType, JavaObject)
 IMPLEMENT_JAVA_METHOD(ViewFactory, BindAttributes, "bindAttributes", VoidType, int64_t)
+IMPLEMENT_JAVA_METHOD(ViewFactory, ManagesChildFrames, "managesChildFrames", bool)
 
 IMPLEMENT_JAVA_CLASS(ViewRef, "com/snap/valdi/ViewRef")
 IMPLEMENT_JAVA_METHOD(ViewRef, InvalidateLayout, "invalidateLayout", VoidType)

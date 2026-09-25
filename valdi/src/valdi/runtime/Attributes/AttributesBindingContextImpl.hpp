@@ -21,7 +21,9 @@ class ILogger;
 
 class AttributesBindingContextImpl : public AttributesBindingContext {
 public:
-    AttributesBindingContextImpl(AttributeIds& attributeIds, const Ref<ColorPalette>& colorPalette, ILogger& logger);
+    AttributesBindingContextImpl(AttributeIds& attributeIds,
+                                 const Ref<ColorPaletteManager>& colorPaletteManager,
+                                 ILogger& logger);
     ~AttributesBindingContextImpl() override;
 
     void registerPreprocessor(const Valdi::StringBox& attribute,
@@ -68,6 +70,8 @@ public:
                                        const std::vector<snap::valdi_core::CompositeAttributePart>& parts,
                                        const Ref<AttributeHandlerDelegate>& delegate) override;
 
+    AttributeId bindTransformAttributes(const Ref<AttributeHandlerDelegate>& delegate) override;
+
     void bindScrollAttributes() override;
 
     void bindAssetAttributes(snap::valdi_core::AssetOutputType assetOutputType) override;
@@ -83,7 +87,7 @@ public:
 
 private:
     AttributeIds& _attributeIds;
-    Ref<ColorPalette> _colorPalette;
+    Ref<ColorPaletteManager> _colorPaletteManager;
     ILogger& _logger;
     AttributeHandlerById _handlers;
     Ref<AttributeHandlerDelegate> _defaultDelegate;

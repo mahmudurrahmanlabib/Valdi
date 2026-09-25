@@ -15,13 +15,13 @@ namespace Valdi {
 
 ViewManagerContext::ViewManagerContext(IViewManager& viewManager,
                                        AttributeIds& attributeIds,
-                                       const Ref<ColorPalette>& colorPalette,
+                                       const Ref<ColorPaletteManager>& colorPaletteManager,
                                        const Shared<YGConfig>& yogaConfig,
                                        bool enablePreloading,
                                        const Ref<MainThreadManager>& mainThreadManager,
                                        ILogger& logger)
     : _viewManager(viewManager),
-      _attributesManager(viewManager, attributeIds, colorPalette, logger, yogaConfig),
+      _attributesManager(viewManager, attributeIds, colorPaletteManager, logger, yogaConfig),
       _mainThreadManager(mainThreadManager) {
     Valdi::registerDefaultProcessors(_attributesManager);
 
@@ -72,6 +72,14 @@ void ViewManagerContext::setAccessibilityEnabled(const bool accessibilityEnabled
 
 bool ViewManagerContext::getAccessibilityEnabled() const {
     return _accessibilityEnabled;
+}
+
+void ViewManagerContext::setApplyManagedChildFramePadding(const bool applyManagedChildFramePadding) {
+    _applyManagedChildFramePadding = applyManagedChildFramePadding;
+}
+
+bool ViewManagerContext::getApplyManagedChildFramePadding() const {
+    return _applyManagedChildFramePadding;
 }
 
 void ViewManagerContext::setPreloadingWorkQueue(const Ref<DispatchQueue>& preloadingWorkQueue) {

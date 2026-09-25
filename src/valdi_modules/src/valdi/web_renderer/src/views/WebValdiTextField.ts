@@ -4,21 +4,59 @@ import { convertColor } from '../styles/ValdiWebStyles';
 
 class ValdiInput extends HTMLElement {
   private input: HTMLInputElement;
-  private onEditEnd: (event: { value: string, reason: string }) => void = () => {};
+  private onEditEnd: (event: { text: string, selectionStart: number, selectionEnd: number, reason: string }) => void = () => {};
   private onSelectionChange: (event: { value: string, selection: { start: number | null, end: number | null } }) => void = () => {};
   private attributeDelegate?: UpdateAttributeDelegate;
 
   constructor() {
     super();
 
-    const shadow = this.attachShadow({ mode: 'open' });
+    const shadow = this.attachShadow({ mode: 'open', delegatesFocus: true });
 
     this.input = document.createElement('input');
 
-    const handleInput = this.debounce((event: Event, reason: string) => {
-      const value = this.input.value;
-      this.attributeDelegate?.updateAttribute(Number(this.input.getAttribute("id")), "value", value);
-      this.onEditEnd({ value, reason });
+    // Style the inner input to remove default browser borders and outlines
+    Object.assign(this.input.style, {
+      width: '100%',
+      height: '100%',
+      border: 'none',
+      outline: 'none',
+      backgroundColor: 'transparent',
+      padding: 0,
+      margin: 0,
+      boxSizing: 'border-box',
+      MozAppearance: 'textfield',
+      WebkitAppearance: 'none',
+    });
+
+    // Add a style element to ensure no focus outlines
+    const style = document.createElement('style');
+    style.textContent = `
+      input {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+      }
+      input:focus {
+        outline: none !important;
+        box-shadow: none !important;
+      }
+      input:focus-visible {
+        outline: none !important;
+        box-shadow: none !important;
+      }
+    `;
+    shadow.appendChild(style);
+
+    const handleInput = this.debounce((_event: Event, reason: string) => {
+      const text = this.input.value;
+      this.attributeDelegate?.updateAttribute(Number(this.input.getAttribute("id")), "value", text);
+      this.onEditEnd({
+        text,
+        selectionStart: this.input.selectionStart ?? 0,
+        selectionEnd: this.input.selectionEnd ?? 0,
+        reason,
+      });
     }, 300).bind(this);
 
     this.input.addEventListener('blur', (event) => handleInput(event, 'blur'));
@@ -27,6 +65,14 @@ class ValdiInput extends HTMLElement {
         handleInput(event, 'return');
       }
     });
+
+    // Stop propagation on interaction events to prevent parent onTap handlers
+    // (e.g. scroll's closeKeyboard) from stealing focus.
+    // This matches the pattern used by WebValdiTextView (textarea) which works correctly.
+    this.input.addEventListener('mousedown', (e) => e.stopPropagation());
+    this.input.addEventListener('touchstart', (e) => e.stopPropagation());
+    this.input.addEventListener('click', (e) => e.stopPropagation());
+
     shadow.appendChild(this.input);
   }
 
@@ -74,7 +120,7 @@ class ValdiInput extends HTMLElement {
   }
 
   // Can't be passed through the attribute system, it'll get turned into a string?
-  setOnEditEnd(value: (event: { value: string, reason: string }) => void) {
+  setOnEditEnd(value: (event: { text: string, selectionStart: number, selectionEnd: number, reason: string }) => void) {
     this.onEditEnd = value;
   }
 
@@ -109,6 +155,34 @@ class ValdiInput extends HTMLElement {
     return this.input.getAttribute(name);
   }
 
+  // Expose input properties so event handlers can access them
+  // after shadow DOM retargets event.target to this host element.
+  get value(): string {
+    return this.input.value;
+  }
+
+  set value(v: string) {
+    if (this.input.value !== v) {
+      this.input.value = v;
+    }
+  }
+
+  get selectionStart(): number | null {
+    return this.input.selectionStart;
+  }
+
+  get selectionEnd(): number | null {
+    return this.input.selectionEnd;
+  }
+
+  get disabled(): boolean {
+    return this.input.disabled;
+  }
+
+  set disabled(v: boolean) {
+    this.input.disabled = v;
+  }
+
   // Public methods to control the inner input
   select() {
     this.input.select();
@@ -136,6 +210,7 @@ export function registerTextFieldElements(): void {
 export class WebValdiTextField extends WebValdiLayout {
   public type = 'textfield';
   public declare htmlElement: ValdiInput;
+  private _callbackListeners: { key: string; eventType: string; handler: EventListener }[] = [];
 
   createHtmlElement() {
     const element = document.createElement('valdi-input') as ValdiInput;
@@ -161,41 +236,96 @@ export class WebValdiTextField extends WebValdiLayout {
     return element;
   }
 
+  private replaceListener(key: string, eventType: string, handler: EventListener | undefined) {
+    const existing = this._callbackListeners.findIndex(l => l.key === key);
+    if (existing >= 0) {
+      this.htmlElement.removeEventListener(this._callbackListeners[existing].eventType, this._callbackListeners[existing].handler);
+      this._callbackListeners.splice(existing, 1);
+    }
+    if (handler) {
+      this.htmlElement.addEventListener(eventType, handler);
+      this._callbackListeners.push({ key, eventType, handler });
+    }
+  }
+
   changeAttribute(attributeName: string, attributeValue: any): void {
     switch (attributeName) {
-      // Callbacks
-      case 'onWillChange':
-        // Note: This only supports preventing the change, not modifying the incoming text.
-        this.htmlElement.addEventListener('beforeinput', (event: InputEvent) => {
-          const result = attributeValue({ value: (event.target as HTMLInputElement).value });
-          if (result === undefined) {
+      case 'onWillChange': {
+        const cb = attributeValue;
+        const handler = cb ? ((event: InputEvent) => {
+          const el = this.htmlElement;
+          const result = cb({
+            text: el.value,
+            selectionStart: el.selectionStart ?? 0,
+            selectionEnd: el.selectionEnd ?? 0,
+          });
+          if (result === false) {
             event.preventDefault();
           }
-        });
+        }) as EventListener : undefined;
+        this.replaceListener('onWillChange', 'beforeinput', handler);
         return;
-      case 'onChange': // Replaces onChangeText
-        this.htmlElement.addEventListener('input', (event) => attributeValue({ value: (event.target as HTMLInputElement).value }));
+      }
+      case 'onChange': {
+        const cb = attributeValue;
+        const handler = cb ? (() => {
+          const el = this.htmlElement;
+          this.attributeDelegate?.updateAttribute(this.id, "value", el.value);
+          cb({
+            text: el.value,
+            selectionStart: el.selectionStart ?? 0,
+            selectionEnd: el.selectionEnd ?? 0,
+          });
+        }) as EventListener : undefined;
+        this.replaceListener('onChange', 'input', handler);
         return;
-      case 'onEditBegin': // Replaces onFocus
-        this.htmlElement.addEventListener('focus', (event) => attributeValue({ value: (event.target as HTMLInputElement).value }));
+      }
+      case 'onEditBegin': {
+        const cb = attributeValue;
+        const handler = cb ? (() => {
+          const el = this.htmlElement;
+          cb({
+            text: el.value,
+            selectionStart: el.selectionStart ?? 0,
+            selectionEnd: el.selectionEnd ?? 0,
+          });
+        }) as EventListener : undefined;
+        this.replaceListener('onEditBegin', 'focus', handler);
         return;
-      case 'onEditEnd': // Replaces onBlur
+      }
+      case 'onEditEnd':
         this.htmlElement.setOnEditEnd(attributeValue);
         return;
-      case 'onReturn':
-        this.htmlElement.addEventListener('keydown', (event: KeyboardEvent) => {
+      case 'onReturn': {
+        const cb = attributeValue;
+        const handler = cb ? ((event: KeyboardEvent) => {
             if (event.key === 'Enter') {
-                attributeValue({ value: (event.target as HTMLInputElement).value });
+                const el = this.htmlElement;
+                cb({
+                  text: el.value,
+                  selectionStart: el.selectionStart ?? 0,
+                  selectionEnd: el.selectionEnd ?? 0,
+                });
             }
-        });
+        }) as EventListener : undefined;
+        this.replaceListener('onReturn', 'keydown', handler);
         return;
-      case 'onWillDelete':
-        this.htmlElement.addEventListener('keydown', (event: KeyboardEvent) => {
+      }
+      case 'onWillDelete': {
+        const cb = attributeValue;
+        const handler = cb ? ((event: KeyboardEvent) => {
             if (event.key === 'Backspace' || event.key === 'Delete') {
-                attributeValue({ value: (event.target as HTMLInputElement).value });
+                const el = this.htmlElement;
+                cb({
+                  text: el.value,
+                  selectionStart: el.selectionStart ?? 0,
+                  selectionEnd: el.selectionEnd ?? 0,
+                });
             }
-        });
+        }) as EventListener : undefined;
+        this.replaceListener('onWillDelete', 'keydown', handler);
         return;
+      }
       case 'onSelectionChange':
         this.htmlElement.setOnSelectionChange(attributeValue);
         return;
@@ -260,7 +390,9 @@ export class WebValdiTextField extends WebValdiLayout {
         this.htmlElement.setAttribute(attributeName, attributeValue);
         return;
       case 'value':
-        this.htmlElement.setAttribute(attributeName, attributeValue);
+        // Must set the .value property (not attribute) to update the current input value.
+        // setAttribute('value') only sets the default/initial value for <input> elements.
+        this.htmlElement.value = attributeValue ?? '';
         return;
       case 'selection':
         if (Array.isArray(attributeValue) && attributeValue.length === 2) {
@@ -277,11 +409,7 @@ export class WebValdiTextField extends WebValdiLayout {
         }
         return;
       case 'enabled':
-        if (attributeValue) {
-          this.htmlElement.removeAttribute('disabled');
-        } else {
-          this.htmlElement.setAttribute('disabled', 'true');
-        }
+        this.htmlElement.disabled = !attributeValue;
         return;
       case 'selectTextOnFocus':
         if (attributeValue) {
@@ -302,7 +430,12 @@ export class WebValdiTextField extends WebValdiLayout {
 
       // Keyboard & Input
       case 'contentType':
-        this.htmlElement.setAttribute(attributeName, getContentType(attributeValue));
+        // Map Valdi's contentType to HTML <input> attributes. Mirrors the
+        // native binders (iOS SCValdiTextInputSetContentTypeValues, Android
+        // EditTextAttributesBinder.applyContentType) which treat contentType
+        // as authoritative over keyboard, masking, and suggestion behavior —
+        // so this helper sets all the related attrs together.
+        applyContentType(this.htmlElement, attributeValue);
         return;
       case 'keyboardType':
         this.htmlElement.setAttribute('inputmode', attributeValue);
@@ -374,17 +507,52 @@ function applyOpacity(color: string, opacityValue: string): string {
     return color;
 }
 
-function getContentType(type: string) {
-  switch (type) {
-    case 'phoneNumber':
-      return 'tel';
-    case 'email':
-      return 'email';
-    case 'password':
-      return 'password';
-    case 'url':
-      return 'url';
-    default:
-      return 'text';
+type ContentTypeAttrs = {
+  type: string;
+  inputmode?: string;
+  pattern?: string;
+  autocomplete?: string;
+  autocorrect?: string;
+  spellcheck?: string;
+};
+
+// Mirrors the cross-platform contentType → input traits mapping used by the
+// iOS (SCValdiTextInputSetContentTypeValues) and Android
+// (EditTextAttributesBinder.applyContentType) binders. The native binders
+// rewrite the full set of related traits on every change; we follow suit so
+// stale state from a prior contentType can't leak through.
+const CONTENT_TYPE_ATTRS: Record<string, ContentTypeAttrs> = {
+  default: { type: 'text' },
+  phoneNumber: { type: 'tel' },
+  email: { type: 'email' },
+  password: { type: 'password' },
+  passwordNumber: { type: 'password', inputmode: 'numeric', pattern: '[0-9]*' },
+  passwordVisible: { type: 'text', autocomplete: 'off' },
+  url: { type: 'url' },
+  number: { type: 'text', inputmode: 'numeric', pattern: '[0-9]*' },
+  numberDecimal: { type: 'text', inputmode: 'decimal' },
+  // Mirrors iOS UIKeyboardTypeNumbersAndPunctuation — full keyboard so the
+  // minus key is reachable. inputmode=decimal hides minus on iOS.
+  numberDecimalSigned: { type: 'text', inputmode: 'text', pattern: '-?[0-9]*[.,]?[0-9]*' },
+  noSuggestions: { type: 'text', autocomplete: 'off', autocorrect: 'off', spellcheck: 'false' },
+};
+
+const CONTENT_TYPE_SECONDARY_ATTRS = ['inputmode', 'pattern', 'autocomplete', 'autocorrect', 'spellcheck'] as const;
+
+function setOrRemoveAttr(element: HTMLElement, name: string, value: string | undefined): void {
+  if (value === undefined) {
+    if (element.hasAttribute(name)) {
+      element.removeAttribute(name);
+    }
+  } else if (element.getAttribute(name) !== value) {
+    element.setAttribute(name, value);
+  }
+}
+
+function applyContentType(element: HTMLElement, type: string): void {
+  const attrs = CONTENT_TYPE_ATTRS[type] ?? CONTENT_TYPE_ATTRS.default;
+  setOrRemoveAttr(element, 'type', attrs.type);
+  for (const name of CONTENT_TYPE_SECONDARY_ATTRS) {
+    setOrRemoveAttr(element, name, attrs[name]);
   }
 }

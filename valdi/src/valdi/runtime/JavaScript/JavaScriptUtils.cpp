@@ -30,11 +30,13 @@
 #include "valdi_core/cpp/Utils/StaticString.hpp"
 #include "valdi_core/cpp/Utils/StringCache.hpp"
 #include "valdi_core/cpp/Utils/Trace.hpp"
+#include "valdi_core/cpp/Utils/Value.hpp"
 #include "valdi_core/cpp/Utils/ValueArray.hpp"
 #include "valdi_core/cpp/Utils/ValueFunction.hpp"
 #include "valdi_core/cpp/Utils/ValueTypedObject.hpp"
 #include "valdi_core/cpp/Utils/ValueTypedProxyObject.hpp"
 #include <atomic>
+#include <fmt/format.h>
 #include <sstream>
 
 namespace Valdi {
@@ -64,7 +66,15 @@ Error convertJSErrorToValdiError(IJavaScriptContext& jsContext, JSValueRef jsVal
     exceptionTracker.clearError();
 
     if (messageString.isEmpty()) {
-        messageString = STRING_LITERAL("Unable to build exception message");
+        // A masked message hides the real failure at crash-group scale (PREVIEW-31681 family).
+        // String(value) covers thrown primitives and objects whose 'message' getter throws.
+        messageString = jsContext.valueToString(jsValue.get(), exceptionTracker);
+        exceptionTracker.clearError();
+    }
+
+    if (messageString.isEmpty()) {
+        messageString = STRING_FORMAT("Unable to build exception message (thrown value type: {})",
+                                      valueTypeToString(jsContext.getValueType(jsValue.get())));
     }
 
     return Error(std::move(messageString), std::move(stackString), cause);
@@ -76,11 +86,22 @@ JSValueRef convertValdiErrorToJSError(IJavaScriptContext& jsContext,
     auto flattenedError = error.flatten();
     JSValueRef jsError;
     if (flattenedError.getStack().isEmpty()) {
-        return jsContext.newError(flattenedError.getMessage().toStringView(), std::nullopt, exceptionTracker);
+        jsError = jsContext.newError(flattenedError.getMessage().toStringView(), std::nullopt, exceptionTracker);
     } else {
-        return jsContext.newError(
+        jsError = jsContext.newError(
             flattenedError.getMessage().toStringView(), {flattenedError.getStack().toStringView()}, exceptionTracker);
     }
+
+    // Carry the error code onto the JS error so consumers can branch on it instead of matching the
+    // message — kPromiseCanceledErrorCode is what lets JS tell an intentional cancellation apart
+    // from a genuine failure. Only stamped when set, to keep ordinary errors unchanged.
+    const auto errorCode = flattenedError.getErrorCode();
+    if (errorCode != 0 && exceptionTracker) {
+        jsContext.setObjectProperty(
+            jsError.get(), std::string_view("code"), jsContext.newNumber(errorCode).get(), exceptionTracker);
+    }
+
+    return jsError;
 }
 
 Ref<ValdiObject> jsValueToValdiObject(IJavaScriptContext& jsContext,
@@ -133,7 +154,15 @@ Ref<RefCountable> unwrapWrappedObject(IJavaScriptContext& jsContext,
 
 std::optional<JSValue> unwrapJSValueIfNeeded(IJavaScriptContext& jsContext,
                                              RefCountable* object,
+                                             JSValueForNativeObjectResolver* nativeObjectResolver,
                                              JSExceptionTracker& exceptionTracker) {
+    if (nativeObjectResolver != nullptr) {
+        auto resolvedValue = nativeObjectResolver->getJSValueForNativeObject(object);
+        if (resolvedValue) {
+            return resolvedValue;
+        }
+    }
+
     auto* wrappedJsValue = dynamic_cast<JSValueRefHolder*>(object);
     if (wrappedJsValue == nullptr) {
         return std::nullopt;
@@ -149,7 +178,7 @@ std::optional<JSValue> unwrapJSValueIfNeeded(IJavaScriptContext& jsContext,
 JSValueRef valdiObjectToJSValue(IJavaScriptContext& jsContext,
                                 const Ref<ValdiObject>& valdiObject,
                                 JSExceptionTracker& exceptionTracker) {
-    auto jsValue = unwrapJSValueIfNeeded(jsContext, valdiObject.get(), exceptionTracker);
+    auto jsValue = unwrapJSValueIfNeeded(jsContext, valdiObject.get(), nullptr, exceptionTracker);
     if (!jsValue || !exceptionTracker) {
         return jsContext.newUndefined();
     }
@@ -221,30 +250,16 @@ JSValueRef proxyObjectToJSValue(IJavaScriptContext& jsContext,
     }
 }
 
-static JSValueRef staticStringTOJSValue(IJavaScriptContext& jsContext,
-                                        const StaticString& staticString,
-                                        JSExceptionTracker& exceptionTracker) {
-    switch (staticString.encoding()) {
-        case StaticString::Encoding::UTF8:
-            return jsContext.newStringUTF8(staticString.utf8StringView(), exceptionTracker);
-        case StaticString::Encoding::UTF16:
-            return jsContext.newStringUTF16(staticString.utf16StringView(), exceptionTracker);
-        case StaticString::Encoding::UTF32: {
-            auto storage = staticString.utf8Storage();
-            return jsContext.newStringUTF8(storage.toStringView(), exceptionTracker);
-        }
-    }
-}
-
 JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
                           const Valdi::Value& value,
+                          JSValueForNativeObjectResolver* nativeObjectResolver,
                           const ReferenceInfoBuilder& referenceInfoBuilder,
                           JSExceptionTracker& exceptionTracker) {
     switch (value.getType()) {
         case ValueType::InternedString:
             return jsContext.newStringUTF8(value.toStringBox().toStringView(), exceptionTracker);
         case ValueType::StaticString:
-            return staticStringTOJSValue(jsContext, *value.getStaticString(), exceptionTracker);
+            return jsContext.newString(*value.getStaticString(), exceptionTracker);
         case ValueType::Double:
             return jsContext.newNumber(value.toDouble());
         case ValueType::Int:
@@ -263,7 +278,8 @@ JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
             return proxyObjectToJSValue(
                 jsContext, value.getTypedProxyObjectRef(), referenceInfoBuilder, exceptionTracker);
         case ValueType::ValdiObject: {
-            auto jsValue = unwrapJSValueIfNeeded(jsContext, value.getValdiObject().get(), exceptionTracker);
+            auto jsValue =
+                unwrapJSValueIfNeeded(jsContext, value.getValdiObject().get(), nativeObjectResolver, exceptionTracker);
             if (!exceptionTracker) {
                 return jsContext.newUndefined();
             }
@@ -283,8 +299,11 @@ JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
             }
 
             for (const auto& it : map) {
-                auto value =
-                    valueToJSValue(jsContext, it.second, referenceInfoBuilder.withProperty(it.first), exceptionTracker);
+                auto value = valueToJSValue(jsContext,
+                                            it.second,
+                                            nativeObjectResolver,
+                                            referenceInfoBuilder.withProperty(it.first),
+                                            exceptionTracker);
                 if (!exceptionTracker) {
                     return jsContext.newUndefined();
                 }
@@ -307,8 +326,8 @@ JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
 
             size_t i = 0;
             for (const auto& item : array) {
-                auto itemResult =
-                    valueToJSValue(jsContext, item, referenceInfoBuilder.withArrayIndex(i), exceptionTracker);
+                auto itemResult = valueToJSValue(
+                    jsContext, item, nativeObjectResolver, referenceInfoBuilder.withArrayIndex(i), exceptionTracker);
                 if (!exceptionTracker) {
                     return jsContext.newUndefined();
                 }
@@ -333,7 +352,7 @@ JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
         case ValueType::Function: {
             auto func = value.getFunctionRef();
 
-            auto jsValue = unwrapJSValueIfNeeded(jsContext, func.get(), exceptionTracker);
+            auto jsValue = unwrapJSValueIfNeeded(jsContext, func.get(), nullptr, exceptionTracker);
             if (!exceptionTracker) {
                 return jsContext.newUndefined();
             }
@@ -349,6 +368,13 @@ JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
         }
     }
     SC_ASSERT_FAIL("This should not happen");
+}
+
+JSValueRef valueToJSValue(IJavaScriptContext& jsContext,
+                          const Valdi::Value& value,
+                          const ReferenceInfoBuilder& referenceInfoBuilder,
+                          JSExceptionTracker& exceptionTracker) {
+    return valueToJSValue(jsContext, value, nullptr, referenceInfoBuilder, exceptionTracker);
 }
 
 StringBox nameFromJSFunction(IJavaScriptContext& jsContext, const JSValue& jsValue) {
@@ -405,12 +431,6 @@ struct ObjectConvertVisitor : public IJavaScriptPropertyNamesVisitor {
                            const JSPropertyName& propertyName,
                            JSExceptionTracker& exceptionTracker) override {
         auto propertyValueResult = context.getObjectProperty(object, propertyName, exceptionTracker);
-        if (!exceptionTracker) {
-            return false;
-        }
-
-        auto convertedProperty =
-            jsValueToValue(context, propertyValueResult.get(), referenceInfoBuilder, exceptionTracker);
         if (!exceptionTracker) {
             return false;
         }
@@ -573,8 +593,8 @@ Ref<ValueTypedArray> jsTypedArrayToValueTypedArray(IJavaScriptContext& jsContext
 
     if (source == nullptr) {
         if (jsContext.getTaskScheduler() != nullptr) {
-            // Schedule an unattributed task, so that we can retain the js array using the global native refs
-            jsContext.getTaskScheduler()->dispatchOnJsThreadSync(nullptr, [&](auto& jsEntry) {
+            constexpr auto reason = JsThreadDispatchReason::TypedArrayConversion;
+            jsContext.getTaskScheduler()->dispatchOnJsThreadSync(reason, [&](auto& jsEntry) {
                 source = jsValueToValdiObject(
                     jsEntry.jsContext, result.arrayBuffer.get(), referenceInfoBuilder, exceptionTracker);
             });
@@ -592,7 +612,8 @@ JSValueRef newTypedArrayFromBytesView(IJavaScriptContext& jsContext,
                                       const BytesView& bytesView,
                                       JSExceptionTracker& exceptionTracker) {
     JSValueRef arrayBuffer;
-    auto unwrappedArrayBuffer = unwrapJSValueIfNeeded(jsContext, bytesView.getSource().get(), exceptionTracker);
+    auto unwrappedArrayBuffer =
+        unwrapJSValueIfNeeded(jsContext, bytesView.getSource().get(), nullptr, exceptionTracker);
 
     if (unwrappedArrayBuffer) {
         arrayBuffer = JSValueRef::makeRetained(jsContext, unwrappedArrayBuffer.value());

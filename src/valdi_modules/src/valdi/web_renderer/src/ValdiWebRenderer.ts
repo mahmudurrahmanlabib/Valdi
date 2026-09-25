@@ -1,31 +1,33 @@
-import { RequireFunc } from 'valdi_core/src/IModuleLoader';
-declare const require: RequireFunc;
+import { Renderer } from 'valdi_core/src/Renderer';
+import { UpdateAttributeDelegate, ValdiWebRendererDelegate } from './ValdiWebRendererDelegate';
+import { WebDebuggerBridge } from './debug/WebDebuggerBridge';
+import { isValdiWebTracingEnabled } from './tracing/ValdiWebTracing';
+import { configureValdiWebTracingFromLocation } from './tracing/WebTracingConfiguration';
 
-// Require this to get the globals to run and setup env
+declare const require: (id: string) => any;
+
+// Bootstrap the runtime (sets up globals, moduleLoader, etc.)
 require('./ValdiWebRuntime');
 
-declare const moduleLoader: any;
-
-var customRequire = moduleLoader.resolveRequire('web_renderer/src/ValdiWebRenderer.ts');
-
-
-const { Renderer } = customRequire('valdi_core/src/Renderer');
-const rendererDelegate = customRequire('./ValdiWebRendererDelegate');
-type UpdateAttributeDelegate = typeof rendererDelegate.UpdateAttributeDelegate;
-type ValdiWebRendererDelegateType = typeof rendererDelegate.ValdiWebRendererDelegate;
-const ValdiWebRendererDelegate = rendererDelegate.ValdiWebRendererDelegate;
-
-
 export class ValdiWebRenderer extends Renderer implements UpdateAttributeDelegate {
-  delegate: ValdiWebRendererDelegateType;
+  delegate: InstanceType<typeof ValdiWebRendererDelegate>;
+  private readonly debuggerBridge: WebDebuggerBridge;
 
-  constructor(private htmlRoot: HTMLElement) {
+  constructor(htmlRoot: HTMLElement | ShadowRoot) {
+    configureValdiWebTracingFromLocation(typeof window === 'undefined' ? undefined : window.location?.search);
     const delegate = new ValdiWebRendererDelegate(htmlRoot);
-    super('valdi-web-renderer', ['view', 'label', 'layout', 'scroll', 'image', 'textfield'], delegate);
+    super('valdi-web-renderer', ['view', 'label', 'layout', 'scroll', 'image', 'textfield', 'textview', 'spinner', 'custom-view', 'video', 'shape'], delegate);
+    this.setTracingEnabled(isValdiWebTracingEnabled());
     delegate.setAttributeDelegate(this);
     this.delegate = delegate;
+    this.debuggerBridge = new WebDebuggerBridge(htmlRoot, delegate, this);
   }
   updateAttribute(elementId: number, attributeName: string, attributeValue: any) {
     super.attributeUpdatedExternally(elementId, attributeName, attributeValue);
+  }
+
+  destroy() {
+    this.debuggerBridge.destroy();
+    this.delegate.onDestroyed();
   }
 }

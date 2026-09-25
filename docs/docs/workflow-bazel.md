@@ -36,16 +36,24 @@ bazel build //src/valdi_modules/src/valdi/jasmine --platforms=//bzl/platforms:io
 
 ## Maintaining `BUILD.bazel` files
 
-To ease the burden of writing and maintainting `BUILD.bazel` Valdi provides a script to automatically generate/update/format `BUILD.bazel` files based on `module.yaml` content. In addition to that, the CI infrastructure includes a pre-cool hook to validate `BUILD.bazel` files.
+A Valdi module is configured entirely through the `valdi_module(...)` call in its `BUILD.bazel`. Edit that file directly to change module configuration.
 
-To add a new dependency:
+To add a new dependency, add the module's Bazel label to the `deps` attribute of the `valdi_module()` call in `BUILD.bazel`. For example:
 
-1. Update `module.yaml`
-2. Run the script:
-
-```sh
-./scripts/regenerate_valdi_modules_build_bazel_files.sh
+```python
+valdi_module(
+    name = "my_module",
+    srcs = glob(["src/**/*.ts", "src/**/*.tsx"]),
+    deps = [
+        "@valdi//src/valdi_modules/src/valdi/valdi_core",
+        "//src/valdi_modules/src/valdi/some_other_valdi_module",
+    ],
+)
 ```
+
+See [Core Module](./core-module.md#buildbazel) for the full list of `valdi_module()` attributes.
+
+> **Note:** Older Valdi projects may have a `module.yaml` file alongside `BUILD.bazel`. `module.yaml` is deprecated; all module configuration belongs in the `valdi_module()` rule. See [glossary](./glossary.md#moduleyaml).
 
 ## Testing
 
@@ -54,6 +62,49 @@ You can run your tests using `bazel test` directly. See documentation about it h
 ## Linting
 
 Once implemented, users will be able to run linting for a single module using Bazel.
+
+## Rebuilding the compiler and companion
+
+By default, Bazel uses the **prebuilt compiler** and builds the **companion from source** (the companion is the JS/TS app in `compiler/companion`). To use your own builds so they are not overwritten by prebuilts:
+
+### Using a locally built compiler
+
+
+1. Build the Valdi compiler and place the binary where the toolchain can find it:
+   ```sh
+   compiler/compiler/scripts/update_compiler_bazel.sh -o compiler/compiler/out
+   ```
+   This produces `compiler/compiler/out/macos/valdi_compiler` (or `out/linux/valdi_compiler` on Linux). The compiler is built with Bazel (`//compiler/compiler:local_valdi_compiler`), so no Swift toolchain install is required. The script works in both the mirrored public repo and the mobile monorepo.
+
+2. Build Valdi modules with the local compiler:
+   ```sh
+   bazel build //src/valdi_modules/src/valdi/jasmine --//bzl/valdi:use_local_compiler=true
+   ```
+
+The `out/` directory is gitignored so your local binary is never committed.
+
+> [!TIP]
+> To confirm the local binary is being picked up, check the Bazel worker log after the first build:
+> ```sh
+> cat "$(ls ~/.cache/bazel/*/bazel-workers/worker-*-ValdiCompile.log 2>/dev/null | head -1)"
+> ```
+> The first line should read `[local-compiler] valdi compiler (local build) starting` (or whatever marker you added). The worker log path is also printed by Bazel when `--worker_verbose` is passed.
+
+### Using a locally built companion
+
+The toolchain already uses the **source-built companion** by default (`use_prebuilt_companion` is false), so the companion is built from `compiler/companion` (e.g. webpack output). To avoid Bazel overwriting your npm-built companion output:
+
+1. Build the companion in dev mode (writes to `dist_dev/` instead of `dist/`):
+   ```sh
+   cd compiler/companion && npm run build-dev
+   ```
+
+2. Build or run Valdi with the dev-mode companion:
+   ```sh
+   bazel build //src/valdi_modules/src/valdi/jasmine --//compiler/companion:dev_mode=true
+   ```
+
+Bazel will use `dist_dev/bundle.js` and will not overwrite your `dist/` folder.
 
 ## Known issues and limitations
 

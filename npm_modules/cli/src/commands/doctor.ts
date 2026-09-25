@@ -39,15 +39,21 @@ import path from 'path';
 import type { Argv } from 'yargs';
 import { ANSI_COLORS } from '../core/constants';
 
-import { ANDROID_NDK_VERSION, ANDROID_PLATFORM_VERSION } from '../setup/versions';
 import type { ArgumentsResolver } from '../utils/ArgumentsResolver';
 import { BazelClient } from '../utils/BazelClient';
 import { checkCommandExists, runCliCommand } from '../utils/cliUtils';
 import { makeCommandHandler } from '../utils/errorUtils';
+import {
+  type LinuxDistroInfo,
+  buildInstallCommand,
+  detectLinuxDistro,
+  getCommonPackageMappings,
+  getPackageName,
+} from '../utils/linuxDistro';
 import { wrapInColor } from '../utils/logUtils';
 
-/** Discord support link for troubleshooting */
-const DISCORD_SUPPORT_URL = 'https://discord.gg/uJyNEeYX2U';
+/** GitHub Discussions link for troubleshooting help */
+const SUPPORT_URL = 'https://github.com/Snapchat/Valdi/discussions';
 
 /**
  * Command line parameters for the doctor command.
@@ -61,7 +67,7 @@ interface CommandParameters {
   fix: boolean;
   /** Output results in JSON format for machine processing */
   json: boolean;
-  /** Include framework development checks (git-lfs, temurin, etc.) */
+  /** Include framework development checks (temurin, etc.) */
   framework: boolean;
   /** Include project-specific checks (workspace structure, etc.) */
   project: boolean;
@@ -114,11 +120,11 @@ interface GroupedDiagnosticResult {
  * is properly configured for Valdi development. It validates:
  * - Node.js version compatibility (≥18.0.0)
  * - Bazel build system installation and functionality (with version validation)
- * - Java JDK installation (Java 17+ recommended)
+ * - Java JDK installation (Java 17+ required)
  * - Platform-specific development tools (Android SDK, Xcode)
  * - Required development dependencies (git, npm, watchman, ios-webkit-debug-proxy)
  * - Optional project-specific checks (workspace structure)
- * - Optional framework development tools (git-lfs, temurin)
+ * - Optional framework development tools (temurin)
  *
  * @class ValdiDoctor
  */
@@ -141,6 +147,9 @@ class ValdiDoctor {
   /** Whether to include project-specific checks */
   private readonly projectMode: boolean;
 
+  /** Cached Linux distribution info (only on Linux) */
+  private readonly linuxDistro?: LinuxDistroInfo;
+
   /**
    * Creates a new ValdiDoctor instance.
    *
@@ -156,6 +165,11 @@ class ValdiDoctor {
     this.jsonOutput = jsonOutput;
     this.frameworkMode = frameworkMode;
     this.projectMode = projectMode;
+
+    // Detect Linux distribution if on Linux
+    if (os.platform() === 'linux') {
+      this.linuxDistro = detectLinuxDistro();
+    }
   }
 
   /**
@@ -164,7 +178,7 @@ class ValdiDoctor {
    * **App Development Mode (default):**
    * - Essential tools for building Valdi applications
    * - Node.js, Bazel (with version validation)
-   * - Basic Android SDK and Java setup (Java 17+ recommended)
+   * - Basic Android SDK and Java setup (Java 17+ required)
    * - Core development tools (git, npm, watchman, ios-webkit-debug-proxy)
    *
    * **Project Mode (--project flag):**
@@ -173,7 +187,7 @@ class ValdiDoctor {
    *
    * **Framework Development Mode (--framework flag):**
    * - All app development checks plus
-   * - Advanced development tools (git-lfs, temurin)
+   * - Advanced development tools (temurin)
    * - Detailed environment variable validation
    * - Platform-specific development packages
    *
@@ -215,15 +229,15 @@ class ValdiDoctor {
     // Java for Android development
     await this.checkJavaInstallation();
 
-    // Android SDK basics
-    this.checkAndroidSDKBasics();
-
     // Core development dependencies
     await this.checkCoreDependencies();
 
+    // Shell autocomplete configuration
+    this.checkShellAutoComplete();
+
     // Framework-specific checks (only if requested)
     if (this.frameworkMode) {
-      await this.checkFrameworkDependencies();
+      this.checkFrameworkDependencies();
       this.checkAdvancedAndroidSDK();
       this.checkEnvironmentVariables();
     }
@@ -575,59 +589,128 @@ class ValdiDoctor {
    * @private
    */
   private async checkEssentialPlatformTools(): Promise<void> {
-    // Check Android SDK (essential for mobile app development)
-    const androidHome = process.env['ANDROID_HOME'] || process.env['ANDROID_SDK_ROOT'];
-    if (androidHome && fs.existsSync(androidHome)) {
-      this.addResult({
-        name: 'Android SDK',
-        status: 'pass',
-        message: `Android SDK found at ${androidHome}`,
-        category: 'Android installation',
-      });
+    // Android SDK, NDK, and build tools are downloaded hermetically by Bazel
+    this.addResult({
+      name: 'Android SDK',
+      status: 'pass',
+      message: 'Android SDK, NDK, and build tools are managed hermetically by Bazel',
+      details: 'See bzl/hermetic_android_sdk.bzl and bzl/hermetic_ndk.bzl',
+      category: 'Android installation',
+    });
+
+    // adb is still needed locally for device interaction (push, logcat, etc.)
+    if (checkCommandExists('adb')) {
+      try {
+        const { stdout } = await runCliCommand('adb --version');
+        const versionLine = stdout.split('\n')[0] || 'Unknown version';
+        this.addResult({
+          name: 'adb (Android Debug Bridge)',
+          status: 'pass',
+          message: `adb is installed: ${versionLine}`,
+          category: 'Android installation',
+        });
+      } catch {
+        this.addResult({
+          name: 'adb (Android Debug Bridge)',
+          status: 'pass',
+          message: 'adb is installed',
+          category: 'Android installation',
+        });
+      }
     } else {
+      const fixCommand = this.getFixCommandForDependency('adb');
       this.addResult({
-        name: 'Android SDK',
+        name: 'adb (Android Debug Bridge)',
         status: 'warn',
-        message: 'Android SDK not found',
-        details: 'Required for Android app development. Set ANDROID_HOME environment variable.',
+        message: 'adb is not installed — needed for device interaction (push, logcat, etc.)',
         fixable: true,
-        fixCommand: 'Install Android Studio and set ANDROID_HOME',
+        fixCommand,
         category: 'Android installation',
       });
     }
 
     // Check Xcode (macOS only, essential for iOS app development)
     if (os.platform() === 'darwin') {
-      if (checkCommandExists('xcode-select')) {
-        try {
-          const { stdout } = await runCliCommand('xcode-select -p');
-          this.addResult({
-            name: 'Xcode',
-            status: 'pass',
-            message: `Xcode found at ${stdout.trim()}`,
-            category: 'iOS development',
-          });
-        } catch {
-          this.addResult({
-            name: 'Xcode',
-            status: 'warn',
-            message: 'Xcode not properly configured',
-            fixable: true,
-            fixCommand: 'xcode-select --install',
-            category: 'iOS development',
-          });
-        }
-      } else {
+      await this.checkXcodeInstallation();
+    }
+  }
+
+  /**
+   * Validates comprehensive Xcode installation and configuration.
+   *
+   * Performs thorough checks matching dev_setup requirements:
+   * - xcode-select command exists
+   * - xcode-select path is configured and valid
+   * - /Applications/Xcode.app exists
+   *
+   * @returns Promise that resolves when Xcode checks are complete
+   * @private
+   */
+  private async checkXcodeInstallation(): Promise<void> {
+    // Check if xcode-select command exists
+    if (!checkCommandExists('xcode-select')) {
+      this.addResult({
+        name: 'Xcode',
+        status: 'fail',
+        message: 'Xcode command line tools not installed',
+        details: 'Required for iOS app development',
+        fixable: true,
+        fixCommand: 'Install Xcode from App Store (https://apps.apple.com/us/app/xcode/id497799835)',
+        category: 'iOS development',
+      });
+      return;
+    }
+
+    // Check if Xcode is properly configured
+    try {
+      const { stdout } = await runCliCommand('xcode-select -p');
+      const xcodePath = stdout.trim();
+
+      if (!xcodePath || !fs.existsSync(xcodePath)) {
+        this.addResult({
+          name: 'Xcode configuration',
+          status: 'fail',
+          message: 'Xcode command line tools path is not configured correctly',
+          fixable: true,
+          fixCommand: 'Run: sudo xcode-select -s /Applications/Xcode.app (or your Xcode path)',
+          category: 'iOS development',
+        });
+        return;
+      }
+
+      // Extract Xcode.app path from the Developer path
+      // xcode-select -p typically returns: /Applications/Xcode.app/Contents/Developer
+      const xcodeAppPath = xcodePath.replace(/\/Contents\/Developer\/?$/, '');
+      
+      if (fs.existsSync(xcodeAppPath) && xcodeAppPath.includes('Xcode')) {
+        // Xcode is installed and configured
         this.addResult({
           name: 'Xcode',
-          status: 'warn',
-          message: 'Xcode command line tools not installed',
-          details: 'Required for iOS app development',
+          status: 'pass',
+          message: `Xcode found at ${xcodeAppPath}`,
+          category: 'iOS development',
+        });
+      } else {
+        // Path doesn't point to an Xcode installation
+        this.addResult({
+          name: 'Xcode',
+          status: 'fail',
+          message: 'Xcode installation not found',
+          details: `xcode-select points to ${xcodePath}, but Xcode app not found at ${xcodeAppPath}`,
           fixable: true,
-          fixCommand: 'Install Xcode from App Store and run: xcode-select --install',
+          fixCommand: 'Install Xcode from App Store (https://apps.apple.com/us/app/xcode/id497799835)',
           category: 'iOS development',
         });
       }
+    } catch {
+      this.addResult({
+        name: 'Xcode',
+        status: 'fail',
+        message: 'Xcode not properly configured',
+        fixable: true,
+        fixCommand: 'Run: sudo xcode-select -s /Applications/Xcode.app (or your Xcode path)',
+        category: 'iOS development',
+      });
     }
   }
 
@@ -679,11 +762,11 @@ class ValdiDoctor {
         } else if (majorVersion > 0) {
           this.addResult({
             name: 'Java Runtime',
-            status: 'warn',
-            message: `Java ${version} is outdated. Java 17+ is recommended`,
-            details: 'dev_setup now installs Java 17 for better compatibility',
+            status: 'fail',
+            message: `Java ${version} is outdated. Java 17+ is required`,
+            details: 'dev_setup installs Java 17 for Android development',
             fixable: true,
-            fixCommand: os.platform() === 'darwin' ? 'brew install openjdk@17' : 'sudo apt install openjdk-17-jdk',
+            fixCommand: this.getJavaInstallCommand(),
             category: 'Java installation',
           });
         } else {
@@ -711,7 +794,7 @@ class ValdiDoctor {
         message: 'Java not found in PATH',
         details: 'dev_setup installs Java JDK for Android development',
         fixable: true,
-        fixCommand: os.platform() === 'darwin' ? 'brew install openjdk@17' : 'sudo apt install openjdk-17-jdk',
+        fixCommand: this.getJavaInstallCommand(),
         category: 'Java installation',
       });
     }
@@ -740,11 +823,21 @@ class ValdiDoctor {
     // Check Java tools in PATH
     const pathEnv = process.env['PATH'] || '';
     if (os.platform() === 'darwin') {
-      if (pathEnv.includes('/opt/homebrew/opt/openjdk@17/bin') || pathEnv.includes('/opt/homebrew/opt/openjdk@11/bin')) {
+      if (pathEnv.includes('/opt/homebrew/opt/openjdk@17/bin')) {
         this.addResult({
           name: 'Java PATH',
           status: 'pass',
           message: 'Java tools in PATH',
+          category: 'Java installation',
+        });
+      } else if (pathEnv.includes('/opt/homebrew/opt/openjdk@11/bin')) {
+        this.addResult({
+          name: 'Java PATH',
+          status: 'fail',
+          message: 'Java 11 in PATH, but Java 17 is required',
+          details: 'dev_setup installs Java 17 for Android development',
+          fixable: true,
+          fixCommand: 'export PATH="/opt/homebrew/opt/openjdk@17/bin:$PATH"',
           category: 'Java installation',
         });
       } else {
@@ -776,8 +869,8 @@ class ValdiDoctor {
         this.addResult({
           name: 'Java JDK symlink',
           status: 'warn',
-          message: 'OpenJDK 11 symlink found, but Java 17+ is recommended',
-          details: 'dev_setup now installs Java 17 for better compatibility',
+          message: 'OpenJDK 11 symlink found, but Java 17 is required',
+          details: 'dev_setup installs Java 17',
           fixable: true,
           fixCommand: 'sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-17.jdk',
           category: 'Java installation',
@@ -797,97 +890,6 @@ class ValdiDoctor {
   }
 
 
-
-  /**
-   * Validates basic Android SDK components needed for app development.
-   *
-   * Checks essential Android SDK components without overwhelming users:
-   * - Android Platform (latest)
-   * - Build Tools (basic check)
-   *
-   * @private
-   */
-  private checkAndroidSDKBasics(): void {
-    const androidHome = process.env['ANDROID_HOME'] || process.env['ANDROID_SDK_ROOT'];
-
-    if (!androidHome || !fs.existsSync(androidHome)) {
-      this.addResult({
-        name: 'Android SDK Components',
-        status: 'warn',
-        message: 'Cannot check Android SDK components - ANDROID_HOME not set',
-        details: 'Set ANDROID_HOME environment variable for Android development',
-        fixable: true,
-        fixCommand: 'Install Android Studio and set ANDROID_HOME',
-        category: 'Android installation',
-      });
-      return;
-    }
-
-    // Check for any Android Platform (not specific version)
-    const platformsDir = path.join(androidHome, 'platforms');
-    if (fs.existsSync(platformsDir)) {
-      const platforms = fs.readdirSync(platformsDir).filter(dir => dir.startsWith('android-'));
-      if (platforms.length > 0) {
-        this.addResult({
-          name: 'Android Platform',
-          status: 'pass',
-          message: `Android Platform installed (${platforms.length} version${platforms.length > 1 ? 's' : ''})`,
-          category: 'Android installation',
-        });
-      } else {
-        this.addResult({
-          name: 'Android Platform',
-          status: 'warn',
-          message: 'No Android Platform found',
-          details: 'Install an Android Platform via Android Studio SDK Manager',
-          fixable: true,
-          fixCommand: 'Open Android Studio > SDK Manager > Install an Android Platform',
-          category: 'Android installation',
-        });
-      }
-    } else {
-      this.addResult({
-        name: 'Android Platform',
-        status: 'warn',
-        message: 'Android platforms directory not found',
-        fixable: true,
-        fixCommand: 'Install Android Studio and configure SDK',
-        category: 'Android installation',
-      });
-    }
-
-    // Check for any Build Tools (not specific version)
-    const buildToolsDir = path.join(androidHome, 'build-tools');
-    if (fs.existsSync(buildToolsDir)) {
-      const buildTools = fs.readdirSync(buildToolsDir);
-      if (buildTools.length > 0) {
-        this.addResult({
-          name: 'Android Build Tools',
-          status: 'pass',
-          message: `Android Build Tools installed (${buildTools.length} version${buildTools.length > 1 ? 's' : ''})`,
-          category: 'Android installation',
-        });
-      } else {
-        this.addResult({
-          name: 'Android Build Tools',
-          status: 'warn',
-          message: 'No Android Build Tools found',
-          fixable: true,
-          fixCommand: 'Install Build Tools via Android Studio SDK Manager',
-          category: 'Android installation',
-        });
-      }
-    } else {
-      this.addResult({
-        name: 'Android Build Tools',
-        status: 'warn',
-        message: 'Build tools directory not found',
-        fixable: true,
-        fixCommand: 'Install Android Studio and configure SDK',
-        category: 'Android installation',
-      });
-    }
-  }
 
   /**
    * Validates core development dependencies needed for app development.
@@ -915,22 +917,104 @@ class ValdiDoctor {
   }
 
   /**
+   * Validates shell autocomplete configuration.
+   *
+   * Checks if shell autocomplete (compinit/bashcompinit) is configured.
+   * dev_setup adds these to shell RC files for better CLI experience.
+   *
+   * @private
+   */
+  private checkShellAutoComplete(): void {
+    const homeDir = process.env['HOME'] ?? '';
+    const shell = process.env['SHELL'] ?? '';
+    
+    let rcFile: string | undefined;
+    let requiredLines: string[] = [];
+
+    // Determine shell and required configuration
+    if (shell.endsWith('/zsh')) {
+      rcFile = path.join(homeDir, '.zshrc');
+      requiredLines = ['autoload -U compinit && compinit', 'autoload -U bashcompinit && bashcompinit'];
+    } else if (shell.endsWith('/bash')) {
+      rcFile = path.join(homeDir, '.bashrc');
+      // Bash typically auto-loads completion, so we're more lenient
+      requiredLines = [];
+    } else {
+      // Unknown shell, skip check
+      return;
+    }
+
+    if (!rcFile || !fs.existsSync(rcFile)) {
+      this.addResult({
+        name: 'Shell autocomplete',
+        status: 'warn',
+        message: `Shell configuration file not found (${rcFile || 'unknown'})`,
+        details: 'Shell autocomplete improves CLI experience',
+        category: 'Development tools',
+      });
+      return;
+    }
+
+    // For bash, we just report success since it typically handles completion automatically
+    if (requiredLines.length === 0) {
+      this.addResult({
+        name: 'Shell autocomplete',
+        status: 'pass',
+        message: 'Shell autocomplete configured (bash)',
+        category: 'Development tools',
+      });
+      return;
+    }
+
+    // Read RC file and check for required lines
+    try {
+      const rcContent = fs.readFileSync(rcFile, 'utf8');
+      const rcLines = rcContent.split('\n');
+      
+      const missingLines: string[] = [];
+      for (const required of requiredLines) {
+        if (!rcLines.includes(required)) {
+          missingLines.push(required);
+        }
+      }
+
+      if (missingLines.length === 0) {
+        this.addResult({
+          name: 'Shell autocomplete',
+          status: 'pass',
+          message: 'Shell autocomplete configured',
+          category: 'Development tools',
+        });
+      } else {
+        this.addResult({
+          name: 'Shell autocomplete',
+          status: 'warn',
+          message: 'Shell autocomplete not fully configured',
+          details: `Missing in ${rcFile}: ${missingLines.join(', ')}`,
+          fixable: true,
+          fixCommand: `Add to ${rcFile}: ${missingLines.join(' && ')}`,
+          category: 'Development tools',
+        });
+      }
+    } catch {
+      this.addResult({
+        name: 'Shell autocomplete',
+        status: 'warn',
+        message: 'Could not verify shell autocomplete configuration',
+        category: 'Development tools',
+      });
+    }
+  }
+
+  /**
    * Validates framework development dependencies.
    *
    * Additional tools needed for framework development:
-   * - git-lfs: Large file storage
    * - temurin: Alternative JDK (macOS)
    *
-   * @returns Promise that resolves when framework dependency checks are complete
    * @private
    */
-  private async checkFrameworkDependencies(): Promise<void> {
-    const frameworkDeps = ['git-lfs'];
-
-    for (const dep of frameworkDeps) {
-      await this.checkSingleDependency(dep, 'warn'); // Framework deps are optional
-    }
-
+  private checkFrameworkDependencies(): void {
     // Platform-specific framework dependencies
     if (os.platform() === 'darwin') {
       // Check for temurin package
@@ -960,60 +1044,19 @@ class ValdiDoctor {
    * Validates advanced Android SDK components for framework development.
    *
    * Detailed Android SDK validation including:
-   * - Specific platform versions
-   * - NDK installation
-   * - Command line tools
+   * Android SDK, NDK, and build tools are downloaded hermetically by Bazel.
+   * No local installation is required.
    *
    * @private
    */
   private checkAdvancedAndroidSDK(): void {
-    const androidHome = process.env['ANDROID_HOME'] || process.env['ANDROID_SDK_ROOT'];
-
-    if (!androidHome || !fs.existsSync(androidHome)) {
-      return; // Already checked in basics
-    }
-
-    // Check specific Android Platform version
-    const platformPath = path.join(androidHome, 'platforms', ANDROID_PLATFORM_VERSION);
-    if (fs.existsSync(platformPath)) {
-      this.addResult({
-        name: `Android Platform ${ANDROID_PLATFORM_VERSION}`,
-        status: 'pass',
-        message: `Android Platform ${ANDROID_PLATFORM_VERSION} installed`,
-        category: 'Android installation',
-      });
-    } else {
-      this.addResult({
-        name: `Android Platform ${ANDROID_PLATFORM_VERSION}`,
-        status: 'warn',
-        message: `Android Platform ${ANDROID_PLATFORM_VERSION} not found`,
-        details: 'Specific platform version for framework development',
-        fixable: true,
-        fixCommand: `sdkmanager --install 'platforms;${ANDROID_PLATFORM_VERSION}'`,
-        category: 'Android installation',
-      });
-    }
-
-    // Check Android NDK
-    const ndkPath = path.join(androidHome, 'ndk', ANDROID_NDK_VERSION);
-    if (fs.existsSync(ndkPath)) {
-      this.addResult({
-        name: 'Android NDK',
-        status: 'pass',
-        message: `Android NDK ${ANDROID_NDK_VERSION} installed`,
-        category: 'Android installation',
-      });
-    } else {
-      this.addResult({
-        name: 'Android NDK',
-        status: 'warn',
-        message: `Android NDK ${ANDROID_NDK_VERSION} not found`,
-        details: 'Required for native development in framework',
-        fixable: true,
-        fixCommand: `sdkmanager --install 'ndk;${ANDROID_NDK_VERSION}'`,
-        category: 'Android installation',
-      });
-    }
+    this.addResult({
+      name: 'Android SDK',
+      status: 'pass',
+      message: 'Android SDK, NDK, and build tools are managed hermetically by Bazel',
+      details: 'See bzl/hermetic_android_sdk.bzl and bzl/hermetic_ndk.bzl',
+      category: 'Android installation',
+    });
   }
 
 
@@ -1029,7 +1072,7 @@ class ValdiDoctor {
     let category: string;
     if (['git', 'npm', 'watchman', 'ios_webkit_debug_proxy'].includes(dep)) {
       category = 'Development tools';
-    } else if (['git-lfs', 'temurin'].includes(dep)) {
+    } else if (['temurin'].includes(dep)) {
       category = 'Framework tools';
     } else {
       category = 'Development tools';
@@ -1074,56 +1117,15 @@ class ValdiDoctor {
    * Validates environment variables as configured by dev_setup.
    *
    * Checks for essential environment variables that dev_setup configures:
-   * - ANDROID_HOME: Android SDK location
-   * - ANDROID_NDK_HOME: Android NDK location
    * - JAVA_HOME: Java JDK location
-   * - PATH modifications: Java, Android tools, Bazelisk
+   * - PATH modifications: Java, Bazelisk
+   *
+   * ANDROID_HOME and ANDROID_NDK_HOME are no longer required — Bazel downloads
+   * the SDK and NDK hermetically.
    *
    * @private
    */
   private checkEnvironmentVariables(): void {
-    // Check ANDROID_HOME
-    const androidHome = process.env['ANDROID_HOME'];
-    if (androidHome && fs.existsSync(androidHome)) {
-      this.addResult({
-        name: 'ANDROID_HOME',
-        status: 'pass',
-        message: `ANDROID_HOME set to ${androidHome}`,
-        category: 'Android installation',
-      });
-    } else {
-      this.addResult({
-        name: 'ANDROID_HOME',
-        status: 'fail',
-        message: 'ANDROID_HOME not set or invalid',
-        details: 'dev_setup configures ANDROID_HOME for Android development',
-        fixable: true,
-        fixCommand: 'valdi dev_setup',
-        category: 'Android installation',
-      });
-    }
-
-    // Check ANDROID_NDK_HOME
-    const androidNdkHome = process.env['ANDROID_NDK_HOME'];
-    if (androidNdkHome && fs.existsSync(androidNdkHome)) {
-      this.addResult({
-        name: 'ANDROID_NDK_HOME',
-        status: 'pass',
-        message: `ANDROID_NDK_HOME set to ${androidNdkHome}`,
-        category: 'Android installation',
-      });
-    } else {
-      this.addResult({
-        name: 'ANDROID_NDK_HOME',
-        status: 'warn',
-        message: 'ANDROID_NDK_HOME not set or invalid',
-        details: 'dev_setup configures ANDROID_NDK_HOME for native development',
-        fixable: true,
-        fixCommand: 'valdi dev_setup',
-        category: 'Android installation',
-      });
-    }
-
     // JAVA_HOME is checked in Java installation section to avoid duplication
 
     // Check PATH modifications
@@ -1153,6 +1155,22 @@ class ValdiDoctor {
   }
 
   /**
+   * Gets the appropriate Java installation command for the current platform
+   * @private
+   */
+  private getJavaInstallCommand(): string {
+    if (os.platform() === 'darwin') {
+      return 'brew install openjdk@17';
+    } else if (os.platform() === 'linux' && this.linuxDistro) {
+      const packageMappings = getCommonPackageMappings();
+      const javaPackage = getPackageName(packageMappings['openjdk-17']!, this.linuxDistro);
+      return buildInstallCommand([javaPackage], this.linuxDistro);
+    } else {
+      return 'Install Java 17 JDK for your distribution';
+    }
+  }
+
+  /**
    * Generates platform-specific fix commands for missing dependencies.
    *
    * Provides appropriate installation commands based on the current platform
@@ -1164,30 +1182,75 @@ class ValdiDoctor {
    * @private
    */
   private getFixCommandForDependency(dep: string): string {
-    switch (dep) {
-      case 'git': {
-        return os.platform() === 'darwin' ? 'brew install git' : 'sudo apt-get install git';
+    // macOS-specific dependencies
+    if (os.platform() === 'darwin') {
+      switch (dep) {
+        case 'git': {
+          return 'brew install git';
+        }
+        case 'npm': {
+          return 'Install Node.js from https://nodejs.org (includes npm)';
+        }
+        case 'watchman': {
+          return 'brew install watchman';
+        }
+        case 'bazelisk': {
+          return 'brew install bazelisk';
+        }
+        case 'ios_webkit_debug_proxy': {
+          return 'brew install ios-webkit-debug-proxy';
+        }
+        case 'adb': {
+          return 'brew install android-platform-tools';
+        }
+        default: {
+          return `brew install ${dep}`;
+        }
       }
+    }
+
+    // Linux dependencies with distribution detection
+    if (os.platform() === 'linux' && this.linuxDistro) {
+      const packageMappings = getCommonPackageMappings();
+
+      switch (dep) {
+        case 'git': {
+          return buildInstallCommand(['git'], this.linuxDistro);
+        }
+        case 'npm': {
+          return buildInstallCommand([getPackageName(packageMappings['npm']!, this.linuxDistro)], this.linuxDistro);
+        }
+        case 'watchman': {
+          const watchmanPkg = getPackageName(packageMappings['watchman']!, this.linuxDistro);
+          const cmd = buildInstallCommand([watchmanPkg], this.linuxDistro);
+          // Add note for RHEL-based systems
+          if (this.linuxDistro.packageManager.name === 'yum' || this.linuxDistro.packageManager.name === 'dnf') {
+            return `${cmd} (may require EPEL repository)`;
+          }
+          return cmd;
+        }
+        case 'bazelisk': {
+          return 'valdi dev_setup';
+        }
+        case 'adb': {
+          return buildInstallCommand([getPackageName(packageMappings['adb']!, this.linuxDistro)], this.linuxDistro);
+        }
+        default: {
+          return buildInstallCommand([dep], this.linuxDistro);
+        }
+      }
+    }
+
+    // Fallback for unknown platforms or when distro detection fails
+    switch (dep) {
       case 'npm': {
         return 'Install Node.js from https://nodejs.org (includes npm)';
       }
-      case 'watchman': {
-        return os.platform() === 'darwin' ? 'brew install watchman' : 'sudo apt-get install watchman';
-      }
-      case 'git-lfs': {
-        return os.platform() === 'darwin' ? 'brew install git-lfs' : 'sudo apt-get install git-lfs';
-      }
       case 'bazelisk': {
-        return os.platform() === 'darwin' ? 'brew install bazelisk' : 'valdi dev_setup';
-      }
-      case 'ios_webkit_debug_proxy': {
-        return 'brew install ios-webkit-debug-proxy';
-      }
-      case 'adb': {
-        return 'sudo apt-get install adb';
+        return 'valdi dev_setup';
       }
       default: {
-        return os.platform() === 'darwin' ? `brew install ${dep}` : `Install ${dep}`;
+        return `Install ${dep} using your system's package manager`;
       }
     }
   }
@@ -1308,8 +1371,8 @@ class ValdiDoctor {
       console.log();
       console.log(wrapInColor('Some issues need to be resolved before Valdi can work properly.', ANSI_COLORS.RED_COLOR));
       console.log();
-      console.log(wrapInColor('Still having trouble? Come get help on Discord:', ANSI_COLORS.BLUE_COLOR));
-      console.log(wrapInColor(DISCORD_SUPPORT_URL, ANSI_COLORS.BLUE_COLOR));
+      console.log(wrapInColor('Still having trouble? Ask for help in GitHub Discussions:', ANSI_COLORS.BLUE_COLOR));
+      console.log(wrapInColor(SUPPORT_URL, ANSI_COLORS.BLUE_COLOR));
       console.log(wrapInColor('Please paste the entire output of this command when asking for help.', ANSI_COLORS.YELLOW_COLOR));
     } else if (totalWarnCount > 0) {
       console.log();
@@ -1402,7 +1465,7 @@ export const builder = (yargs: Argv<CommandParameters>): void => {
       alias: 'j',
     })
     .option('framework', {
-      describe: 'Include framework development checks (git-lfs, temurin, etc.)',
+      describe: 'Include framework development checks (temurin, etc.)',
       type: 'boolean',
       default: false,
       alias: 'F',

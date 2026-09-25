@@ -10,6 +10,8 @@ import {
 } from './AST';
 import { ILogger } from './logger/ILogger';
 import { JSXProcessor } from './JSXProcessor';
+import { createConsoleLogTransformer } from './ConsoleLogTransformer';
+import { createWebRequireTransformer } from './WebRequireTransformer';
 import {
   Diagnostic,
   DumpedInterface,
@@ -26,6 +28,7 @@ import { IWorkspace, OpenFileImportPath, OpenFileResult } from './IWorkspace';
 import * as _path from 'path';
 import { ImportPathResolver } from './utils/ImportPathResolver';
 import { debounce } from 'lodash';
+import { VersioningValidator } from './VersioningValidator';
 
 export interface OpenedFile {
   sourceFile: ts.SourceFile;
@@ -118,6 +121,7 @@ export class Workspace implements IWorkspace {
     shouldDebounceOpenFile: boolean,
     readonly logger: ILogger | undefined,
     readonly compilerOptions: ts.CompilerOptions | undefined,
+    readonly nativeApiMinVersion: number | undefined,
   ) {
     this.workspaceRoot = workspaceRoot;
     const project = new Project(workspaceRoot, compilerOptions, logger ? new ProjectListener(logger) : undefined);
@@ -245,6 +249,16 @@ export class Workspace implements IWorkspace {
       );
     }
 
+    // Wrap console.log/warn/error/info/debug calls in runtime.isLoggingEnabled guards.
+    // This is safe in dev builds because runtime.isLoggingEnabled is always true.
+    resolvedCustomTransformers.before!.push(createConsoleLogTransformer());
+
+    // Annotate variable-arg require() calls with /* @valdi-dynamic */ for web.
+    // Runs on all platforms — only adds a comment, no behavior change.
+    // On web: PrependWebJsProcessor converts annotated requires to moduleLoader.load().
+    // On native: minifier strips the comment.
+    resolvedCustomTransformers.before!.push(createWebRequireTransformer());
+
     resolvedCustomTransformers = mergeCustomTransformers(resolvedCustomTransformers, customTransformers);
 
     const output: EmitResult = { entries: [], emitted: false };
@@ -361,6 +375,18 @@ export class Workspace implements IWorkspace {
     return success;
   }
 
+  private validateVersioning(openedFile: OpenedFile, output: Diagnostic[]): boolean {
+    const validator = new VersioningValidator(
+      openedFile.sourceFile,
+      openedFile.workspaceProject.typeChecker,
+      (sourceFile, node, text) => this.makeDiagnostic(sourceFile, node, text),
+      this.nativeApiMinVersion,
+    );
+    const diagnostics = validator.validate();
+    output.push(...diagnostics);
+    return diagnostics.length === 0;
+  }
+
   async getDiagnostics(fileName: string): Promise<GetDiagnosticsResult> {
     return this.getDiagnosticsSync(fileName);
   }
@@ -390,6 +416,15 @@ export class Workspace implements IWorkspace {
 
     if (!fileName.endsWith('.js')) {
       if (!this.doGetDiagnostics(openedFile, false, diagnostics)) {
+        return {
+          diagnostics,
+          fileContent: openedFile.sourceFile.text,
+          hasError: true,
+          timeTakenMs: sw.elapsedMilliseconds,
+        };
+      }
+
+      if (!this.validateVersioning(openedFile, diagnostics)) {
         return {
           diagnostics,
           fileContent: openedFile.sourceFile.text,

@@ -26,11 +26,49 @@ public:
     bool disableSyncCallsInCallingThread() const;
     bool enableTSN() const;
     bool enableTSNForModule(const StringBox& moduleName) const;
-    bool shouldCrashOnANR() const;
     bool disableAnimationRemoveOnCompleteIos() const;
     bool shouldNudgeJSThread() const;
-    bool disablePersistentStoreEncryption() const;
-    bool skipProtoIndex() const;
+    bool enableScopedContextStackTraceCapture() const;
+    bool enableRenderRequestContextFix() const;
+    // Killswitch for the pre-raster quiescence fence in BridgedView::rasterInto.
+    bool disablePreRasterFence() const;
+    // Kill switch for the bridge-function resolution teardown degrade. When true (default), a
+    // native->JS resolution that races runtime teardown is reported with the distinguishable
+    // kResolutionSkippedDuringTeardownErrorCode so a marshalling boundary can degrade to a no-op
+    // instead of raising an uncatchable error. Set false to restore the raising behavior.
+    bool enableResolutionTeardownDegrade() const;
+    // When true (default), teardown drains cooperatively: worker terminate() skips forced execution
+    // termination, and a disposed runtime lets in-flight/queued JS-thread work finish before teardown
+    // (avoids the silent-skip that crashes an in-flight bridge call). Set false for aggressive
+    // termination that stops even frozen JS, at the cost of teardown-race side effects.
+    bool useCooperativeTermination() const;
+    // When true (default), ~JavaScriptRuntime joins the JS thread before destroying members, so an
+    // in-flight JS task can't touch a freed member during teardown. Set false to revert to the prior
+    // behavior (the join becomes a hang if the JS thread is frozen; off trades that back for the
+    // earlier member-order crash).
+    bool joinJsThreadOnTeardown() const;
+    bool applyManagedChildFramePadding() const;
+    bool disableHitTestSyncDeadline() const;
+    // Killswitch for failing deadline-bounded sync JS calls fast while an earlier one is still
+    // overdue (ValueFunctionWithJSValue). Off restores one full deadline wait per call.
+    bool disableSyncDeadlineCircuitBreaker() const;
+    // True when VALDI_MAX_VIEW_OPERATIONS_PROCESSING_TIME > 0 (throttling enabled). Gates top-down move order in TS.
+    bool useTopDownMoveOrder() const;
+    bool enableMmapModuleArchives() const;
+    // True when the module matches an entry in VALDI_MMAP_MODULE_ARCHIVES_DENYLIST
+    // (comma-separated). Each entry is a prefix; a trailing '$' anchors it to an
+    // exact module name ("camera$" pins only "camera", not "camera_control_center").
+    // Denylisted modules keep heap-backed archives even when
+    // enableMmapModuleArchives() is on — on swapless iOS that de-facto pins them,
+    // trading back their share of the memory win to avoid refault latency on
+    // bursty surfaces.
+    bool isMmapModuleArchiveDenylisted(const StringBox& modulePath) const;
+    bool enableANRDiagnostics() const;
+    bool enableFixFlexBasisFitContent() const;
+    // Number of modules ModuleLoader.preloadBatch evaluates per JS-scheduler task before yielding.
+    // 0 (default) keeps preload as a single uninterrupted task. > 0 bounds the max contiguous JS
+    // occupancy during capture-start preload so the 5s Composer watchdog ack can run. Read via getInt.
+    int32_t preloadYieldChunkSize() const;
 
 private:
     Shared<ITweakValueProvider> _tweakValueProvider;

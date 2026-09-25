@@ -9,6 +9,7 @@
 #include "valdi/runtime/Attributes/AttributeHandler.hpp"
 #include "valdi/runtime/Attributes/AttributesManager.hpp"
 #include "valdi/runtime/Attributes/BoundAttributes.hpp"
+#include "valdi/runtime/Attributes/ValueConverters.hpp"
 #include "valdi/runtime/Attributes/ViewNodeAttribute.hpp"
 #include "valdi/runtime/Context/ViewNode.hpp"
 
@@ -29,6 +30,9 @@ bool ViewNodeAttributesApplier::setAttribute(ViewTransactionScope& viewTransacti
                                              const Value& value,
                                              const Ref<Animator>& animator) {
     if (_viewNode == nullptr) {
+        return false;
+    }
+    if (_viewNode->getViewFactory() == nullptr) {
         return false;
     }
 
@@ -102,6 +106,10 @@ void ViewNodeAttributesApplier::reapplyAttribute(ViewTransactionScope& viewTrans
     } else {
         updateAttribute(viewTransactionScope, id, *attribute, nullptr, /* justAddedView */ false);
     }
+}
+
+void ViewNodeAttributesApplier::invalidateColorAttributes() {
+    _colorAttributesInvalidated = true;
 }
 
 bool ViewNodeAttributesApplier::removeAllAttributesForOwner(ViewTransactionScope& viewTransactionScope,
@@ -178,9 +186,35 @@ void ViewNodeAttributesApplier::processAttributeChange(ViewTransactionScope& vie
     }
 
     if (id == DefaultAttributeTranslationX) {
-        _viewNode->setTranslationX(attribute.getResolvedValue().toFloat());
+        auto value = attribute.getResolvedValue();
+        if (value.isNullOrUndefined()) {
+            _viewNode->setTranslationX(0, false);
+        } else {
+            auto translation = ValueConverter::toPercent(value);
+            if (!translation) {
+                onApplyAttributeFailed(id, translation.error());
+                return;
+            }
+            _viewNode->setTranslationX(static_cast<float>(translation.value().value), translation.value().isPercent);
+        }
     } else if (id == DefaultAttributeTranslationY) {
-        _viewNode->setTranslationY(attribute.getResolvedValue().toFloat());
+        auto value = attribute.getResolvedValue();
+        if (value.isNullOrUndefined()) {
+            _viewNode->setTranslationY(0, false);
+        } else {
+            auto translation = ValueConverter::toPercent(value);
+            if (!translation) {
+                onApplyAttributeFailed(id, translation.error());
+                return;
+            }
+            _viewNode->setTranslationY(static_cast<float>(translation.value().value), translation.value().isPercent);
+        }
+    } else if (id == DefaultAttributeScaleX) {
+        auto value = attribute.getResolvedValue();
+        _viewNode->setScaleX(value.isNullOrUndefined() ? 1.0f : value.toFloat());
+    } else if (id == DefaultAttributeScaleY) {
+        auto value = attribute.getResolvedValue();
+        _viewNode->setScaleY(value.isNullOrUndefined() ? 1.0f : value.toFloat());
     } else if (id == DefaultAttributeAccessibilityId) {
         auto value = attribute.getResolvedValue();
         if (value.isNullOrUndefined()) {
@@ -243,17 +277,24 @@ void ViewNodeAttributesApplier::updateAttribute(ViewTransactionScope& viewTransa
 }
 
 void ViewNodeAttributesApplier::onApplyAttributeFailed(AttributeId id, const Error& error) {
+    // Asynchronously reported failures can arrive after the view factory was reset,
+    // leaving _boundAttributes null.
     VALDI_ERROR(_viewNode->getLogger(),
                 "{}, Could not apply attribute '{}' in class {}: {}",
                 _viewNode->getLoggerFormatPrefix(),
                 getAttributeName(id),
-                _boundAttributes->getClassName(),
+                _boundAttributes != nullptr ? _boundAttributes->getClassName() : StringBox::emptyString(),
                 error);
 }
 
 void ViewNodeAttributesApplier::flush(ViewTransactionScope& viewTransactionScope) {
     if (_viewNode == nullptr) {
         return;
+    }
+
+    if (_colorAttributesInvalidated) {
+        _colorAttributesInvalidated = false;
+        updateInvalidatedColorAttributes(viewTransactionScope);
     }
 
     while (!_dirtyCompositeAttributes.empty()) {
@@ -265,7 +306,25 @@ void ViewNodeAttributesApplier::flush(ViewTransactionScope& viewTransactionScope
 }
 
 bool ViewNodeAttributesApplier::needsFlush() const {
-    return !_dirtyCompositeAttributes.empty();
+    return _colorAttributesInvalidated || !_dirtyCompositeAttributes.empty();
+}
+
+void ViewNodeAttributesApplier::updateInvalidatedColorAttributes(ViewTransactionScope& viewTransactionScope) {
+    for (const auto& it : _attributes) {
+        if (!it.second->shouldReevaluateOnColorChange()) {
+            continue;
+        }
+
+        auto id = it.first;
+        auto attribute = it.second;
+        attribute->markAppliedValueDirty();
+
+        if (attribute->isCompositePart()) {
+            _dirtyCompositeAttributes[attribute->getCompositeAttribute()->getAttributeId()] = nullptr;
+        } else {
+            updateAttribute(viewTransactionScope, id, *attribute, nullptr, /* justAddedView */ false);
+        }
+    }
 }
 
 void ViewNodeAttributesApplier::updateCompositeAttribute(ViewTransactionScope& viewTransactionScope,
@@ -294,6 +353,11 @@ void ViewNodeAttributesApplier::updateCompositeAttribute(ViewTransactionScope& v
 
         setAttribute(viewTransactionScope, compositeId, this, Value(value), animator);
     } else {
+        VALDI_WARN(getLogger(),
+                   "{} Removing composite attribute '{}' from class {}: all parts empty, view resets to defaults",
+                   _viewNode->getLoggerFormatPrefix(),
+                   getAttributeName(compositeId),
+                   _boundAttributes->getClassName());
         removeAttribute(viewTransactionScope, compositeId, this, animator);
     }
 }
@@ -441,7 +505,12 @@ void ViewNodeAttributesApplier::setBoundAttributes(Ref<BoundAttributes> boundAtt
     auto hadAttributes = _boundAttributes != nullptr;
     _boundAttributes = std::move(boundAttributes);
 
-    if (VALDI_UNLIKELY(hadAttributes && _boundAttributes != nullptr)) {
+    if (_boundAttributes == nullptr) {
+        // Clear state so flush() / emplaceAttribute() are never called with null _boundAttributes.
+        _dirtyCompositeAttributes.clear();
+        _colorAttributesInvalidated = false;
+        _attributes.clear();
+    } else if (VALDI_UNLIKELY(hadAttributes)) {
         updateAttributeHandlers();
     }
 }
@@ -475,11 +544,22 @@ void ViewNodeAttributesApplier::updateAttributeHandlers() {
             }
         });
     }
+
+    auto dirtyIt = _dirtyCompositeAttributes.begin();
+    while (dirtyIt != _dirtyCompositeAttributes.end()) {
+        const auto* handler = _boundAttributes->getAttributeHandlerForId(dirtyIt->first);
+        if (handler == nullptr || handler->getCompositeAttribute() == nullptr) {
+            dirtyIt = _dirtyCompositeAttributes.erase(dirtyIt);
+        } else {
+            ++dirtyIt;
+        }
+    }
 }
 
 void ViewNodeAttributesApplier::destroy() {
     _viewNode = nullptr;
     _dirtyCompositeAttributes.clear();
+    _colorAttributesInvalidated = false;
     _attributes.clear();
 }
 

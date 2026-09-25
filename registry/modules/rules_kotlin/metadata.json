@@ -1,0 +1,6 @@
+{
+    "homepage": "https://github.com/bazel-contrib/rules_kotlin",
+    "maintainers": [],
+    "versions": ["1.9.0", "2.3.10"],
+    "yanked_versions": {}
+}

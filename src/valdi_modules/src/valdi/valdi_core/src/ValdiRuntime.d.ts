@@ -2,7 +2,7 @@ import { RuntimeBase } from 'coreutils/src/RuntimeBase';
 import { ElementFrame } from 'valdi_tsx/src/Geometry';
 import { NativeNode } from 'valdi_tsx/src/NativeNode';
 import { NativeView } from 'valdi_tsx/src/NativeView';
-import { Asset, PlatformAssetOverrides } from './Asset';
+import { Asset, PlatformAssetOverrides, ThemableAssetMap } from './Asset';
 import { ElementId } from './IRenderedElement';
 import { IRootComponentsManager } from './IRootComponentsManager';
 import { RenderRequest } from './RenderRequest';
@@ -28,14 +28,22 @@ export interface ColorPalette {
   [key: string]: string;
 }
 
-interface MessageEvent<T = unknown> {
+export interface NativeMessageEvent<T = unknown> {
   readonly data: T;
+  readonly ports: readonly NativeMessagePort[];
 }
 
-export type OnMessageFunc<T> = (msg: MessageEvent<T>) => void;
+export type OnMessageFunc<T> = (msg: NativeMessageEvent<T>) => void;
+
+export interface NativeMessagePort {
+  onmessage: OnMessageFunc<unknown> | null;
+  postMessage<T>(data: T, transfer?: readonly NativeMessagePort[]): void;
+  start(): void;
+  close(): void;
+}
 
 export interface NativeWorker {
-  postMessage<T>(data: T): void;
+  postMessage<T>(data: T, transfer?: readonly NativeMessagePort[]): void;
   setOnMessage<T>(f: OnMessageFunc<T>): void;
   terminate(): void;
 }
@@ -59,7 +67,36 @@ export const enum BackendRenderingType {
 
 export type AssetEntry = Asset | string;
 
+export interface LoadedAsset {
+  brand?: 'LoadedAsset';
+}
+
+export interface LoadedAssetImageMetadata {
+  type: 'image';
+  width: number;
+  height: number;
+}
+
+export interface LoadedAssetLottieMetadata {
+  type: 'lottie';
+  width: number;
+  height: number;
+  durationMs: number;
+}
+
+export interface LoadedAssetSkCodecMetadata {
+  type: 'skcodec';
+  width: number;
+  height: number;
+  numberOfFrames: number;
+  durationMs: number;
+}
+
+export type LoadedAssetMetadata = LoadedAssetImageMetadata | LoadedAssetLottieMetadata | LoadedAssetSkCodecMetadata;
+
 export interface ValdiRuntime extends RuntimeBase {
+  apiVersion: number;
+
   postMessage(contextId: string, command: string, params: any): void;
   getFrameForElementId(
     contextId: string,
@@ -126,6 +163,8 @@ export interface ValdiRuntime extends RuntimeBase {
 
   startTraceRecording(): number;
   stopTraceRecording(id: number): any[];
+  /** Optional so valdi_core remains compatible with older native and web runtime implementations. */
+  stopTraceRecordingWithStats?(id: number): any[];
 
   submitDebugMessage: SubmitDebugMessageFunc;
 
@@ -136,16 +175,19 @@ export interface ValdiRuntime extends RuntimeBase {
   makeAssetFromBytes(bytes: ArrayBuffer | Uint8Array): Asset;
   makeDirectionalAsset(ltrAsset: string | Asset, rtlAsset: string | Asset): Asset;
   makePlatformSpecificAsset(defaultAsset: string | Asset, platformAssetOverrides: PlatformAssetOverrides): Asset;
+  makeThemableAsset(assetsByColorPalette: ThemableAssetMap): Asset;
   getAssets(catalogPath: string): AssetEntry[];
   addAssetLoadObserver(
     asset: string | Asset,
-    onLoad: (loadedAsset: unknown, error: string | undefined) => void,
+    onLoad: (loadedAsset: LoadedAsset | Uint8Array | undefined, error: string | undefined) => void,
     outputType: number,
     preferredWidth: number | undefined,
     preferredHeight: number | undefined,
   ): () => void;
+  getLoadedAssetMetadata(loadedAsset: LoadedAsset): LoadedAssetMetadata | undefined;
 
-  setColorPalette(colorPalette: ColorPalette): void;
+  configureColorPalette(name: string, colorPalette: ColorPalette): void;
+  setActiveColorPalette(name: string): void;
 
   outputLog(type: number, content: string): void;
 
@@ -177,9 +219,30 @@ export interface ValdiRuntime extends RuntimeBase {
 
   performGC(): void;
 
+  /**
+   * Engine-independent weak references, backing the standard `WeakRef` global that
+   * PostInit installs on engines without native support (e.g. QuickJS). newWeakRef
+   * returns an opaque handle; derefWeakRef returns the target, or undefined once it
+   * has been collected.
+   */
+  newWeakRef(target: object): unknown;
+  derefWeakRef(handle: unknown): object | undefined;
+
   dumpHeap?(): ArrayBuffer;
 
   isDebugEnabled: boolean;
+
+  /**
+   * Whether JS logging (console.log/warn/error/info/debug) is enabled.
+   * In non-appstore builds this is always true. In appstore builds this is false.
+   */
+  isLoggingEnabled: boolean;
+
+  /**
+   * When true, the renderer emits moves in top-down order (parent before children) to reduce ANR risk.
+   * Gated by VALDI_MAX_VIEW_OPERATIONS_PROCESSING_TIME (same COF as view-op throttling); true when that value > 0.
+   */
+  useTopDownMoveOrder: boolean;
 
   buildType: string;
 }

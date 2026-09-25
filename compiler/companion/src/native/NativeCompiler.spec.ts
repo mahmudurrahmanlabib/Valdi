@@ -19,11 +19,17 @@ function compileAsIRString(
   setupWorkspace: ((workpace: Workspace) => void) | undefined,
   filterIR: (ir: NativeCompilerIR.Base) => boolean,
 ): string {
-  const workspace = new Workspace('/', false, undefined, {
-    target: ts.ScriptTarget.ESNext,
-    module: ts.ModuleKind.CommonJS,
-    lib: ['lib.es2015.d.ts'],
-  });
+  const workspace = new Workspace(
+    '/',
+    false,
+    undefined,
+    {
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.CommonJS,
+      lib: ['lib.es2015.d.ts'],
+    },
+    undefined,
+  );
 
   const filePath = 'file.ts';
   workspace.registerInMemoryFile(filePath, text);
@@ -43,11 +49,17 @@ function compileAsC(
   selectFunction: string | undefined,
   setupWorkspace: ((workpace: Workspace) => void) | undefined,
 ): string {
-  const workspace = new Workspace('/', false, undefined, {
-    target: ts.ScriptTarget.ESNext,
-    module: ts.ModuleKind.CommonJS,
-    lib: ['lib.es2015.d.ts'],
-  });
+  const workspace = new Workspace(
+    '/',
+    false,
+    undefined,
+    {
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.CommonJS,
+      lib: ['lib.es2015.d.ts'],
+    },
+    undefined,
+  );
 
   const filePath = 'file.ts';
   workspace.registerInMemoryFile(filePath, text);
@@ -1114,6 +1126,7 @@ jumptarget 'body'
 getpropvalue @5 @12 @20
 add @6 @20 @22
 assign @22 @6
+jumptarget 'incrementor'
 assign @12 @24
 inc @12 @25
 assign @25 @12
@@ -1208,13 +1221,14 @@ mod @7 @14 @16
 eqstrict @16 @13 @17
 branch @17 'true' 'false'
 jumptarget 'true'
-jump 'cond'
+jump 'incrementor'
 jump 'exit'
 jumptarget 'false'
 jumptarget 'exit'
 getpropvalue @4 @7 @20
 add @5 @20 @22
 assign @22 @5
+jumptarget 'incrementor'
 assign @7 @24
 inc @7 @25
 assign @25 @7
@@ -1227,6 +1241,72 @@ jumptarget 'return'
 function_end @1
         `.trim(),
     );
+  });
+
+  // Regression: `continue` in a C-style `for` must jump to the
+  // incrementor block (which runs the update expression), NOT the loop
+  // condition. Jumping to the condition skips the update, so the loop variable
+  // never advances and the loop spins forever. Asserted structurally so the
+  // test does not depend on unrelated IR details.
+  it('routes `continue` in a for loop through the incrementor', () => {
+    const result = compileSimplified(
+      `
+    function run(n: number): void {
+      for (let i = 0; i < n; i++) {
+        if (i % 2 === 0) {
+          continue;
+        }
+      }
+    }
+        `,
+      ['file_ts_run'],
+    );
+
+    // The incrementor is its own jump target, and `continue` jumps to it
+    // (the loop back-edge still targets 'cond', which is correct).
+    expect(result).toContain("jumptarget 'incrementor'");
+    expect(result).toContain("jump 'incrementor'");
+    // The update (i++) is emitted inside that incrementor block.
+    const incrementorBlock = result.slice(result.indexOf("jumptarget 'incrementor'"));
+    expect(incrementorBlock).toContain('inc @');
+  });
+
+  // Regression for the retain/release pass: a reassigned value must be released
+  // before it is re-retained. The pass previously tested
+  // membership with `in` on a number[] (an array-index check), so a variable
+  // whose id exceeded the assigned-count so far had its release skipped, leaking
+  // a reference. A multi-step optional chain that follows an earlier chain
+  // (bumping the variable count) reproduces the high-id case. Every self-retain
+  // `X = tsn_retain_inline(ctx, X)` is inherently a reassignment, so it must be
+  // immediately preceded by a release of X. Compiled with optimizations off so
+  // variable renumbering doesn't mask the id condition.
+  it('releases before re-retaining a reassigned value', () => {
+    const c = compileAsC(
+      `
+      interface Nested { retries: number; }
+      interface Config { timeout?: number; nested?: Nested; }
+      function resolve(config: Config | undefined): number {
+        const timeout = config?.timeout ?? 30;
+        const retries = config?.nested?.retries ?? 3;
+        return timeout + retries;
+      }
+      `,
+      { optimizeSlots: false, optimizeVarRefs: false, foldConstants: false },
+      'resolve',
+      undefined,
+    );
+    const lines = c.split('\n').map((l) => l.trim());
+    const selfRetain = /^(object_var\d+) = tsn_retain_inline\(ctx, \1\);$/;
+    let sawSelfRetain = false;
+    for (let i = 0; i < lines.length; i++) {
+      const match = lines[i].match(selfRetain);
+      if (!match) {
+        continue;
+      }
+      sawSelfRetain = true;
+      expect(lines[i - 1]).toBe(`tsn_release_inline(ctx, ${match[1]});`);
+    }
+    expect(sawSelfRetain).toBe(true);
   });
 
   it('compiles while loops', () => {
@@ -3385,6 +3465,7 @@ getprop @4 'length' @8
 lt @5 @8 @10
 branch @10 'body' 'exit'
 jumptarget 'body'
+jumptarget 'incrementor'
 assign @5 @12
 inc @5 @13
 assign @13 @5
@@ -3539,6 +3620,40 @@ jumptarget 'return'
 function_end @1
         `.trim(),
     );
+  });
+
+  it('does not emit a runtime object for an inline const enum declaration', () => {
+    const result = configuredCompile(
+      `
+      const enum Color { Red = 0, Green = 1, Blue = 2 }
+      const c = Color.Green;
+    `,
+      { optimizeSlots: false, optimizeVarRefs: true },
+      false,
+      false,
+      false,
+      false,
+      undefined,
+    );
+    expect(result).toContain('storeint 1');
+    expect(result).not.toContain('newobject');
+  });
+
+  it('inlines string const enum values declared inline', () => {
+    const result = configuredCompile(
+      `
+      const enum Direction { Up = 'UP', Down = 'DOWN' }
+      const d = Direction.Up;
+    `,
+      { optimizeSlots: false, optimizeVarRefs: true },
+      false,
+      false,
+      false,
+      false,
+      undefined,
+    );
+    expect(result).toContain("storestring 'UP'");
+    expect(result).not.toContain('newobject');
   });
 
   it('supports try finally', () => {
@@ -4000,5 +4115,29 @@ jumptarget 'yield'
 function_end @1
       `.trim(),
     );
+  });
+
+  it('escapes single quotes in string literals', () => {
+    const result = configuredCompile(
+      `
+      const enum Foo { Value = "it's a test" }
+      const s = Foo.Value;
+      `,
+      { optimizeSlots: false, optimizeVarRefs: true },
+      false, false, false, false, undefined,
+    );
+    expect(result).toContain("storestring 'it\\'s a test'");
+  });
+
+  it('escapes backslashes in string literals', () => {
+    const result = configuredCompile(
+      String.raw`
+      const enum Foo { Value = "C:\\Users\\file" }
+      const s = Foo.Value;
+      `,
+      { optimizeSlots: false, optimizeVarRefs: true },
+      false, false, false, false, undefined,
+    );
+    expect(result).toContain("storestring 'C:\\\\Users\\\\file'");
   });
 });

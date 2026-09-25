@@ -31,6 +31,8 @@ public:
     int width() const;
     int height() const;
 
+    Valdi::Value getMetadata() const override;
+
     static void initializeCodecs();
 
     /**
@@ -65,6 +67,12 @@ public:
      Make an Image from bytes representing an encoded image, like in PNG or JPG format.
      */
     static Valdi::Result<Ref<Image>> make(const Valdi::BytesView& data);
+
+    static bool isSVG(const Valdi::BytesView& data);
+
+    static Valdi::Result<Ref<Image>> makeFromSVG(const Valdi::BytesView& data,
+                                                 int preferredWidth = 0,
+                                                 int preferredHeight = 0);
 
     /**
      Make an Image with the raw pixels data in the format specified in the BitmapInfo.

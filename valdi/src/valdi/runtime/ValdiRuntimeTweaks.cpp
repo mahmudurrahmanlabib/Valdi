@@ -55,10 +55,6 @@ bool ValdiRuntimeTweaks::shouldNudgeJSThread() const {
     return getConfigKey("VALDI_ENABLE_JSTHREAD_NUDGE");
 }
 
-bool ValdiRuntimeTweaks::disablePersistentStoreEncryption() const {
-    return getConfigKey("VALDI_DISABLE_PERSISTENT_STORE_ENCRYPTION");
-}
-
 bool ValdiRuntimeTweaks::enableTSNForModule(const StringBox& moduleName) const {
     auto const key = StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_TSN_ENABLED_MODULES"));
     auto const fallback = Value(makeShared<ValueTypedArray>(TypedArrayType::Uint8Array, Valdi::BytesView()));
@@ -92,16 +88,116 @@ bool ValdiRuntimeTweaks::enableTSNForModule(const StringBox& moduleName) const {
     return true;
 }
 
-bool ValdiRuntimeTweaks::shouldCrashOnANR() const {
-    return getConfigKey("VALDI_ENABLE_CRASH_ON_ANR");
-}
-
 bool ValdiRuntimeTweaks::disableAnimationRemoveOnCompleteIos() const {
     return getConfigKey("VALDI_DISABLE_ANIMATION_REMOVE_ON_COMPLETE_IOS");
 }
 
-bool ValdiRuntimeTweaks::skipProtoIndex() const {
-    return getConfigKey("VALDI_PROTO_SKIP_INDEX");
+bool ValdiRuntimeTweaks::enableScopedContextStackTraceCapture() const {
+    static const StringBox kKey =
+        StringCache::getGlobal().makeStringFromLiteral("VALDI_ENABLE_SCOPED_CONTEXT_STACK_TRACE_CAPTURE");
+    return _tweakValueProvider->getBool(kKey, false);
+}
+
+bool ValdiRuntimeTweaks::enableRenderRequestContextFix() const {
+    auto configKey =
+        StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_ENABLE_RENDER_REQUEST_CONTEXT_FIX"));
+    return _tweakValueProvider->getBool(configKey, true);
+}
+
+bool ValdiRuntimeTweaks::disablePreRasterFence() const {
+    return getConfigKey("VALDI_DISABLE_PRE_RASTER_FENCE");
+}
+
+bool ValdiRuntimeTweaks::enableResolutionTeardownDegrade() const {
+    auto configKey =
+        StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_ENABLE_RESOLUTION_TEARDOWN_DEGRADE"));
+    return _tweakValueProvider->getBool(configKey, true);
+}
+
+bool ValdiRuntimeTweaks::useCooperativeTermination() const {
+    auto configKey =
+        StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_USE_COOPERATIVE_TERMINATION"));
+    return _tweakValueProvider->getBool(configKey, true);
+}
+
+bool ValdiRuntimeTweaks::joinJsThreadOnTeardown() const {
+    auto configKey =
+        StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_JOIN_JS_THREAD_ON_TEARDOWN"));
+    return _tweakValueProvider->getBool(configKey, true);
+}
+
+bool ValdiRuntimeTweaks::applyManagedChildFramePadding() const {
+    auto configKey =
+        StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_MANAGES_CHILD_FRAME_PADDING_ENABLED"));
+    return _tweakValueProvider->getBool(configKey, true);
+}
+
+bool ValdiRuntimeTweaks::disableHitTestSyncDeadline() const {
+    return getConfigKey("VALDI_DISABLE_HIT_TEST_SYNC_DEADLINE");
+}
+
+bool ValdiRuntimeTweaks::disableSyncDeadlineCircuitBreaker() const {
+    return getConfigKey("VALDI_DISABLE_SYNC_DEADLINE_CIRCUIT_BREAKER");
+}
+
+bool ValdiRuntimeTweaks::useTopDownMoveOrder() const {
+    auto configKey =
+        StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_MAX_VIEW_OPERATIONS_PROCESSING_TIME"));
+    return _tweakValueProvider->getInt(configKey, 0) > 0;
+}
+
+bool ValdiRuntimeTweaks::enableMmapModuleArchives() const {
+    return getConfigKey("VALDI_ENABLE_MMAP_MODULE_ARCHIVES");
+}
+
+bool ValdiRuntimeTweaks::isMmapModuleArchiveDenylisted(const StringBox& modulePath) const {
+    static const StringBox kKey = StringCache::getGlobal().makeStringFromLiteral("VALDI_MMAP_MODULE_ARCHIVES_DENYLIST");
+    auto denylist = _tweakValueProvider->getString(kKey, StringBox());
+    if (denylist.isEmpty()) {
+        return false;
+    }
+
+    auto moduleView = modulePath.toStringView();
+    auto listView = denylist.toStringView();
+    size_t start = 0;
+    while (start <= listView.size()) {
+        auto end = listView.find(',', start);
+        if (end == std::string_view::npos) {
+            end = listView.size();
+        }
+        auto prefix = listView.substr(start, end - start);
+        while (!prefix.empty() && prefix.front() == ' ') {
+            prefix.remove_prefix(1);
+        }
+        while (!prefix.empty() && prefix.back() == ' ') {
+            prefix.remove_suffix(1);
+        }
+        // A trailing '$' anchors the entry: "camera$" matches only the module
+        // "camera", not "camera_control_center". Without it the entry is a prefix.
+        bool exact = !prefix.empty() && prefix.back() == '$';
+        if (exact) {
+            prefix.remove_suffix(1);
+        }
+        if (!prefix.empty() && (exact ? moduleView == prefix : moduleView.substr(0, prefix.size()) == prefix)) {
+            return true;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+bool ValdiRuntimeTweaks::enableANRDiagnostics() const {
+    // Key name kept from the earlier module-load diagnostics so the existing COF config carries over.
+    return getConfigKey("VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS");
+}
+
+bool ValdiRuntimeTweaks::enableFixFlexBasisFitContent() const {
+    return getConfigKey("VALDI_ENABLE_FIX_FLEX_BASIS_FIT_CONTENT");
+}
+
+int32_t ValdiRuntimeTweaks::preloadYieldChunkSize() const {
+    auto configKey = StringCache::getGlobal().makeStringFromLiteral(std::string_view("VALDI_PRELOAD_YIELD_CHUNK_SIZE"));
+    return _tweakValueProvider->getInt(configKey, 0);
 }
 
 } // namespace Valdi

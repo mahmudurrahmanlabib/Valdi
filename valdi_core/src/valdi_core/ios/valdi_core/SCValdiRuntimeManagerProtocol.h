@@ -10,6 +10,13 @@
 @protocol SCSnapDrawingRuntime;
 @protocol SCNValdiCoreModuleFactoriesProvider;
 
+NS_ASSUME_NONNULL_BEGIN
+
+typedef struct {
+    int64_t memoryUsageBytes;
+    int64_t objectsCount;
+} SCValdiMemoryStatistics;
+
 typedef void (^SCValdiRuntimeCreatedCallback)(id<SCValdiRuntimeProtocol>);
 
 /**
@@ -24,8 +31,16 @@ typedef void (^SCValdiRuntimeCreatedCallback)(id<SCValdiRuntimeProtocol>);
 @property (readonly, nonatomic) BOOL referenceTrackingEnabled;
 
 /**
+ Whether Gestures.framework is prewarmed at context creation. Reflects
+ SCValdiConfiguration.enableGesturePrewarm; defaults to YES (killswitch).
+ */
+@property (readonly, nonatomic) BOOL gesturePrewarmEnabled;
+
+/**
  The block will be provided with a SCValdiConfiguration instance that you can mutate
  and the runtime manager will apply this configuration after the block finishes executing.
+ Constructor-time settings such as debugger service configuration should be provided before
+ the underlying RuntimeManager is initialized.
  */
 - (void)updateConfiguration:(void (^)(SCValdiConfiguration* configuration))updateBlock;
 
@@ -39,13 +54,13 @@ typedef void (^SCValdiRuntimeCreatedCallback)(id<SCValdiRuntimeProtocol>);
  Valdi modules from this runtime will be loaded with the module provider
  instead of using the built-in modules.
  */
-- (id<SCValdiRuntimeProtocol>)createRuntimeWithCustomModuleProvider:
+- (nullable id<SCValdiRuntimeProtocol>)createRuntimeWithCustomModuleProvider:
     (id<SCValdiCustomModuleProvider>)customModuleProvider;
 
 /**
  * Returns the SnapDrawing Runtime
  */
-- (id<SCSnapDrawingRuntime>)snapDrawingRuntime;
+- (nullable id<SCSnapDrawingRuntime>)snapDrawingRuntime;
 
 /**
  * Registers a callback that will be called when the main runtime is created.
@@ -71,8 +86,24 @@ typedef void (^SCValdiRuntimeCreatedCallback)(id<SCValdiRuntimeProtocol>);
 /**
  Captures the stacktraces of all JS threads.
  */
-- (NSArray<SCValdiCapturedJSStacktrace*>*)captureStackTracesWithTimeoutMs:(NSUInteger)timeoutMs;
+- (nullable NSArray<SCValdiCapturedJSStacktrace*>*)captureStackTracesWithTimeoutMs:(NSUInteger)timeoutMs;
 
 - (void)getWorkerOnExecutor:(NSString*)executor block:(void (^)(id<SCValdiJSRuntime>))block;
 
+/**
+ Aggregates memory statistics across all JS runtimes managed by this runtime manager.
+ */
+- (SCValdiMemoryStatistics)dumpMemoryStatistics;
+
+/**
+ Asynchronously aggregates memory statistics across all JS runtimes managed by this runtime
+ manager. Each runtime reports on its own JS thread; @c completion is invoked once with the
+ totals after the final runtime has reported. Unlike @c dumpMemoryStatistics, this never blocks
+ the calling thread waiting on the JS threads. @c completion may be invoked on an arbitrary
+ (JS) thread.
+ */
+- (void)dumpMemoryStatisticsAsyncWithCompletion:(void (^)(SCValdiMemoryStatistics))completion;
+
 @end
+
+NS_ASSUME_NONNULL_END

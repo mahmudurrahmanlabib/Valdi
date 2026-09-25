@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import inquirer from 'inquirer';
 import type { Argv } from 'yargs';
@@ -15,19 +16,20 @@ import {
   deleteAll,
   fileExists,
   isDirectoryEmpty,
-  processReplacements,
   resolveFilePath,
 } from '../utils/fileUtils';
 import { wrapInColor } from '../utils/logUtils';
-import { toPascalCase } from '../utils/stringUtils';
+import { toPascalCase, sanitizeProjectName, validateProjectName } from '../utils/stringUtils';
 import { getAllProjectSyncTargets, runProjectSync } from './projectsync';
-import { resolveLatestReleaseRef } from '../utils/githubUtils';
+import { getLatestReleaseTag } from '../utils/githubUtils';
 
 interface CommandParameters {
   confirmBootstrap: boolean;
   projectName: string;
   applicationType: string;
-  valdiImport: string;
+  valdiVersion: string;
+  valdiWidgetsVersion: string;
+  localValdiPath: string;
   skipProjectsync: boolean;
   withCleanup: boolean;
 }
@@ -52,23 +54,16 @@ const ALL_APPLICATION_TEMPLATES: readonly ApplicationTemplate[] = [
 ];
 
 const VALDI_GIT_URL = 'https://github.com/Snapchat/Valdi';
+const VALDI_WIDGETS_GIT_URL = 'https://github.com/Snapchat/Valdi_Widgets';
 
-const DEFAULT_VALDI_IMPORT = `
-http_archive(
-    name = "valdi",
-    strip_prefix = "Valdi-{{VALDI_RELEASE_TAG}}",
-    url = "${VALDI_GIT_URL}/archive/{{VALDI_RELEASE_REF}}.tar.gz",
-)`;
+/** Pinned Valdi release used by default for reproducible bootstraps. Bump when cutting a new Valdi release. */
+const DEFAULT_VALDI_RELEASE_TAG = 'beta-0.2.0';
+/** Pinned Valdi_Widgets release used by default. Should match the Valdi release cycle. */
+const DEFAULT_VALDI_WIDGETS_RELEASE_TAG = 'beta-0.2.0';
 
-const LOCAL_VALDI_IMPORT_TEMPLATE = `
-local_repository(
-    name = "valdi",
-    path = "{{PATH}}",
-)
-`;
 
 function isAlreadyInitialized(): boolean {
-  return fileExists(path.join(process.cwd(), 'WORKSPACE'));
+  return fileExists(path.join(process.cwd(), 'MODULE.bazel')) || fileExists(path.join(process.cwd(), 'WORKSPACE'));
 }
 
 async function getShouldBootstrap(argv: ArgumentsResolver<CommandParameters>): Promise<boolean> {
@@ -103,46 +98,91 @@ async function getApplicationType(argv: ArgumentsResolver<CommandParameters>): P
 
 async function getProjectName(argv: ArgumentsResolver<CommandParameters>): Promise<string> {
   return argv.getArgumentOrResolve('projectName', async () => {
-    const result = await inquirer.prompt<{ projectName: string }>([
-      {
-        type: 'input',
-        name: 'projectName',
-        message: 'Please provide a name for this project:',
-        default: defaultProjectName,
-      },
-    ]);
+    let projectName = '';
+    let isValid = false;
 
-    return result.projectName;
+    while (!isValid) {
+      const result = await inquirer.prompt<{ projectName: string }>([
+        {
+          type: 'input',
+          name: 'projectName',
+          message: 'Please provide a name for this project:',
+          default: defaultProjectName,
+        },
+      ]);
+
+      projectName = result.projectName;
+      const validationError = validateProjectName(projectName, { requireBazelModuleName: true });
+
+      if (validationError) {
+        console.log(wrapInColor(`\n❌ ${validationError}\n`, ANSI_COLORS.RED_COLOR));
+        continue;
+      }
+
+      const sanitized = sanitizeProjectName(projectName);
+      if (sanitized !== projectName) {
+        console.log(
+          wrapInColor(
+            `\n⚠️  Project name will be sanitized from "${projectName}" to "${sanitized}"`,
+            ANSI_COLORS.YELLOW_COLOR,
+          ),
+        );
+        const confirm = await getUserConfirmation('Do you want to continue with this name?', true);
+        if (!confirm) {
+          continue;
+        }
+      }
+
+      isValid = true;
+    }
+
+    return sanitizeProjectName(projectName);
   });
 }
 
-function getValdiImport(argv: ArgumentsResolver<CommandParameters>, valdiReleaseRef: string): string {
-  const valdiImport = argv.getArgument('valdiImport');
-  if (valdiImport) {
-    return processReplacements(LOCAL_VALDI_IMPORT_TEMPLATE, { PATH: valdiImport });
-  } else {
-    const valdiReleaseTag = valdiReleaseRef.split('/').pop()!;
-    return processReplacements(DEFAULT_VALDI_IMPORT, {
-      VALDI_RELEASE_REF: valdiReleaseRef,
-      VALDI_RELEASE_TAG: valdiReleaseTag,
-    });
+function resolveValdiReleaseTag(
+  argv: ArgumentsResolver<CommandParameters>,
+  gitUrl: string,
+  defaultTag: string,
+  versionOption: 'valdiVersion' | 'valdiWidgetsVersion' = 'valdiVersion',
+): Promise<string> {
+  const override = argv.getArgument(versionOption);
+  if (!override) {
+    return Promise.resolve(defaultTag);
   }
+  if (override === 'latest') {
+    return getLatestReleaseTag(gitUrl);
+  }
+  return Promise.resolve(override);
 }
 
+
 // Create files from templates
-function initializeConfigFiles(projectName: string, template: ApplicationTemplate, valdiImport: string) {
+function initializeConfigFiles(
+  projectName: string,
+  template: ApplicationTemplate,
+  valdiReleaseTag: string,
+  valdiWidgetsReleaseTag: string,
+) {
+
   const TEMPLATE_FILES = [
     TemplateFile.init(TEMPLATE_BASE_PATHS.USER_CONFIG).withOutputPath(resolveFilePath(VALDI_CONFIG_PATHS[0] ?? '')),
     TemplateFile.init(TEMPLATE_BASE_PATHS.BAZEL_VERSION),
-    TemplateFile.init(TEMPLATE_BASE_PATHS.WORKSPACE).withReplacements({
+    TemplateFile.init(TEMPLATE_BASE_PATHS.MODULE_BAZEL).withReplacements({
       WORKSPACE_NAME: projectName,
-      VALDI_IMPORT: valdiImport,
-      WIDGET_ALIAS: '',
+      VALDI_RELEASE_TAG: valdiReleaseTag,
+      VALDI_WIDGETS_RELEASE_TAG: valdiWidgetsReleaseTag,
     }),
-    TemplateFile.init(TEMPLATE_BASE_PATHS.BAZEL_RC),
+    TemplateFile.init(TEMPLATE_BASE_PATHS.BAZEL_RC).withReplacements({
+      VALDI_RELEASE_TAG: valdiReleaseTag,
+    }),
     TemplateFile.init(TEMPLATE_BASE_PATHS.README),
     TemplateFile.init(TEMPLATE_BASE_PATHS.GIT_IGNORE),
     TemplateFile.init(TEMPLATE_BASE_PATHS.WATCHMAN_CONFIG),
+    TemplateFile.init(TEMPLATE_BASE_PATHS.EDITOR_CONFIG),
+    TemplateFile.init(TEMPLATE_BASE_PATHS.AGENTS).withReplacements({ MODULE_NAME: projectName }),
+    TemplateFile.init(TEMPLATE_BASE_PATHS.RULES_PYTHON_PATCH_BUILD),
+    TemplateFile.init(TEMPLATE_BASE_PATHS.RULES_PYTHON_PATCH),
   ];
 
   TEMPLATE_FILES.forEach(templateFile => {
@@ -152,17 +192,80 @@ function initializeConfigFiles(projectName: string, template: ApplicationTemplat
     templateFile.expandTemplate();
   });
 
+  // Copy shared bootstrap directories
+  const replacements: Replacements = {
+    MODULE_NAME: projectName,
+    MODULE_NAME_PASCAL_CASED: toPascalCase(projectName),
+  };
+  const githubSourcePath = path.join(BOOTSTRAP_DIR_PATH, '.github');
+  if (fileExists(githubSourcePath)) {
+    console.log(wrapInColor('Creating GitHub templates...', ANSI_COLORS.YELLOW_COLOR));
+    const githubDestPath = path.join(process.cwd(), '.github');
+    copyBootstrapFiles(githubSourcePath, githubDestPath, replacements);
+  }
+
   // Setup hello world application
   console.log(wrapInColor(`Initializing ${template.name} application...`, ANSI_COLORS.YELLOW_COLOR));
   const sourcePath = path.join(BOOTSTRAP_DIR_PATH, 'apps', template.path);
   const destPath = process.cwd();
 
-  const replacements: Replacements = {
-    MODULE_NAME: projectName,
-    MODULE_NAME_PASCAL_CASED: toPascalCase(projectName),
-  };
-
   copyBootstrapFiles(sourcePath, destPath, replacements);
+}
+
+const VALDI_SUB_MODULES: readonly { name: string; subPath: string }[] = [
+  { name: 'android_macros', subPath: 'bzl/macros' },
+  { name: 'snap_macros', subPath: 'bzl/valdi/snap_macros' },
+  { name: 'snap_client_toolchains', subPath: 'bzl/toolchains' },
+  { name: 'snap_platforms', subPath: 'bzl/platforms' },
+  { name: 'skia_user_config', subPath: 'third-party/skia_user_config' },
+  { name: 'rules_hdrs', subPath: 'third-party/rules_hdrs' },
+  { name: 'valdi_toolchain', subPath: 'bin' },
+];
+
+function applyLocalOverrides(localValdiPath: string) {
+  const resolvedPath = path.resolve(localValdiPath);
+  const registryPath = path.join(resolvedPath, 'registry');
+
+  const moduleBazelPath = path.join(process.cwd(), 'MODULE.bazel');
+  let content = fs.readFileSync(moduleBazelPath, 'utf-8');
+
+  // Replace Valdi archive variables + override with local_path_override
+  content = content.replace(
+    /VALDI_TAG = .*\nVALDI_URL = .*\nVALDI_PREFIX = .*\n\nbazel_dep\(name = "valdi".*\)\narchive_override\(\n\s+module_name = "valdi",\n\s+urls = \[VALDI_URL\],\n\s+strip_prefix = VALDI_PREFIX,\n\)/,
+    `bazel_dep(name = "valdi", version = "0.1")\nlocal_path_override(module_name = "valdi", path = "${resolvedPath}")`,
+  );
+
+  // Replace sub-module archive_overrides with local_path_override, or strip
+  // them entirely if the sub-module no longer exists in the local checkout
+  for (const sub of VALDI_SUB_MODULES) {
+    const subModuleBazel = path.join(resolvedPath, sub.subPath, 'MODULE.bazel');
+    const regex = new RegExp(`\\nbazel_dep\\(name = "${sub.name}"\\)\\narchive_override\\(module_name = "${sub.name}".*\\)`);
+    if (fs.existsSync(subModuleBazel)) {
+      content = content.replace(
+        regex,
+        `\nbazel_dep(name = "${sub.name}")\nlocal_path_override(module_name = "${sub.name}", path = "${resolvedPath}/${sub.subPath}")`,
+      );
+    } else {
+      content = content.replace(regex, '');
+    }
+  }
+
+  // Remove Widgets section entirely in local mode (not available locally)
+  content = content.replace(
+    /# -- Valdi Widgets.*\nWIDGETS_TAG = .*\n\nbazel_dep\(name = "valdi_widgets"\)\narchive_override\(\n\s+module_name = "valdi_widgets",\n\s+urls = \[.*\],\n\s+strip_prefix = .*,\n\)/,
+    '',
+  );
+
+  fs.writeFileSync(moduleBazelPath, content);
+
+  // Update .bazelrc to use local registry
+  const bazelrcPath = path.join(process.cwd(), '.bazelrc');
+  let bazelrc = fs.readFileSync(bazelrcPath, 'utf-8');
+  bazelrc = bazelrc.replace(
+    /common --registry=https:\/\/raw\.githubusercontent\.com\/Snapchat\/Valdi\/.*\/registry/,
+    `common --registry=file://${registryPath}`,
+  );
+  fs.writeFileSync(bazelrcPath, bazelrc);
 }
 
 async function valdiBootstrap(argv: ArgumentsResolver<CommandParameters>) {
@@ -200,18 +303,38 @@ async function valdiBootstrap(argv: ArgumentsResolver<CommandParameters>) {
 
   // Prompt user for input
   // - Application Name
-  const projectName = await getProjectName(argv);
+  let projectName = await getProjectName(argv);
+  
+  // Validate project name if provided via command line argument
+  if (argv.getArgument('projectName')) {
+    const validationError = validateProjectName(projectName, { requireBazelModuleName: true });
+    if (validationError) {
+      throw new CliError(validationError);
+    }
+    projectName = sanitizeProjectName(projectName);
+  }
+  
   if (!projectName) {
     throw new CliError('Project name cannot be empty.');
   }
 
-  const valdiCommitHash = await resolveLatestReleaseRef(`${VALDI_GIT_URL}.git`);
-
-  const valdiImport = getValdiImport(argv, valdiCommitHash);
+  const valdiReleaseTag = await resolveValdiReleaseTag(argv, VALDI_GIT_URL, DEFAULT_VALDI_RELEASE_TAG);
+  const valdiWidgetsReleaseTag = await resolveValdiReleaseTag(
+    argv,
+    VALDI_WIDGETS_GIT_URL,
+    DEFAULT_VALDI_WIDGETS_RELEASE_TAG,
+    'valdiWidgetsVersion',
+  );
 
   // Creating basic config files and Hello World application
   console.log(wrapInColor('Initializing config files...', ANSI_COLORS.BLUE_COLOR));
-  initializeConfigFiles(projectName, applicationType, valdiImport);
+  initializeConfigFiles(projectName, applicationType, valdiReleaseTag, valdiWidgetsReleaseTag);
+
+  const localValdiPath = argv.getArgument('localValdiPath');
+  if (localValdiPath) {
+    console.log(wrapInColor(`Applying local overrides for ${localValdiPath}...`, ANSI_COLORS.YELLOW_COLOR));
+    applyLocalOverrides(localValdiPath);
+  }
 
   // Check bazel version matches .bazelversion
   console.log(wrapInColor('Verifying Bazel installation...', ANSI_COLORS.BLUE_COLOR));
@@ -245,18 +368,37 @@ export const builder = (yargs: Argv<CommandParameters>) => {
       type: 'boolean',
       alias: 'y',
     })
-    .option('applicationType', { describe: 'Type of application to create', alias: 't' })
-    .option('valdiImport', {
-      describe: 'A full path to a local checkout of the valid repo',
+    .option('applicationType', {
+      describe: 'Type of application to create',
+      alias: 't',
+    })
+    .option('projectName', {
+      describe: 'Name of the project',
+      type: 'string',
+      alias: 'n',
+    })
+    .option('valdiVersion', {
+      describe: `Valdi release tag or branch to use (e.g. beta-0.1.0, main). Use "latest" for the GitHub latest release, or "main" for bleeding edge. Default: ${DEFAULT_VALDI_RELEASE_TAG}`,
+      type: 'string',
+    })
+    .option('valdiWidgetsVersion', {
+      describe: `Valdi_Widgets release tag or branch to use. Use "latest" for the GitHub latest release, or "main" for bleeding edge. Default: ${DEFAULT_VALDI_WIDGETS_RELEASE_TAG}`,
+      type: 'string',
+    })
+    .option('localValdiPath', {
+      describe: 'Path to a local Valdi checkout. Generates local_path_override entries instead of archive_override.',
       type: 'string',
       alias: 'l',
     })
-    .option('skipProjectsync', { describe: 'Skip projectsync for testing purposes', type: 'boolean', alias: 'p' })
+    .option('skipProjectsync', {
+      describe: 'Skip projectsync for testing purposes',
+      type: 'boolean',
+      alias: 'p',
+    })
     .option('withCleanup', {
       describe: 'Deletes all existing files in the current directory before initiating bootstrap',
       type: 'boolean',
       alias: 'c',
-    })
-    .option('projectName', { describe: 'Name of the project', type: 'string', alias: 'n' });
+    });
 };
 export const handler = makeCommandHandler(valdiBootstrap);

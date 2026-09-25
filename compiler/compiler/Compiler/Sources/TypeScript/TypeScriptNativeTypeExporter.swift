@@ -27,6 +27,7 @@ private struct EnumMember {
 
     let value: Value
     let comments: String?
+    let declaredVersion: String?
 }
 
 private class DocumentIndexMatcher {
@@ -151,11 +152,18 @@ final class TypeScriptNativeTypeExporter {
         }
 
         if let function = type.function {
-            let functionParameters = try function.parameters.map { try parsePropertyOrParameter(propertyLikeDeclaration: $0, references: references) }
+            let functionParameters = try function.parameters.map {
+                try parsePropertyOrParameter(
+                    propertyLikeDeclaration: $0,
+                    references: references,
+                    declaredVersion: nil
+                )
+            }
             let returnValue = try resolveType(type: function.returnValue, references: references)
 
             var isSingleCall = false
             var shouldCallOnWorkerThread = false
+            var allowSyncCall = false
             if let annotations = annotations {
                 for annotation in annotations {
                     guard let annotation = ValdiAnnotationType(rawValue: annotation.name) else {
@@ -168,13 +176,17 @@ final class TypeScriptNativeTypeExporter {
                         try validateWorkerThreadAnnotation(functionReturnType: returnValue, leadingComments: type.leadingComments!)
 
                         shouldCallOnWorkerThread = true
+                    } else if annotation == .allowSyncCall {
+                        allowSyncCall = true
+                    } else if annotation == .version {
+                        // Version annotations are validation metadata and do not affect native code generation.
                     } else {
-                        try self.throwAnnotationError(comments: type.leadingComments!, message: "Function only support the @SingleCall and @WorkerThread annotations")
+                        try self.throwAnnotationError(comments: type.leadingComments!, message: "Function only support the @SingleCall, @WorkerThread and @AllowSyncCall annotations")
                     }
                 }
             }
 
-            return .function(parameters: functionParameters, returnType: returnValue, isSingleCall: isSingleCall, shouldCallOnWorkerThread: shouldCallOnWorkerThread)
+            return .function(parameters: functionParameters, returnType: returnValue, isSingleCall: isSingleCall, shouldCallOnWorkerThread: shouldCallOnWorkerThread, allowSyncCall: allowSyncCall)
         }
 
         if let typeReferenceIndex = type.typeReferenceIndex {
@@ -344,7 +356,8 @@ final class TypeScriptNativeTypeExporter {
                                    type: TS.AST.TSType,
                                    isOptional: Bool,
                                    leadingComments: TS.AST.Comments?,
-                                   references: [TS.AST.TypeReference]) throws -> ValdiModelProperty {
+                                   references: [TS.AST.TypeReference],
+                                   declaredVersion: String?) throws -> ValdiModelProperty {
         var parsedType = try resolveType(type: type, references: references)
         if isOptional {
             parsedType = .nullable(parsedType)
@@ -364,12 +377,12 @@ final class TypeScriptNativeTypeExporter {
             }
 
             if propertyMetadata.shouldCallOnWorkerThread {
-                guard case let .function(parameters, returnType, isSingleCall, _) = parsedType.unwrappingOptional else {
+                guard case let .function(parameters, returnType, isSingleCall, _, allowSyncCall) = parsedType.unwrappingOptional else {
                     try throwAnnotationError(comments: leadingComments, message: "@WorkerThread can only be set on functions or methods")
                 }
                 try validateWorkerThreadAnnotation(functionReturnType: returnType, leadingComments: leadingComments)
 
-                let newType = ValdiModelPropertyType.function(parameters: parameters, returnType: returnType, isSingleCall: isSingleCall, shouldCallOnWorkerThread: true)
+                let newType = ValdiModelPropertyType.function(parameters: parameters, returnType: returnType, isSingleCall: isSingleCall, shouldCallOnWorkerThread: true, allowSyncCall: allowSyncCall)
                 if parsedType.isOptional {
                     parsedType = ValdiModelPropertyType.nullable(newType)
                 } else {
@@ -382,15 +395,19 @@ final class TypeScriptNativeTypeExporter {
                                   type: parsedType,
                                   comments: resolvedPropertyMetadata?.comments,
                                   omitConstructor: resolvedPropertyMetadata?.omitConstructor,
-                                  injectableParams: resolvedPropertyMetadata?.injectableParams ?? .empty)
+                                  injectableParams: resolvedPropertyMetadata?.injectableParams ?? .empty,
+                                  declaredVersion: declaredVersion)
     }
 
-    private func parsePropertyOrParameter(propertyLikeDeclaration: TS.AST.PropertyLikeDeclaration, references: [TS.AST.TypeReference]) throws -> ValdiModelProperty {
+    private func parsePropertyOrParameter(propertyLikeDeclaration: TS.AST.PropertyLikeDeclaration,
+                                          references: [TS.AST.TypeReference],
+                                          declaredVersion: String?) throws -> ValdiModelProperty {
         return try parsePropertyLike(name: propertyLikeDeclaration.name,
                                  type: propertyLikeDeclaration.type,
                                  isOptional: propertyLikeDeclaration.isOptional,
                                  leadingComments: propertyLikeDeclaration.leadingComments,
-                                 references: references)
+                                 references: references,
+                                 declaredVersion: declaredVersion)
     }
 
     func export() -> Promise<(ExportedType, ValdiClassMapping)> {
@@ -401,20 +418,22 @@ final class TypeScriptNativeTypeExporter {
         }
     }
 
-    private func parseEnumMember(enumMember: TS.AST.EnumMember, sequence: EnumMemberSequence) throws -> EnumMember {
+    private func parseEnumMember(enumMember: TS.AST.EnumMember,
+                                 sequence: EnumMemberSequence,
+                                 declaredVersion: String?) throws -> EnumMember {
         if let numberValue = enumMember.numberValue {
             guard let enumValue = Int(numberValue) else {
                 throw CompilerError("Could not parse number '\(numberValue)' in enum member \(enumMember.name) ")
             }
             sequence.setNext(enumValue + 1)
-            return EnumMember(name: enumMember.name, value: .number(enumValue), comments: enumMember.leadingComments?.text)
+            return EnumMember(name: enumMember.name, value: .number(enumValue), comments: enumMember.leadingComments?.text, declaredVersion: declaredVersion)
         }
 
         if let stringValue = enumMember.stringValue {
-            return EnumMember(name: enumMember.name, value: .string(stringValue), comments: enumMember.leadingComments?.text)
+            return EnumMember(name: enumMember.name, value: .string(stringValue), comments: enumMember.leadingComments?.text, declaredVersion: declaredVersion)
         }
 
-        return EnumMember(name: enumMember.name, value: .number(sequence.assign()), comments: enumMember.leadingComments?.text)
+        return EnumMember(name: enumMember.name, value: .number(sequence.assign()), comments: enumMember.leadingComments?.text, declaredVersion: declaredVersion)
     }
 
     func exportFunction() -> Promise<(ExportedFunction, ValdiClassMapping)> {
@@ -423,17 +442,27 @@ final class TypeScriptNativeTypeExporter {
         }
 
         let comments = annotatedSymbol.mergedCommentsWithoutAnnotations()
+        let allowSyncCall = annotatedSymbol.annotations.contains(where: { $0.name == ValdiAnnotationType.allowSyncCall.rawValue })
 
         do {
-            let parameters = try dumpedFunction.type.parameters.map { try self.parsePropertyOrParameter(propertyLikeDeclaration: $0, references: self.commentedFile.references) }
+            let parameters = try dumpedFunction.type.parameters.map {
+                try self.parsePropertyOrParameter(
+                    propertyLikeDeclaration: $0,
+                    references: self.commentedFile.references,
+                    declaredVersion: nil
+                )
+            }
             let returnType = try self.resolveType(type: dumpedFunction.type.returnValue, references: self.commentedFile.references)
             let exportedFunction = ExportedFunction(containingIosType: self.iosType,
-                                                     containingAndroidTypeName: self.androidClass,
-                                                     functionName: dumpedFunction.name,
-                                                     parameters: parameters,
-                                                     returnType: returnType,
-                                                     comments: comments)
-             let classMapping = ValdiClassMapping()
+                                                    containingAndroidTypeName: self.androidClass,
+                                                    containingCppType: self.cppType,
+                                                    functionName: dumpedFunction.name,
+                                                    parameters: parameters,
+                                                    returnType: returnType,
+                                                    allowSyncCall: allowSyncCall,
+                                                    comments: comments,
+                                                    declaredVersion: nativeApiDeclaredVersion(annotations: annotatedSymbol.annotations))
+            let classMapping = ValdiClassMapping()
             return Promise(data: (exportedFunction, classMapping))
         } catch {
             return Promise(error: error)
@@ -443,13 +472,17 @@ final class TypeScriptNativeTypeExporter {
     func exportModule() -> Promise<(ExportedModule, ValdiClassMapping)>  {
         do {
             var model = ValdiModel()
+            model.tsType = dumpedSymbol.text
             model.exportAsInterface = true
             model.cppType = cppType
             model.iosType = iosType
             model.androidClassName = androidClass
+            model.declaredVersion = nativeApiDeclaredVersion(annotations: annotatedSymbol.annotations)
+            model.isNativeApi = true
 
-            for annotatedSymbol in commentedFile.annotatedSymbols where annotatedSymbol.symbol.modifiers?.contains("export") == true {
-                if let function = annotatedSymbol.symbol.function {
+            for exportedSymbol in commentedFile.annotatedSymbols where exportedSymbol.symbol.modifiers?.contains("export") == true {
+                let declaredVersion = nativeApiDeclaredVersion(annotations: exportedSymbol.annotations)
+                if let function = exportedSymbol.symbol.function {
                     let wrappedType = TS.AST.TSType(name: function.name,
                                                     leadingComments: nil,
                                                     function: function.type,
@@ -462,11 +495,19 @@ final class TypeScriptNativeTypeExporter {
                                                                   type: wrappedType,
                                                                   isOptional: false,
                                                                   leadingComments: dumpedSymbol.leadingComments,
-                                                                  references: self.commentedFile.references))
+                                                                  references: self.commentedFile.references,
+                                                                  declaredVersion: declaredVersion))
                 }
 
-                if let variable = annotatedSymbol.symbol.variable {
-                    model.properties.append(try parsePropertyLike(name: variable.name, type: variable.type, isOptional: false, leadingComments: variable.leadingComments, references: self.commentedFile.references))
+                if let variable = exportedSymbol.symbol.variable {
+                    model.properties.append(try parsePropertyLike(
+                        name: variable.name,
+                        type: variable.type,
+                        isOptional: false,
+                        leadingComments: variable.leadingComments,
+                        references: self.commentedFile.references,
+                        declaredVersion: declaredVersion
+                    ))
                 }
             }
 
@@ -488,7 +529,15 @@ final class TypeScriptNativeTypeExporter {
 
         do {
             let enumSequence = EnumMemberSequence()
-            let enumMembers = try dumpedEnum.members.map { try self.parseEnumMember(enumMember: $0, sequence: enumSequence) }
+            let enumMembers = try dumpedEnum.members.enumerated().map { index, enumMember in
+                try self.parseEnumMember(
+                    enumMember: enumMember,
+                    sequence: enumSequence,
+                    declaredVersion: nativeApiDeclaredVersion(
+                        annotations: annotatedSymbol.memberAnnotations[index] ?? []
+                    )
+                )
+            }
 
             let classMapping = ValdiClassMapping()
 
@@ -498,7 +547,7 @@ final class TypeScriptNativeTypeExporter {
                     TypeScriptAnnotatedSymbol.cleanCommentString($0)
                 }
 
-                return EnumCase(name: member.name, value: value, comments: comments)
+                return EnumCase(name: member.name, value: value, comments: comments, declaredVersion: member.declaredVersion)
             }
             let numberCases: [EnumCase<Int>] = enumMembers.compactMap { member in
                 guard case let .number(value) = member.value else { return nil }
@@ -506,7 +555,7 @@ final class TypeScriptNativeTypeExporter {
                     TypeScriptAnnotatedSymbol.cleanCommentString($0)
                 }
 
-                return EnumCase(name: member.name, value: value, comments: comments)
+                return EnumCase(name: member.name, value: value, comments: comments, declaredVersion: member.declaredVersion)
             }
 
             let valid = stringCases.isEmpty != numberCases.isEmpty
@@ -525,7 +574,8 @@ final class TypeScriptNativeTypeExporter {
                                             androidTypeName: self.androidClass,
                                             cppType: self.cppType,
                                             cases: enumCases,
-                                            comments: comments)
+                                            comments: comments,
+                                            declaredVersion: nativeApiDeclaredVersion(annotations: annotatedSymbol.annotations))
 
             return Promise(data: (.enum(exportedEnum), classMapping))
         } catch {
@@ -542,9 +592,15 @@ final class TypeScriptNativeTypeExporter {
 
         do {
             var properties: [ValdiModelProperty] = []
-            for member in dumpedInterface.members {
+            for (index, member) in dumpedInterface.members.enumerated() {
                 do {
-                    let property = try self.parsePropertyOrParameter(propertyLikeDeclaration: member, references: self.commentedFile.references)
+                    let property = try self.parsePropertyOrParameter(
+                        propertyLikeDeclaration: member,
+                        references: self.commentedFile.references,
+                        declaredVersion: nativeApiDeclaredVersion(
+                            annotations: annotatedSymbol.memberAnnotations[index] ?? []
+                        )
+                    )
                     properties.append(property)
                 } catch let error {
                     throw CompilerError("Failed to parse property \(member.name): \(error.legibleLocalizedDescription)")
@@ -559,6 +615,8 @@ final class TypeScriptNativeTypeExporter {
             model.properties = properties
             model.comments = comments
             model.typeParameters = dumpedInterface.typeParameters?.map { ValdiTypeParameter(name: $0.name) }
+            model.declaredVersion = nativeApiDeclaredVersion(annotations: annotatedSymbol.annotations)
+            model.isNativeApi = true
             
             // Check for usePublicFields parameter in ExportModel annotation
             if let exportModelAnnotation = self.annotatedSymbol.annotations.first(where: { $0.name == "ExportModel" }) {

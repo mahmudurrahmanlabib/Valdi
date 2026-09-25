@@ -131,13 +131,27 @@ void IosSignpostEmitter::end(const TraceEnd& traceEnd) {
 std::atomic<detail::TraceSdkScopedTraceSupport*> scopedTraceSupportInstance = nullptr;
 
 void TraceSdkScopedTrace::initialize(detail::TraceSdkScopedTraceSupport* scopedTraceSupport) {
-    std::atomic_store_explicit(&scopedTraceSupportInstance, scopedTraceSupport, std::memory_order::relaxed);
+    std::atomic_store_explicit(&scopedTraceSupportInstance, scopedTraceSupport, std::memory_order_relaxed);
 }
 
 TraceSdkScopedTrace::TraceSdkScopedTrace(const char* name) noexcept
-    : _scopedTraceSupport(std::atomic_load_explicit(&scopedTraceSupportInstance, std::memory_order::relaxed)) {
+    : _scopedTraceSupport(std::atomic_load_explicit(&scopedTraceSupportInstance, std::memory_order_relaxed)) {
     if (_scopedTraceSupport) {
         _cookie = _scopedTraceSupport->beginSync(name);
+    }
+}
+
+TraceSdkScopedTrace::TraceSdkScopedTrace(std::string_view name) noexcept
+    : _scopedTraceSupport(std::atomic_load_explicit(&scopedTraceSupportInstance, std::memory_order_relaxed)) {
+    if (_scopedTraceSupport) {
+        _cookie = _scopedTraceSupport->beginSync(name);
+    }
+}
+
+TraceSdkScopedTrace::TraceSdkScopedTrace(std::string_view name, uint64_t parentSpanId) noexcept
+    : _scopedTraceSupport(std::atomic_load_explicit(&scopedTraceSupportInstance, std::memory_order_relaxed)) {
+    if (_scopedTraceSupport) {
+        _cookie = _scopedTraceSupport->beginSyncWithFlow(name, parentSpanId);
     }
 }
 

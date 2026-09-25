@@ -1,3 +1,4 @@
+import { isAttributedText, renderAttributedText } from '../utils/parseAttributedText';
 import { WebValdiLayout } from './WebValdiLayout';
 
 export class WebValdiLabel extends WebValdiLayout {
@@ -18,10 +19,11 @@ export class WebValdiLabel extends WebValdiLayout {
       position: 'relative',
       textAlign: 'start',
       textDecoration: 'none',
-      whiteSpace: 'pre-wrap',
-      wordWrap: 'break-word',
+      // Native VALDI labels are single-line unless numberOfLines opts into
+      // wrapping; pre-wrap makes short labels (e.g. CTA pills) wrap on web.
+      whiteSpace: 'nowrap',
       fontFamily: 'sans-serif',
-      font: 'AvenirNext-DemiBold',
+      font: 'Montserrat-SemiBold',
       pointerEvents: 'auto',
     });
 
@@ -31,11 +33,45 @@ export class WebValdiLabel extends WebValdiLayout {
   changeAttribute(attributeName: string, attributeValue: any): void {
     switch (attributeName) {
       case 'value':
-        this.htmlElement.textContent = attributeValue;
+        if (isAttributedText(attributeValue)) {
+          this.htmlElement.textContent = '';
+          this.htmlElement.appendChild(renderAttributedText(attributeValue));
+        } else {
+          this.htmlElement.textContent = attributeValue;
+        }
         return;
       case 'numberOfLines':
-        // Not yet implemented
-        // If this falls through to the super call it'll break things.
+        if (typeof attributeValue === 'number' && attributeValue > 0) {
+          Object.assign(this.htmlElement.style, {
+            display: '-webkit-box',
+            WebkitLineClamp: String(attributeValue),
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+            whiteSpace: 'pre-wrap',
+            wordWrap: 'break-word',
+          });
+        } else if (typeof attributeValue === 'number') {
+          // Native VALDI treats numberOfLines <= 0 as unlimited multiline
+          // (TextViewHelper maps <= 0 to Int.MAX_VALUE), so wrap without clamping.
+          Object.assign(this.htmlElement.style, {
+            display: 'inline',
+            WebkitLineClamp: '',
+            WebkitBoxOrient: '',
+            overflow: 'visible',
+            whiteSpace: 'pre-wrap',
+            wordWrap: 'break-word',
+          });
+        } else {
+          // Unset: restore the single-line label default.
+          Object.assign(this.htmlElement.style, {
+            display: 'inline',
+            WebkitLineClamp: '',
+            WebkitBoxOrient: '',
+            overflow: 'visible',
+            whiteSpace: 'nowrap',
+            wordWrap: '',
+          });
+        }
         return;
     }
 

@@ -35,7 +35,8 @@ protected:
         _downloader->setDataResponse(_url, _imageData);
 
         auto zeroBitmap = loadResourceFromDisk("testdata/0x0.bmp");
-        SC_ASSERT(!zeroBitmap.failure());
+        ASSERT_FALSE(zeroBitmap.failure())
+            << "Failed to load testdata/0x0.bmp (ensure the file is in test data/runfiles)";
         _downloader->setDataResponse(_zeroDimensionErrorUrl, zeroBitmap.value());
 
         _downloader->setDataResponse(_dataErrorUrl, BytesView());
@@ -106,6 +107,14 @@ TEST_F(ImageLoaderTests, returnsErrorIfDataCannotBeConvertedToImage) {
     auto result = loadImage(_dataErrorUrl, getWidth(), getHeight());
     ASSERT_TRUE(result.failure());
     ASSERT_TRUE(result.error().toString().length() != 0);
+}
+
+TEST_F(ImageLoaderTests, decodeFailureReportsPayloadAndAssetSource) {
+    auto result = loadImage(_dataErrorUrl, getWidth(), getHeight());
+    ASSERT_TRUE(result.failure());
+    const auto message = result.error().toString();
+    EXPECT_NE(std::string::npos, message.find("Empty payload (bytes=0 magic=)")) << message;
+    EXPECT_NE(std::string::npos, message.find("[host=module ext=none]")) << message;
 }
 
 // NOTE(rjaber): Zero Dimension bitmaps are possible, but not currently supported by snap drawing

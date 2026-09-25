@@ -13,6 +13,7 @@
 #include <vector>
 
 namespace snap::valdi_core {
+class HTTPRequestManager;
 class ModuleFactoriesProvider;
 }
 
@@ -21,6 +22,7 @@ class IJavaScriptBridge;
 class RuntimeManager;
 class Arguments;
 class StringBox;
+class ValdiStandaloneRuntime;
 
 struct StandaloneArguments {
     StringBox scriptPath;
@@ -29,9 +31,13 @@ struct StandaloneArguments {
     LogType logLevel = LogTypeInfo;
     IJavaScriptBridge* jsBridge = nullptr;
     std::vector<std::shared_ptr<snap::valdi_core::ModuleFactoriesProvider>> moduleFactoriesProviders;
+    std::shared_ptr<snap::valdi_core::HTTPRequestManager> requestManager = nullptr;
     bool enableDebuggerService = false;
     bool enableHotReloader = false;
+    bool enableTSN = false;
 };
+
+Ref<ValdiStandaloneRuntime> createValdiStandaloneRuntime(const StandaloneArguments& arguments);
 
 int runValdiStandalone(const StandaloneArguments& arguments);
 

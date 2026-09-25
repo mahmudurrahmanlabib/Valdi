@@ -6,10 +6,13 @@
 //
 
 #include "valdi/runtime/Context/ViewNode.hpp"
+#include "valdi/runtime/Attributes/AttributeOwner.hpp"
 #include "valdi/runtime/Attributes/ViewNodeAttributesApplier.hpp"
 #include "valdi/runtime/Attributes/Yoga/Yoga.hpp"
 #include "valdi/runtime/CSS/CSSAttributesManager.hpp"
 #include "valdi/runtime/Context/IViewNodeAssetHandler.hpp"
+#include "valdi/runtime/Context/ScrollAnchorPosition.hpp"
+#include "valdi/runtime/Context/StickyPosition.hpp"
 #include "valdi/runtime/Context/ViewManagerContext.hpp"
 #include "valdi/runtime/Context/ViewNodeAccessibilityState.hpp"
 #include "valdi/runtime/Context/ViewNodeChildrenIndexer.hpp"
@@ -21,6 +24,7 @@
 #include "valdi/runtime/Interfaces/IViewManager.hpp"
 #include "valdi/runtime/Interfaces/IViewTransaction.hpp"
 #include "valdi/runtime/Utils/MainThreadManager.hpp"
+#include "valdi/runtime/ValdiBuildFlags.hpp"
 #include "valdi/runtime/Views/MeasureDelegate.hpp"
 #include "valdi/runtime/Views/ViewTransactionScope.hpp"
 #include "valdi_core/cpp/Constants.hpp"
@@ -38,29 +42,35 @@
 #include "valdi_core/cpp/Utils/ContainerUtils.hpp"
 #include <cmath>
 #include <fmt/format.h>
+#include <limits>
 #include <sstream>
-#include <yoga/YGNode.h>
+#include <yoga/Yoga.h>
+#include <yoga/algorithm/CalculateLayout.h>
+#include <yoga/enums/FlexDirection.h>
+#include <yoga/node/Node.h>
+#include <yoga/style/StyleSizeLength.h>
 
 namespace Valdi {
 
-YGSize ygMeasureYoga(
-    YGNodeRef node, float width, YGMeasureMode widthMode, float height, YGMeasureMode heightMode, void* context);
-void ygDirtiedCallback(YGNodeRef node);
+YGSize ygMeasureYoga(YGNodeConstRef node, float width, YGMeasureMode widthMode, float height, YGMeasureMode heightMode);
+void ygDirtiedCallback(YGNodeConstRef node);
 
 void destroyYogaNode(YGNode* yogaNode) {
     if (yogaNode == nullptr) {
         return;
     }
-    yogaNode->setContext(nullptr);
-    yogaNode->setDirtiedFunc(nullptr);
-    yogaNode->setMeasureFunc(nullptr);
+    auto* node = facebook::yoga::resolveRef(yogaNode);
+    node->setContext(nullptr);
+    node->setDirtiedFunc(nullptr);
+    node->setMeasureFunc(nullptr);
     YGNodeFree(yogaNode);
 }
 
 void setupYogaNode(YGNode* yogaNode, ViewNode* viewNode) {
     Yoga::attachViewNode(yogaNode, viewNode);
-    yogaNode->setDirty(true);
-    yogaNode->setDirtiedFunc(ygDirtiedCallback);
+    auto* node = facebook::yoga::resolveRef(yogaNode);
+    node->setDirty(true);
+    node->setDirtiedFunc(ygDirtiedCallback);
 }
 
 static auto getBackend(ViewNodeTree* tree) {
@@ -73,6 +83,18 @@ static auto getBackend(ViewNodeTree* tree) {
     }
 
     return viewManagerContext->getViewManager().getRenderingBackendType();
+}
+
+static facebook::yoga::Style& getYogaStyle(YGNodeRef node) {
+    return facebook::yoga::resolveRef(node)->style();
+}
+
+static facebook::yoga::Node* resolveYogaNode(YGNodeRef node) {
+    return facebook::yoga::resolveRef(node);
+}
+
+static const facebook::yoga::Node* resolveYogaNode(YGNodeConstRef node) {
+    return facebook::yoga::resolveRef(node);
 }
 
 static inline float sanitizeYogaValue(float yogaValue) {
@@ -96,9 +118,20 @@ LazyLayoutData::~LazyLayoutData() {
 
 void LazyLayoutData::destroyNode() {
     if (yogaNode != nullptr) {
+        facebook::yoga::resolveRef(yogaNode)->setDirtiedFunc(nullptr);
+        while (YGNodeGetChildCount(yogaNode) > 0) {
+            YGNodeRemoveChild(yogaNode, YGNodeGetChild(yogaNode, 0));
+        }
         destroyYogaNode(yogaNode);
         yogaNode = nullptr;
     }
+}
+
+float ViewNodeTranslation::getResolvedValue(float referenceLength, bool isPercent) const {
+    if (isPercent) {
+        return referenceLength * (value / 100.0f);
+    }
+    return value;
 }
 
 const SharedAnimator& nullAnimator() {
@@ -135,12 +168,23 @@ constexpr size_t kHasChildWithAccessibilityId = 26;
 constexpr size_t kCanAlwaysScrollHorizontal = 27;
 constexpr size_t kCanAlwaysScrollVertical = 28;
 constexpr size_t kAccessibilityTreeNeedsUpdate = 29;
+constexpr size_t kParentManagesChildFrames = 30;
+constexpr size_t kManagesChildFrames = 31;
+constexpr size_t kIsMeasuring = 32;
+constexpr size_t kManagedChildrenLayoutNeedsCommit = 33;
+constexpr size_t kTranslationXIsPercent = 34;
+constexpr size_t kTranslationYIsPercent = 35;
+constexpr size_t kHasOveriddenColorPalette = 36;
 
-ViewNode::ViewNode(YGConfig* yogaConfig, AttributeIds& attributeIds, ILogger& logger)
+ViewNode::ViewNode(YGConfig* yogaConfig,
+                   AttributeIds& attributeIds,
+                   const Ref<ColorPalette>& colorPalette,
+                   ILogger& logger)
     : _yogaNode(yogaConfig != nullptr ? Yoga::createNode(yogaConfig) : nullptr),
       _attributeIds(attributeIds),
       _logger(logger),
-      _attributesApplier(this) {
+      _attributesApplier(this),
+      _colorPalette(colorPalette) {
     if (_yogaNode != nullptr) {
         setupYogaNode(_yogaNode, this);
     }
@@ -172,6 +216,52 @@ ViewNodeTree* ViewNode::getViewNodeTree() const {
     return _viewNodeTree;
 }
 
+void ViewNode::setColorPaletteName(ViewTransactionScope& viewTransactionScope, const StringBox& colorPaletteName) {
+    if (colorPaletteName.isEmpty() && !hasOveriddenColorPalette()) {
+        return;
+    }
+
+    Ref<ColorPalette> colorPalette;
+    if (colorPaletteName.isEmpty()) {
+        colorPalette = getParentResolvedColorPalette();
+        setHasOveriddenColorPalette(false);
+    } else {
+        if (_viewNodeTree != nullptr) {
+            const auto& viewManagerContext = _viewNodeTree->getViewManagerContext();
+            if (viewManagerContext != nullptr) {
+                colorPalette = viewManagerContext->getAttributesManager().getColorPaletteManager()->getColorPalette(
+                    colorPaletteName);
+            }
+        }
+        setHasOveriddenColorPalette(true);
+    }
+
+    if (!setResolvedColorPalette(colorPalette)) {
+        return;
+    }
+
+    invalidateColorAttributes(viewTransactionScope, false);
+    propagateInheritedColorPalette(viewTransactionScope, _colorPalette);
+}
+
+void ViewNode::setInheritedColorPalette(ViewTransactionScope& viewTransactionScope,
+                                        const Ref<ColorPalette>& colorPalette) {
+    if (hasOveriddenColorPalette()) {
+        return;
+    }
+
+    if (!setResolvedColorPalette(colorPalette)) {
+        return;
+    }
+
+    invalidateColorAttributes(viewTransactionScope, true);
+    propagateInheritedColorPalette(viewTransactionScope, colorPalette);
+}
+
+const Ref<ColorPalette>& ViewNode::getResolvedColorPalette() const {
+    return _colorPalette;
+}
+
 const Ref<View>& ViewNode::getView() const {
     return _view;
 }
@@ -187,6 +277,33 @@ Ref<View> ViewNode::getViewAndDisablePooling() const {
 Value ViewNode::toPlaformRepresentation(bool wrapInPlatformReference) {
     return _viewNodeTree->getViewManagerContext()->getViewManager().createViewNodeWrapper(strongSmallRef(this),
                                                                                           wrapInPlatformReference);
+}
+
+void ViewNode::setStoredObject(const StringBox& key, const Value& value) {
+    if (value.isNullOrUndefined()) {
+        if (_storedObjects != nullptr) {
+            _storedObjects->erase(key);
+        }
+        return;
+    }
+
+    if (_storedObjects == nullptr) {
+        _storedObjects = makeShared<ValueMap>();
+    }
+    (*_storedObjects)[key] = value;
+}
+
+Value ViewNode::getStoredObject(const StringBox& key) const {
+    if (_storedObjects == nullptr) {
+        return Value::undefined();
+    }
+
+    auto it = _storedObjects->find(key);
+    if (it == _storedObjects->end()) {
+        return Value::undefined();
+    }
+
+    return it->second;
 }
 
 static void callViewCallbackIfNeeded(const Ref<ValueFunction>& valueFunction) {
@@ -610,6 +727,13 @@ ViewNodeUpdateViewTreeResult ViewNode::updateViewTree(ViewTransactionScope& view
                    updateResult.reinsertedViews);
     }
 
+    if (updateResult.visitedNodes > 0) {
+        if (const auto metrics = getMetrics(); metrics != nullptr) {
+            metrics->emitUpdateViewTreeLatency(
+                getModuleName(), sw.elapsed(), updateResult.visitedNodes, updateResult.createdViews);
+        }
+    }
+
     return updateResult;
 }
 
@@ -695,6 +819,27 @@ bool ViewNode::doUpdateVisibility(const Valdi::Frame& viewport,
             if (visibleInViewport) {
                 clipRect.x -= bounds.x;
                 clipRect.y -= bounds.y;
+
+                // Reverse-map the clip rect from visual (scaled) space back into
+                // the local coordinate space so children see the correct visible
+                // range. Negative scale also flips the axis; positive scale != 1
+                // only compresses/expands without flipping.
+                if (_scaleX < 0.0f) {
+                    const float absScaleX = -_scaleX;
+                    clipRect.x = (bounds.width - (clipRect.x + clipRect.width)) / absScaleX;
+                    clipRect.width = clipRect.width / absScaleX;
+                } else if (_scaleX > 0.0f && _scaleX != 1.0f) {
+                    clipRect.x /= _scaleX;
+                    clipRect.width /= _scaleX;
+                }
+                if (_scaleY < 0.0f) {
+                    const float absScaleY = -_scaleY;
+                    clipRect.y = (bounds.height - (clipRect.y + clipRect.height)) / absScaleY;
+                    clipRect.height = clipRect.height / absScaleY;
+                } else if (_scaleY > 0.0f && _scaleY != 1.0f) {
+                    clipRect.y /= _scaleY;
+                    clipRect.height /= _scaleY;
+                }
 
                 if (_scrollState != nullptr) {
                     _scrollState->resolveClipRect(clipRect);
@@ -854,6 +999,106 @@ Point ViewNode::getDirectionAgnosticScrollContentOffset() const {
     return _scrollState->getDirectionAgnosticContentOffset();
 }
 
+namespace {
+
+// Max depth to descend/search the scroll subtree when (re)finding the preserve anchor.
+constexpr int kPreserveAnchorMaxDepth = 12;
+
+// Absolute Y of `node` relative to `scrollNode` (sum of Yoga tops up the parent chain).
+float preserveAnchorAbsoluteTop(ViewNode* scrollNode, ViewNode* node) {
+    // A node may have no Yoga node (e.g. not-yet-laid-out lazy rows); treat its offset as 0.
+    float y = node->getYogaNode() ? sanitizeYogaValue(YGNodeLayoutGetTop(node->getYogaNode())) : 0.0f;
+    for (auto* parent = node->getParent().get(); parent != nullptr && parent != scrollNode;
+         parent = parent->getParent().get()) {
+        if (parent->getYogaNode()) {
+            y += sanitizeYogaValue(YGNodeLayoutGetTop(parent->getYogaNode()));
+        }
+    }
+    return y;
+}
+
+// Descend to the deepest node that straddles `probeY` (a content-space Y). Callers probe the
+// viewport CENTER, not its leading edge: the center is always real message content, whereas the
+// leading edge at the newest/oldest end sits on chrome (top padding, loading spinners, whitespace)
+// pinned to the content edge, which doesn't move when messages are inserted -- a useless anchor.
+// We pick by position (inverted lists are column-reverse) and descend to a leaf-sized node.
+ViewNode* preserveDescendantAtY(ViewNode* scrollNode, float probeY) {
+    ViewNode* anchor = nullptr;
+    ViewNode* node = scrollNode;
+    // Carry the running absolute top of `node` down the descent so a child's absolute top is just
+    // nodeTop + its own Yoga top -- no per-child walk back up to scrollNode (this runs per scroll
+    // frame). scrollNode is the origin, so its children's tops are relative to it (nodeTop = 0).
+    float nodeTop = 0.0f;
+    for (int depth = 0; depth < kPreserveAnchorMaxDepth; depth++) {
+        ViewNode* next = nullptr;
+        float nextTop = 0.0f;
+        float nearestBelowTop = 0.0f;
+        bool haveNearestBelow = false;
+        for (auto* child : *node) {
+            // Skip children without a layout node -- no position/size to anchor on.
+            if (!child->getYogaNode()) {
+                continue;
+            }
+            float top = nodeTop + sanitizeYogaValue(YGNodeLayoutGetTop(child->getYogaNode()));
+            float height = sanitizeYogaValue(YGNodeLayoutGetHeight(child->getYogaNode()));
+            if (probeY >= top && probeY < top + height) {
+                next = child;
+                nextTop = top;
+                break;
+            }
+            if (top >= probeY && (!haveNearestBelow || top < nearestBelowTop)) {
+                next = child;
+                nextTop = top;
+                nearestBelowTop = top;
+                haveNearestBelow = true;
+            }
+        }
+        if (!next)
+            break;
+        // Track the deepest node that has a trackable (non-zero) rawId. If the deepest node is
+        // id-less we fall back to this ancestor rather than returning an unanchorable node, which
+        // would clear the anchor and let the next reflow jump.
+        if (next->getRawId() != 0) {
+            anchor = next;
+        }
+        node = next;
+        nodeTop = nextTop;
+    }
+    return anchor;
+}
+
+ViewNode* preserveFindDescendantById(ViewNode* node, RawViewNodeId id, int depth) {
+    // id 0 is the unset/default rawId (e.g. synthetic placeholder nodes); never "match" it, or
+    // we would anchor to the first id-less node (content top) and jump the viewport.
+    if (depth <= 0 || id == 0)
+        return nullptr;
+    for (auto* child : *node) {
+        if (child->getRawId() == id)
+            return child;
+        auto* found = preserveFindDescendantById(child, id, depth - 1);
+        if (found)
+            return found;
+    }
+    return nullptr;
+}
+
+// Re-pick the anchor (the node at the viewport center) and remember its id + screen position
+// (absolute top relative to the viewport top) so a later content reflow can pin it back. Called
+// from both layout (updateScrollState) and scroll (handleOnScroll) so the anchor never goes stale
+// between layout passes.
+void refreshPreserveAnchor(ViewNode* scrollNode, ViewNodeScrollState& scrollState, float offsetY, float viewportH) {
+    float probeY = offsetY + viewportH * 0.5f;
+    // Only anchor on a node with a real, trackable rawId. id 0 (unset/default) can't be re-found
+    // across passes, so don't record it -- clear instead and re-pick next pass.
+    if (auto* anchor = preserveDescendantAtY(scrollNode, probeY); anchor != nullptr && anchor->getRawId() != 0) {
+        scrollState.setPreserveAnchor(anchor->getRawId(), preserveAnchorAbsoluteTop(scrollNode, anchor) - offsetY);
+    } else {
+        scrollState.clearPreserveAnchor();
+    }
+}
+
+} // namespace
+
 void ViewNode::handleOnScroll(const Point& directionDependentContentOffset,
                               const Point& directionDependentUnclampedContentOffset,
                               const Point& directionDependentVelocity) {
@@ -877,6 +1122,18 @@ void ViewNode::handleOnScroll(const Point& directionDependentContentOffset,
 
         scrollState.notifyOnScroll(
             directionAgnosticContentOffset, directionAgnosticUnclampedContentOffset, directionDependentVelocity);
+
+        // Keep the preserveScrollPosition anchor in sync with the live scroll position. Layout
+        // passes (updateScrollState) only run on relayout, but the offset also moves on scroll and
+        // clamp; refreshing here means a later content reflow pins the node the user is actually
+        // looking at, not a stale one captured at an old offset.
+        if (scrollState.getPreserveScrollPosition()) {
+            refreshPreserveAnchor(this, scrollState, directionAgnosticContentOffset.y, _calculatedFrame.height);
+        }
+
+        // Sticky headers: apply cached-measurement clamp inside the scroll frame so the
+        // transform lands in the same VSYNC as the scroll gesture. No layout thrash.
+        updateStickyHeaders(/*refreshCache=*/false);
 
         setCalculatedViewportNeedsUpdate();
     });
@@ -1125,6 +1382,14 @@ const Frame& ViewNode::getCalculatedFrame() const {
     return _calculatedFrame;
 }
 
+Frame ViewNode::getMeasuredFrame() const {
+    auto parent = getParent();
+    if (parent != nullptr && parent->_flags[kIsMeasuring] && _yogaNode != nullptr) {
+        return ygNodeGetFrame(_yogaNode, parent->getRtlScrollOffsetX());
+    }
+    return getCalculatedFrame();
+}
+
 Frame ViewNode::getDirectionAgnosticFrame() const {
     auto frame = getCalculatedFrame();
 
@@ -1187,12 +1452,12 @@ Point ViewNode::convertSelfVisualToRootVisual(const Point& selfDirectionDependen
 Point ViewNode::getDirectionDependentTransform() const {
     auto directionDependentFrame = getCalculatedFrame();
     return Point(directionDependentFrame.x + getDirectionDependentTranslationX(),
-                 directionDependentFrame.y + _translationY);
+                 directionDependentFrame.y + getTranslationY());
 }
 
 Point ViewNode::getDirectionAgnosticTransform() const {
     auto directionAgnosticFrame = getDirectionAgnosticFrame();
-    return Point(directionAgnosticFrame.x + _translationX, directionAgnosticFrame.y + _translationY);
+    return Point(directionAgnosticFrame.x + getTranslationX(), directionAgnosticFrame.y + getTranslationY());
 }
 
 Point ViewNode::getBoundsOriginPoint() const {
@@ -1246,15 +1511,27 @@ void ViewNode::setViewFactory(ViewTransactionScope& viewTransactionScope, const 
     if (_viewFactory != viewFactory) {
         removeView(viewTransactionScope);
         _viewFactory = viewFactory;
+        auto previousManagesChildFrames = managesChildFrames();
+        _flags[kManagesChildFrames] = viewFactory != nullptr && viewFactory->managesChildFrames();
+        if (previousManagesChildFrames != managesChildFrames()) {
+            auto previousIsLazyLayout = isLazyLayout();
+            updateIsLazyLayout(viewTransactionScope);
+            if (previousIsLazyLayout == isLazyLayout()) {
+                reinsertChildrenInYogaContainer(viewTransactionScope);
+            }
+        }
 
         if (viewFactory != nullptr) {
             setIsLayout(viewFactory->getViewClassName() == AttributesManager::getLayoutPlaceholderClassName());
-            _attributesApplier.setBoundAttributes(viewFactory->getBoundAttributes());
-            _flags[kScrollAttributesBound] = viewFactory->getBoundAttributes()->isBackingClassScrollable();
+            auto boundAttributes = viewFactory->getBoundAttributes();
+            _attributesApplier.setBoundAttributes(boundAttributes);
+            _flags[kScrollAttributesBound] =
+                (boundAttributes != nullptr && boundAttributes->isBackingClassScrollable());
 
             if (_flags[kScrollAttributesBound]) {
-                getYogaNodeForInsertingChildren()->getStyle().overflow() = YGOverflowScroll;
+                getYogaStyle(getYogaNodeForInsertingChildren()).setOverflow(facebook::yoga::Overflow::Scroll);
             }
+            updateYogaMeasureFunc();
         } else {
             setIsLayout(true);
             _attributesApplier.setBoundAttributes(nullptr);
@@ -1265,8 +1542,17 @@ void ViewNode::setViewFactory(ViewTransactionScope& viewTransactionScope, const 
 void ViewNode::setViewClassNameForPlatform(ViewTransactionScope& viewTransactionScope,
                                            const StringBox& viewClassName,
                                            PlatformType platformType) {
-    if (_viewNodeTree->getViewManagerContext()->getViewManager().getPlatformType() != platformType) {
-        return;
+    auto currentPlatformType = _viewNodeTree->getViewManagerContext()->getViewManager().getPlatformType();
+    if (currentPlatformType != platformType) {
+        // macOS and Linux fall through to iOS class names as the base fallback.
+        // macosClass / linuxClass overwrite iosClass when explicitly set (bound later).
+        bool isFallthrough = ((currentPlatformType == PlatformTypeMacOS || currentPlatformType == PlatformTypeLinux) &&
+                              platformType == PlatformTypeIOS) ||
+                             // Linux also accepts macosClass as a shared-desktop override.
+                             (currentPlatformType == PlatformTypeLinux && platformType == PlatformTypeMacOS);
+        if (!isFallthrough) {
+            return;
+        }
     }
 
     if (viewClassName.isEmpty()) {
@@ -1307,6 +1593,7 @@ void ViewNode::removeFromParent(ViewTransactionScope& viewTransactionScope) {
         return;
     }
     auto parent = getParent();
+    auto previousParentManagedChildFrames = parentManagesChildFrames();
 
     auto* owner = YGNodeGetOwner(_yogaNode);
     if (owner != nullptr) {
@@ -1319,10 +1606,24 @@ void ViewNode::removeFromParent(ViewTransactionScope& viewTransactionScope) {
     getCSSAttributesManager().setParent(nullptr);
     _parent.reset();
     setHasParent(false);
+    _flags[kParentManagesChildFrames] = false;
+    if (previousParentManagedChildFrames) {
+        getYogaStyle(_yogaNode).setPositionType(facebook::yoga::PositionType::Relative);
+        // Relative is the default, not necessarily what this node declared. insertChildAt forces
+        // Absolute for a managed-child-frames parent but only restores position in that same branch,
+        // so a node declaring `position: "absolute"` that moves from a managed parent to a standard
+        // one would keep the Relative set above — and the attributes applier caches last-applied
+        // values, so it would not notice the style no longer matches and would never re-apply.
+        //
+        // reapplyAttribute markDirty()s first, so it re-applies even though the cached value is
+        // unchanged, and it no-ops when `position` was never set — leaving the Relative default in
+        // place for the common case.
+        _attributesApplier.reapplyAttribute(viewTransactionScope, getAttributeIds().getIdForName("position"));
+    }
 }
 
 void ViewNode::appendChild(ViewTransactionScope& viewTransactionScope, const Ref<ViewNode>& child) {
-    insertChildAt(viewTransactionScope, child, getChildCount());
+    insertChildAt(viewTransactionScope, child, getLiveChildCount());
 }
 
 void ViewNode::insertChildAt(ViewTransactionScope& viewTransactionScope, const Ref<ViewNode>& child, size_t index) {
@@ -1332,6 +1633,7 @@ void ViewNode::insertChildAt(ViewTransactionScope& viewTransactionScope, const R
     child->removeFromParent(viewTransactionScope);
     child->_parent = weakRef(this);
     child->setHasParent(true);
+    child->_flags[kParentManagesChildFrames] = managesChildFrames();
 
     auto* yogaContainer = getYogaNodeForInsertingChildren();
     if (static_cast<size_t>(YGNodeGetChildCount(yogaContainer)) < index) {
@@ -1347,8 +1649,13 @@ void ViewNode::insertChildAt(ViewTransactionScope& viewTransactionScope, const R
         return;
     }
 
-    yogaContainer->setMeasureFunc(nullptr);
-    YGNodeInsertChild(yogaContainer, child->_yogaNode, static_cast<uint32_t>(index));
+    if (managesChildFrames()) {
+        getYogaStyle(child->_yogaNode).setPositionType(facebook::yoga::PositionType::Absolute);
+    } else {
+        resolveYogaNode(yogaContainer)->setMeasureFunc(nullptr);
+    }
+    YGNodeInsertChild(
+        yogaContainer, child->_yogaNode, static_cast<uint32_t>(resolveYogaInsertionIndexForLiveIndex(index)));
 
     child->getCSSAttributesManager().setParent(&getCSSAttributesManager());
 
@@ -1367,6 +1674,7 @@ void ViewNode::insertChildAt(ViewTransactionScope& viewTransactionScope, const R
     if (getChildCount() > kMaxChildrenBeforeIndexing && _childrenIndexer == nullptr) {
         _childrenIndexer = std::make_unique<ViewNodeChildrenIndexer>(this);
     }
+    child->setInheritedColorPalette(viewTransactionScope, _colorPalette);
 
     setCalculatedViewportHasChildNeedsUpdate();
 
@@ -1384,13 +1692,16 @@ bool ViewNode::invalidateMeasuredSize() {
         return _emittingViewNode->invalidateMeasuredSize();
     }
 
+    if (parentManagesChildFrames()) {
+        return getParent()->markLayoutDirty();
+    }
+
     if (_yogaNode == nullptr) {
         return false;
     }
 
-    if (!_yogaNode->getLayout().didUseCustomMeasure()) {
-        // If we did not use a custom measure, there is no need to dirty our yoga node, because it would not have
-        // any impact on the layout.
+    if (!facebook::yoga::resolveRef(_yogaNode)->hasMeasureFunc()) {
+        // If there is no custom measure func, there is no need to dirty our yoga node.
         return false;
     }
 
@@ -1406,12 +1717,12 @@ bool ViewNode::markLayoutDirty() {
         return false;
     }
 
-    _yogaNode->markDirtyAndPropogate();
+    facebook::yoga::resolveRef(_yogaNode)->markDirtyAndPropagate();
     return true;
 }
 
 bool ViewNode::isFlexLayoutDirty() const {
-    return _yogaNode->isDirty();
+    return resolveYogaNode(_yogaNode)->isDirty();
 }
 
 bool ViewNode::isLazyLayoutDirty() const {
@@ -1419,24 +1730,69 @@ bool ViewNode::isLazyLayoutDirty() const {
 }
 
 Size ViewNode::onMeasure(float width, MeasureMode widthMode, float height, MeasureMode heightMode) {
+    _flags[kIsMeasuring] = true;
+
+    if (managesChildFrames()) {
+        updateManagedChildrenLayout(width, widthMode, height, heightMode, /* forceLayout */ true);
+    }
+
+    // Gated (on by default; a host can disable it per renderer via config as a kill switch): a
+    // managesChildFrames node routes its `padding` (a children-node attribute) to a detached container
+    // yoga node, so its own measuring yoga node has no padding — Yoga neither reserves it from the
+    // space it offers this node nor adds it back, and a padded label/pill collapses to its content
+    // size. When enabled, mirror Yoga's normal leaf behavior: reserve the padding from the space handed
+    // to the measurer (so text wraps in the inner width), then add it back to the measured content.
+    bool applyManagedChildFramePadding = true;
+    if (_viewNodeTree != nullptr) {
+        const auto& viewManagerContext = _viewNodeTree->getViewManagerContext();
+        if (viewManagerContext != nullptr) {
+            applyManagedChildFramePadding = viewManagerContext->getApplyManagedChildFramePadding();
+        }
+    }
+
+    float paddingWidth = 0;
+    float paddingHeight = 0;
+    if (managesChildFrames() && applyManagedChildFramePadding) {
+        auto* detachedYogaNode = getDetachedYogaNode();
+        if (detachedYogaNode != nullptr) {
+            const auto& containerLayout = resolveYogaNode(detachedYogaNode)->getLayout();
+            paddingWidth = containerLayout.padding(facebook::yoga::PhysicalEdge::Left) +
+                           containerLayout.padding(facebook::yoga::PhysicalEdge::Right);
+            paddingHeight = containerLayout.padding(facebook::yoga::PhysicalEdge::Top) +
+                            containerLayout.padding(facebook::yoga::PhysicalEdge::Bottom);
+        }
+    }
+
+    // Only reserve padding from a bounded dimension; an unspecified axis is already unconstrained.
+    float measureWidth = (widthMode != MeasureModeUnspecified && width > paddingWidth) ? width - paddingWidth : width;
+    float measureHeight =
+        (heightMode != MeasureModeUnspecified && height > paddingHeight) ? height - paddingHeight : height;
+
+    Size measuredSize;
     if (_lazyLayoutData != nullptr && _lazyLayoutData->onMeasureCallback != nullptr) {
         VALDI_TRACE("Valdi.onMeasureNode.external");
-        return measureExternal(width, widthMode, height, heightMode);
+        measuredSize = measureExternal(measureWidth, widthMode, measureHeight, heightMode);
     } else if (_attributesApplier.getBoundAttributes() != nullptr &&
                _attributesApplier.getBoundAttributes()->getMeasureDelegate() != nullptr) {
         VALDI_TRACE("Valdi.onMeasureNode.delegate");
-        return _attributesApplier.getBoundAttributes()->getMeasureDelegate()->measure(
-            *this, width, widthMode, height, heightMode);
+        measuredSize = _attributesApplier.getBoundAttributes()->getMeasureDelegate()->measure(
+            *this, measureWidth, widthMode, measureHeight, heightMode);
     } else if (_lazyLayoutData != nullptr) {
-        return Size(_lazyLayoutData->estimatedWidth, _lazyLayoutData->estimatedHeight);
+        measuredSize = Size(_lazyLayoutData->estimatedWidth, _lazyLayoutData->estimatedHeight);
     } else {
-        return Size();
+        measuredSize = Size();
     }
+
+    measuredSize.width += paddingWidth;
+    measuredSize.height += paddingHeight;
+
+    _flags[kIsMeasuring] = false;
+    return measuredSize;
 }
 
 Ref<ViewNode> ViewNode::makePlaceholderViewNode(ViewTransactionScope& viewTransactionScope,
                                                 const Ref<View>& placeholderView) {
-    auto viewNode = Valdi::makeShared<ViewNode>(nullptr, _attributeIds, _logger);
+    auto viewNode = Valdi::makeShared<ViewNode>(nullptr, _attributeIds, _colorPalette, _logger);
     viewNode->setViewNodeTree(_viewNodeTree);
     viewNode->setViewFactory(viewTransactionScope, _viewFactory);
     viewNode->_emittingViewNode = strongSmallRef(this);
@@ -1482,6 +1838,10 @@ bool ViewNode::isMeasurerPlaceholder() const {
     return _emittingViewNode != nullptr;
 }
 
+ViewNode* ViewNode::getEmittingViewNode() const {
+    return _emittingViewNode.get();
+}
+
 void ViewNode::valueChanged(AttributeId attribute, const Value& value, bool shouldNotifySync) {
     _attributesApplier.updateAttributeWithoutUpdate(attribute, value);
 
@@ -1518,7 +1878,12 @@ void ViewNode::setIsLayout(bool isLayout) {
 }
 
 bool ViewNode::needsYogaMeasureFunc() const {
-    if (!hasParent() || !_yogaNode->getChildren().empty()) {
+    if (!hasParent()) {
+        // No measure func if we are the root.
+        return false;
+    }
+
+    if (!managesChildFrames() && resolveYogaNode(_yogaNode)->getChildCount() > 0) {
         // No measure func if we are the root or if we are a container
         return false;
     }
@@ -1533,15 +1898,37 @@ bool ViewNode::needsYogaMeasureFunc() const {
     }
 }
 
+bool ViewNode::updateManagedChildrenLayout(
+    float width, MeasureMode widthMode, float height, MeasureMode heightMode, bool forceLayout) {
+    auto* managedChildrenYogaNode = getDetachedYogaNode();
+    if (managedChildrenYogaNode == nullptr) {
+        return false;
+    }
+
+    auto updated = calculateLayoutOnNodeIfNeeded(managedChildrenYogaNode,
+                                                 width,
+                                                 widthMode,
+                                                 height,
+                                                 heightMode,
+                                                 _flags[kLayoutIsRightToLeft] ? LayoutDirectionRTL : LayoutDirectionLTR,
+                                                 forceLayout,
+                                                 /* isFromLazyLayout */ false);
+    if (updated) {
+        _flags[kManagedChildrenLayoutNeedsCommit] = true;
+    }
+    return updated;
+}
+
 void ViewNode::updateYogaMeasureFunc() {
     if (_yogaNode == nullptr) {
         return;
     }
 
+    auto* resolvedYogaNode = facebook::yoga::resolveRef(_yogaNode);
     if (needsYogaMeasureFunc()) {
-        _yogaNode->setMeasureFunc(ygMeasureYoga);
+        resolvedYogaNode->setMeasureFunc(ygMeasureYoga);
     } else {
-        _yogaNode->setMeasureFunc(nullptr);
+        resolvedYogaNode->setMeasureFunc(nullptr);
     }
 }
 
@@ -1550,6 +1937,7 @@ bool ViewNode::isLazyLayout() const {
 }
 
 void ViewNode::setIsLazyLayout(ViewTransactionScope& viewTransactionScope, bool isLazyLayout) {
+    isLazyLayout = isLazyLayout && !managesChildFrames();
     if (_flags[kIsLazyLayoutFlag] == isLazyLayout) {
         return;
     }
@@ -1580,8 +1968,19 @@ void ViewNode::setPrefersLazyLayout(ViewTransactionScope& viewTransactionScope, 
 
 void ViewNode::updateIsLazyLayout(ViewTransactionScope& viewTransactionScope) {
     setIsLazyLayout(viewTransactionScope,
-                    _flags[kPrefersLazyLayoutFlag] ||
-                        (_lazyLayoutData != nullptr && _lazyLayoutData->onMeasureCallback != nullptr));
+                    !managesChildFrames() &&
+                        (_flags[kPrefersLazyLayoutFlag] ||
+                         (_lazyLayoutData != nullptr && _lazyLayoutData->onMeasureCallback != nullptr)));
+}
+
+void ViewNode::reinsertChildrenInYogaContainer(ViewTransactionScope& viewTransactionScope) {
+    auto allChildren = copyChildren();
+    for (const auto& childViewNode : allChildren) {
+        childViewNode->removeFromParent(viewTransactionScope);
+    }
+    for (const auto& childViewNode : allChildren) {
+        appendChild(viewTransactionScope, childViewNode);
+    }
 }
 
 LazyLayoutData& ViewNode::getOrCreateLazyLayoutData() {
@@ -1591,32 +1990,41 @@ LazyLayoutData& ViewNode::getOrCreateLazyLayoutData() {
     return *_lazyLayoutData;
 }
 
+YGNode* ViewNode::getOrCreateDetachedYogaNode() {
+    auto& lazyLayoutData = getOrCreateLazyLayoutData();
+    if (lazyLayoutData.yogaNode == nullptr) {
+        lazyLayoutData.yogaNode =
+            Yoga::createNode(const_cast<facebook::yoga::Config*>(facebook::yoga::resolveRef(_yogaNode)->getConfig()));
+        setupYogaNode(lazyLayoutData.yogaNode, this);
+    }
+    return lazyLayoutData.yogaNode;
+}
+
+YGNode* ViewNode::getDetachedYogaNode() const {
+    return _lazyLayoutData != nullptr ? _lazyLayoutData->yogaNode : nullptr;
+}
+
 YGNode* ViewNode::getLazyLayoutYogaNode() const {
     return _lazyLayoutData != nullptr ? _lazyLayoutData->yogaNode : nullptr;
 }
 
 const YGNode* ViewNode::getContainerYogaNode() const {
-    if (_lazyLayoutData == nullptr || _lazyLayoutData->yogaNode == nullptr) {
-        return _yogaNode;
-    } else {
-        return _lazyLayoutData->yogaNode;
-    }
+    auto* detachedYogaNode = getDetachedYogaNode();
+    return detachedYogaNode != nullptr ? detachedYogaNode : _yogaNode;
 }
 
 YGNode* ViewNode::getYogaNodeForInsertingChildren() {
-    if (!_flags[kIsLazyLayoutFlag]) {
+    if (!_flags[kIsLazyLayoutFlag] && !managesChildFrames()) {
         return _yogaNode;
     }
-    auto& lazyLayoutData = getOrCreateLazyLayoutData();
-    if (lazyLayoutData.yogaNode == nullptr) {
-        lazyLayoutData.yogaNode = Yoga::createNode(_yogaNode->getConfig());
-        setupYogaNode(lazyLayoutData.yogaNode, this);
+    auto* detachedYogaNode = getOrCreateDetachedYogaNode();
+    if (_flags[kIsLazyLayoutFlag] && YGNodeGetChildCount(detachedYogaNode) == 0) {
         // First time we are inserting in this lazyLayout, schedule a lazyLayout pass since our node
         // will be already dirty and won't trigger the yoga dirtied callbacks.
         scheduleLazyLayout();
     }
 
-    return lazyLayoutData.yogaNode;
+    return detachedYogaNode;
 }
 
 size_t ViewNode::getChildCount() const {
@@ -1625,16 +2033,32 @@ size_t ViewNode::getChildCount() const {
         return 0;
     }
 
-    return yogaNode->getChildren().size();
+    return resolveYogaNode(yogaNode)->getChildCount();
+}
+
+size_t ViewNode::getLiveChildCount() const {
+    return getChildCount();
+}
+
+size_t ViewNode::resolveYogaInsertionIndexForLiveIndex(size_t liveIndex) {
+    return liveIndex;
 }
 
 ViewNode* ViewNode::getChildAt(size_t index) const {
     const auto* yogaNode = getContainerYogaNode();
     SC_ASSERT_NOTNULL(yogaNode);
 
-    auto* childYogaNode = yogaNode->getChildren()[index];
+    auto* childYogaNode = resolveYogaNode(yogaNode)->getChild(index);
     auto* childViewNode = reinterpret_cast<ViewNode*>(Yoga::getAttachedViewNode(childYogaNode));
     return childViewNode;
+}
+
+bool ViewNode::managesChildFrames() const {
+    return _flags[kManagesChildFrames];
+}
+
+bool ViewNode::parentManagesChildFrames() const {
+    return _flags[kParentManagesChildFrames];
 }
 
 std::string ViewNode::getLayoutDebugDescription() const {
@@ -1770,7 +2194,29 @@ void ViewNode::setHasParent(bool hasParent) {
 }
 
 Frame ViewNode::calculateSelfViewport() const {
-    auto bounds = _calculatedFrame.withOffset(getDirectionDependentTranslationX(), _translationY);
+    auto tx = getDirectionDependentTranslationX();
+    auto ty = getTranslationY();
+    auto& f = _calculatedFrame;
+    Frame bounds;
+    if (VALDI_LIKELY(_scaleX == 1.0f && _scaleY == 1.0f)) {
+        bounds = f.withOffset(tx, ty);
+    } else {
+        // Scale is applied around the center anchor point (matching iOS CALayer default
+        // anchor of 0.5,0.5 and Android View default pivot at center).
+        auto scaledX = f.x + (f.width * (1.0f - _scaleX)) / 2.0f + tx;
+        auto scaledY = f.y + (f.height * (1.0f - _scaleY)) / 2.0f + ty;
+        bounds = Frame(scaledX, scaledY, f.width * _scaleX, f.height * _scaleY);
+        // Normalize to ensure positive dimensions so that Frame::intersects() and
+        // setLeft/Right/Top/Bottom all work correctly (negative scale flips sign).
+        if (bounds.width < 0.0f) {
+            bounds.x += bounds.width;
+            bounds.width = -bounds.width;
+        }
+        if (bounds.height < 0.0f) {
+            bounds.y += bounds.height;
+            bounds.height = -bounds.height;
+        }
+    }
     if (VALDI_UNLIKELY(extendViewportWithChildren())) {
         for (auto* child : *this) {
             auto childBounds = child->calculateSelfViewport();
@@ -1966,27 +2412,20 @@ struct MeasureMetrics {
     uint32_t totalMeasure = 0;
 };
 
-YGValue resolveYogaValue(float containerSize, YGValue appliedValue) {
+static thread_local MeasureMetrics* currentMeasureMetrics = nullptr;
+
+facebook::yoga::StyleSizeLength resolveYogaValue(float containerSize, facebook::yoga::StyleSizeLength appliedValue) {
     float resolvedValue;
 
-    switch (appliedValue.unit) {
-        case YGUnitUndefined:
-        case YGUnitAuto:
-            resolvedValue = containerSize;
-            break;
-        case YGUnitPoint:
-            resolvedValue = std::min(appliedValue.value, containerSize);
-            break;
-        case YGUnitPercent:
-            resolvedValue = appliedValue.value * containerSize * 0.01f;
-            break;
+    if (appliedValue.isPoints()) {
+        resolvedValue = std::min(appliedValue.value().unwrap(), containerSize);
+    } else if (appliedValue.isPercent()) {
+        resolvedValue = appliedValue.value().unwrap() * containerSize * 0.01f;
+    } else {
+        resolvedValue = containerSize;
     }
 
-    YGValue out;
-    out.value = resolvedValue;
-    out.unit = YGUnitPoint;
-
-    return out;
+    return facebook::yoga::StyleSizeLength::points(resolvedValue);
 }
 
 static void doCalculateLayoutOnNode(YGNode* yogaNode,
@@ -1996,13 +2435,13 @@ static void doCalculateLayoutOnNode(YGNode* yogaNode,
                                     MeasureMode heightMode,
                                     LayoutDirection direction,
                                     MeasureMetrics& measureCount) {
-    YGDirection yogaDirection;
+    facebook::yoga::Direction yogaDirection;
     switch (direction) {
         case LayoutDirectionLTR:
-            yogaDirection = YGDirectionLTR;
+            yogaDirection = facebook::yoga::Direction::LTR;
             break;
         case LayoutDirectionRTL:
-            yogaDirection = YGDirectionRTL;
+            yogaDirection = facebook::yoga::Direction::RTL;
             break;
     }
 
@@ -2014,8 +2453,8 @@ static void doCalculateLayoutOnNode(YGNode* yogaNode,
         heightMode = MeasureModeUnspecified;
     }
 
-    YGValue savedMaxWidth = yogaNode->getStyle().maxDimensions()[YGDimensionWidth];
-    YGValue savedMaxHeight = yogaNode->getStyle().maxDimensions()[YGDimensionHeight];
+    auto savedMaxWidth = getYogaStyle(yogaNode).maxDimension(facebook::yoga::Dimension::Width);
+    auto savedMaxHeight = getYogaStyle(yogaNode).maxDimension(facebook::yoga::Dimension::Height);
 
     float ownerWidth;
     switch (widthMode) {
@@ -2027,7 +2466,8 @@ static void doCalculateLayoutOnNode(YGNode* yogaNode,
             break;
         case MeasureModeAtMost:
             ownerWidth = width;
-            yogaNode->getStyle().maxDimensions()[YGDimensionWidth] = resolveYogaValue(width, savedMaxWidth);
+            getYogaStyle(yogaNode).setMaxDimension(facebook::yoga::Dimension::Width,
+                                                   resolveYogaValue(width, savedMaxWidth));
             break;
     }
 
@@ -2041,15 +2481,18 @@ static void doCalculateLayoutOnNode(YGNode* yogaNode,
             break;
         case MeasureModeAtMost:
             ownerHeight = height;
-            yogaNode->getStyle().maxDimensions()[YGDimensionHeight] = resolveYogaValue(height, savedMaxHeight);
+            getYogaStyle(yogaNode).setMaxDimension(facebook::yoga::Dimension::Height,
+                                                   resolveYogaValue(height, savedMaxHeight));
             break;
     }
 
-    YGNodeCalculateLayoutWithContext(
-        yogaNode, ownerWidth, ownerHeight, yogaDirection, static_cast<void*>(&measureCount));
+    auto* previousMeasureMetrics = currentMeasureMetrics;
+    currentMeasureMetrics = &measureCount;
+    facebook::yoga::calculateLayout(facebook::yoga::resolveRef(yogaNode), ownerWidth, ownerHeight, yogaDirection);
+    currentMeasureMetrics = previousMeasureMetrics;
 
-    yogaNode->getStyle().maxDimensions()[YGDimensionWidth] = savedMaxWidth;
-    yogaNode->getStyle().maxDimensions()[YGDimensionHeight] = savedMaxHeight;
+    getYogaStyle(yogaNode).setMaxDimension(facebook::yoga::Dimension::Width, savedMaxWidth);
+    getYogaStyle(yogaNode).setMaxDimension(facebook::yoga::Dimension::Height, savedMaxHeight);
 }
 
 bool ViewNode::calculateLayoutOnNodeIfNeeded(YGNode* yogaNode,
@@ -2060,14 +2503,18 @@ bool ViewNode::calculateLayoutOnNodeIfNeeded(YGNode* yogaNode,
                                              LayoutDirection direction,
                                              bool forceLayout,
                                              bool isFromLazyLayout) const {
-    if (!yogaNode->isDirty() && !forceLayout) {
+    if (!resolveYogaNode(yogaNode)->isDirty() && !forceLayout) {
         return false;
     }
 
     auto backendString = getBackendString(getBackend(_viewNodeTree));
     auto module = getModuleName();
 
+#if VALDI_DEBUG_TREE_UPDATES
+    VALDI_TRACE_META("Valdi.calculateLayout", std::to_string(getRecursiveChildCount()));
+#else
     VALDI_TRACE("Valdi.calculateLayout");
+#endif
     auto metricsObj = getMetrics();
     ScopedMetrics metrics = isFromLazyLayout ?
                                 Metrics::scopedCalculateLazyLayoutLatency(metricsObj, module, backendString) :
@@ -2145,7 +2592,7 @@ Size ViewNode::measureLayout(
     }
 }
 
-void ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope, bool didPerformLayout) {
+bool ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope, bool didPerformLayout) {
     ViewNodesFrameObserver* frameObserver = nullptr;
     if (_viewNodeTree != nullptr) {
         frameObserver = _viewNodeTree->getViewNodesFrameObserver();
@@ -2160,17 +2607,18 @@ void ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope, bool d
     }
 
     VALDI_TRACE("Valdi.updateCalculatedFrames");
-    layoutFinished(viewTransactionScope,
-                   didPerformLayout,
-                   getViewOffsetX(),
-                   getViewOffsetY(),
-                   rtlOffsetX,
-                   nullptr,
-                   parentChildrenIndexer,
-                   frameObserver);
+    auto calculatedFrameDidChange = layoutFinished(viewTransactionScope,
+                                                   didPerformLayout,
+                                                   getViewOffsetX(),
+                                                   getViewOffsetY(),
+                                                   rtlOffsetX,
+                                                   nullptr,
+                                                   parentChildrenIndexer,
+                                                   frameObserver);
     if (frameObserver != nullptr) {
         frameObserver->flush();
     }
+    return calculatedFrameDidChange;
 }
 
 bool ViewNode::isInScrollMode() const {
@@ -2197,13 +2645,12 @@ bool ViewNode::updateCalculatedFrame(float viewOffsetX,
     auto newFrame = ygNodeGetFrame(_yogaNode, rtlOffsetX);
     auto newViewFrame = newFrame.withOffset(viewOffsetX, viewOffsetY);
 
-    auto hasNewLayout = _yogaNode->getHasNewLayout();
+    auto hasNewLayout = resolveYogaNode(_yogaNode)->getHasNewLayout();
     auto hadLayout = _flags[kLayoutDidCompleteOnceFlag];
     auto layoutIsRightToLeft = isRightToLeft();
-
+    auto layoutDirectionDidChange = layoutIsRightToLeft != _flags[kLayoutIsRightToLeft];
     if (!hadLayout || _calculatedFrame != newFrame) {
-        *calculatedSizeDidChange =
-            _calculatedFrame.width != newFrame.width || _calculatedFrame.height != newFrame.height;
+        *calculatedSizeDidChange = _calculatedFrame.size() != newFrame.size();
         *calculatedFrameDidChange = true;
         _calculatedFrame = newFrame;
 
@@ -2211,7 +2658,7 @@ bool ViewNode::updateCalculatedFrame(float viewOffsetX,
         hasNewLayout = true;
     }
 
-    if (!hadLayout || _viewFrame != newViewFrame || layoutIsRightToLeft != _flags[kLayoutIsRightToLeft]) {
+    if (!hadLayout || _viewFrame != newViewFrame || layoutDirectionDidChange) {
         _previousViewFrame = _viewFrame;
         _viewFrame = newViewFrame;
         _flags[kLayoutIsRightToLeft] = layoutIsRightToLeft;
@@ -2226,7 +2673,7 @@ bool ViewNode::updateCalculatedFrame(float viewOffsetX,
 
     _flags[kLayoutDidCompleteOnceFlag] = true;
 
-    _yogaNode->setHasNewLayout(false);
+    resolveYogaNode(_yogaNode)->setHasNewLayout(false);
 
     return true;
 }
@@ -2235,10 +2682,10 @@ bool ViewNode::updateLazyLayout() {
     // Using lazy-layout creates a new "detached" yoga subtree, so the device-level RTL/LTR style that
     // we set on the root node doesn't propagate to that detached subtree.
     // Need to manually set the Direction style on the detached subtree.
-    auto direction = _yogaNode->getLayout().direction();
-    auto previousDirection = _lazyLayoutData->yogaNode->getLayout().direction();
+    auto direction = facebook::yoga::resolveRef(_yogaNode)->getLayout().direction();
+    auto previousDirection = facebook::yoga::resolveRef(_lazyLayoutData->yogaNode)->getLayout().direction();
     auto directionHasChanged = direction != previousDirection;
-    YGNodeStyleSetDirection(_lazyLayoutData->yogaNode, direction);
+    getYogaStyle(_lazyLayoutData->yogaNode).setDirection(direction);
 
     auto sizeHasChanged = _lazyLayoutData->availableWidth != _calculatedFrame.width ||
                           _lazyLayoutData->availableHeight != _calculatedFrame.height;
@@ -2260,30 +2707,166 @@ bool ViewNode::updateLazyLayout() {
     return updated;
 }
 
+void ViewNode::updateStickyHeaders(bool refreshCache) {
+    if (_scrollState == nullptr || !_scrollState->getNativeStickyEnabled()) {
+        return;
+    }
+    if (_viewNodeTree == nullptr) {
+        return;
+    }
+
+    float scrollY = _scrollState->getDirectionAgnosticContentOffset().y;
+    // Pixels of visual overhang above sticky headers. Extends the effective header
+    // height for the clamp so a header rendering a bar above its yoga bounds
+    // (SectionList.stickyCover) stops sliding before the next section arrives.
+    // Mirrors SectionList.tsx's `headerHeight = getHeaderHeight() + coverHeight`.
+    float stickyCover = _scrollState->getNativeStickyCover();
+    // Pixels below scroll viewport top where headers pin. Matches CSS `top: N`.
+    // Effectively shifts the pin position down so headers aren't clipped behind
+    // a floating page header with visual footprint past its Yoga bounds.
+    float stickyOffset = _scrollState->getNativeStickyOffset();
+
+    // We push translationY updates through the attribute-set path so both the C++ state
+    // and the platform-side transform binder fire in the same frame. withLock acquires
+    // the tree mutex (recursive -- safe if already held on the Android scroll path) and
+    // opens a ViewTransactionScope. Nested calls piggyback on the outer transaction; a
+    // top-level call submits at end-of-scope, pushing transforms in the same VSYNC as
+    // the scroll gesture.
+    _viewNodeTree->withLock([&]() {
+        auto& scope = _viewNodeTree->getCurrentViewTransactionScope();
+
+        // Bounded-depth subtree walk. Header nesting in SubscreenSections is deep:
+        // scroll -> PullToRefresh -> SubscreenContent -> paddingRight layout ->
+        // SectionList root -> SectionListItem root -> column-reverse layout -> header
+        // (~8 levels). 16 covers that plus any consumer wrapping without unbounded cost.
+        // Skip into nested scrolls: each scroll owns its own sticky pass.
+        static constexpr int kStickyMaxDepth = 16;
+        auto* owner = AttributeOwner::getNativeOverridenAttributeOwner();
+        std::function<void(ViewNode*, int)> walk = [&](ViewNode* node, int depth) {
+            if (depth <= 0) {
+                return;
+            }
+            for (auto* child : *node) {
+                if (child->getStickyPosition() == StickyPositionTop) {
+                    if (refreshCache) {
+                        auto* parent = child->getParent().get();
+                        // parent Y relative to this scroll node (sum yoga Top edges up the chain).
+                        float parentY = 0.0f;
+                        float parentH = 0.0f;
+                        if (parent == this) {
+                            // Direct child of the scroll: no parent section to clamp against.
+                            // Treat the sticky track as unbounded so the header stays pinned once
+                            // scrolled past its natural Y, matching CSS `position: sticky`
+                            // semantics for elements whose containing block is the scroll itself.
+                            parentH = std::numeric_limits<float>::max();
+                        } else if (parent != nullptr && parent->getYogaNode() != nullptr) {
+                            parentH = sanitizeYogaValue(resolveYogaNode(parent->getYogaNode())
+                                                            ->getLayout()
+                                                            .dimension(facebook::yoga::Dimension::Height));
+                            for (auto* p = parent; p != nullptr && p != this; p = p->getParent().get()) {
+                                // Skip logical grouping / lazy-layout wrappers that don't have a
+                                // Yoga node -- their child positions are still relative to the
+                                // enclosing laid-out ancestor. Matches preserveAnchorAbsoluteTop.
+                                if (p->getYogaNode() == nullptr) {
+                                    continue;
+                                }
+                                parentY += sanitizeYogaValue(resolveYogaNode(p->getYogaNode())
+                                                                 ->getLayout()
+                                                                 .position(facebook::yoga::PhysicalEdge::Top));
+                            }
+                        }
+                        float childH = 0.0f;
+                        float childTop = 0.0f;
+                        if (child->getYogaNode() != nullptr) {
+                            childTop = sanitizeYogaValue(resolveYogaNode(child->getYogaNode())
+                                                             ->getLayout()
+                                                             .position(facebook::yoga::PhysicalEdge::Top));
+                            childH = sanitizeYogaValue(resolveYogaNode(child->getYogaNode())
+                                                           ->getLayout()
+                                                           .dimension(facebook::yoga::Dimension::Height));
+                        }
+                        // Absorb child's Top offset within its parent so the sticky trigger
+                        // fires when the child (not the parent) reaches the pin position.
+                        // For SectionList headers childTop is 0 (via column-reverse), so
+                        // this is a no-op there; for any other sticky consumer whose child
+                        // isn't at Top=0 of its parent, this makes the clamp behave like
+                        // CSS `position: sticky` (per-element trigger) rather than parallax
+                        // from the parent's top.
+                        child->_stickyCachedParentY = parentY + childTop;
+                        child->_stickyCachedParentH =
+                            parentH == std::numeric_limits<float>::max() ? parentH : std::max(0.0f, parentH - childTop);
+                        child->_stickyCachedChildH = childH;
+                    }
+
+                    // displacement = clamp(scrollY - parentY + offset, 0, parentH - (childH + cover))
+                    // - `cover` matches JS's `headerHeight = getHeaderHeight() + coverHeight`
+                    //   so headers stop sliding before the next section's header arrives.
+                    // - `offset` matches CSS `position: sticky; top: N`. Not auto-wired by
+                    //   SectionList; consumers can set it directly if their scroll extends
+                    //   behind a transparent floating header.
+                    //
+                    // Behavior: full-overlap. Section N pins at max; Section N+1 rides up
+                    // from below at its natural position, arrives at viewport top, and
+                    // paints over Section N by later-sibling paint order + zIndex on the
+                    // header. User sees clean single-header handoff. Matches
+                    // UITableView / UICollectionView pinToVisibleBounds defaults.
+                    //
+                    // Alternative "push-out" mode (Section N slides above viewport as
+                    // Section N+1 arrives) is a v2 opt-in -- see valdi-docs/bcollins RFC.
+                    float maxDisplacement =
+                        std::max(0.0f, child->_stickyCachedParentH - child->_stickyCachedChildH - stickyCover);
+                    float distance = scrollY - child->_stickyCachedParentY + stickyOffset;
+                    float displacement = std::max(0.0f, std::min(distance, maxDisplacement));
+
+                    // setAttribute so processAttributeChange fires both the C++ setter
+                    // (updates _translationY) and the platform transform binder (Android
+                    // View.setTranslationY) in one call. On iOS translationY is a composite
+                    // part of transformComposite -- setAttribute only marks the composite
+                    // dirty; flush() drains it to apply layer.transform same-frame.
+                    child->setAttribute(
+                        scope, DefaultAttributeTranslationY, owner, Value(static_cast<double>(displacement)), nullptr);
+                    child->getAttributesApplier().flush(scope);
+                }
+                // Skip recursion into nested scrolls (each owns its own sticky pass), but
+                // only AFTER checking stickyPosition above -- so a scroll container tagged
+                // stickyPosition='top' (e.g. horizontal tab bar) can act as a sticky header.
+                if (child->_flags[kScrollAttributesBound]) {
+                    continue;
+                }
+                walk(child, depth - 1);
+            }
+        };
+        walk(this, kStickyMaxDepth);
+    });
+}
+
 void ViewNode::updateScrollState() {
     auto& scrollState = getOrCreateScrollState();
     scrollState.setInScrollMode(true);
 
-    auto hadOverflow = _yogaNode->getLayout().hadOverflow();
+    auto hadOverflow = resolveYogaNode(_yogaNode)->getLayout().hadOverflow();
     auto* yogaContainer = getYogaNodeForInsertingChildren();
+    auto* yogaContainerNode = resolveYogaNode(yogaContainer);
 
     float rtlOffsetX = 0;
 
     if (isRightToLeft()) {
-        if (hadOverflow && _yogaNode->getStyle().flexDirection() == YGFlexDirectionRow) {
+        if (hadOverflow && getYogaStyle(_yogaNode).flexDirection() == facebook::yoga::FlexDirection::Row) {
             // On RTL horizontal, we need to adjust the calculated frames as yoga doesn't move the items to the
             // right of the container.
             float lowestLeft = 0;
 
-            for (auto* childYogaNode : yogaContainer->getChildren()) {
-                auto left =
-                    ygNodeGetFrame(childYogaNode, -sanitizeYogaValue(childYogaNode->getLayout().margin[YGEdgeLeft]))
-                        .getLeft();
+            for (auto* childYogaNode : yogaContainerNode->getChildren()) {
+                auto left = ygNodeGetFrame(childYogaNode,
+                                           -sanitizeYogaValue(
+                                               childYogaNode->getLayout().margin(facebook::yoga::PhysicalEdge::Left)))
+                                .getLeft();
 
                 lowestLeft = std::min(left, lowestLeft);
             }
 
-            lowestLeft -= sanitizeYogaValue(_yogaNode->getLayout().padding[YGEdgeLeft]);
+            lowestLeft -=
+                sanitizeYogaValue(resolveYogaNode(_yogaNode)->getLayout().padding(facebook::yoga::PhysicalEdge::Left));
 
             rtlOffsetX = -lowestLeft;
         } else {
@@ -2296,21 +2879,123 @@ void ViewNode::updateScrollState() {
     float highestWidth = 0;
     float highestHeight = 0;
 
-    for (auto* childYogaNode : yogaContainer->getChildren()) {
+    for (auto* childYogaNode : yogaContainerNode->getChildren()) {
         auto frame = ygNodeGetFrame(childYogaNode, rtlOffsetX);
 
-        auto right = frame.getRight() + childYogaNode->getLayout().margin[YGEdgeRight];
-        auto bottom = frame.getBottom() + childYogaNode->getLayout().margin[YGEdgeBottom];
+        auto right = frame.getRight() + childYogaNode->getLayout().margin(facebook::yoga::PhysicalEdge::Right);
+        auto bottom = frame.getBottom() + childYogaNode->getLayout().margin(facebook::yoga::PhysicalEdge::Bottom);
 
         highestWidth = std::max(right, highestWidth);
         highestHeight = std::max(bottom, highestHeight);
     };
 
-    highestWidth += yogaContainer->getLayout().padding[YGEdgeRight];
-    highestHeight += yogaContainer->getLayout().padding[YGEdgeBottom];
+    highestWidth += yogaContainerNode->getLayout().padding(facebook::yoga::PhysicalEdge::Right);
+    highestHeight += yogaContainerNode->getLayout().padding(facebook::yoga::PhysicalEdge::Bottom);
 
     auto updateResult = scrollState.updateContentSizeAndRtlOffset(
         Size(highestWidth, highestHeight), _calculatedFrame.size(), rtlOffsetX, getPointScale(), isHorizontal());
+
+    // Scroll anchor: find a descendant with scrollAnchorPosition != 0 and pin the scroll
+    // offset so it appears at the specified viewport edge. Only active when maintainScrollAnchor is true.
+    if (scrollState.getMaintainScrollAnchor()) {
+        float viewportH = _calculatedFrame.height;
+
+        // Find the child with scrollAnchorPosition != 0
+        std::function<ViewNode*(ViewNode*, int)> findAnchor = [&](ViewNode* node, int depth) -> ViewNode* {
+            if (depth <= 0)
+                return nullptr;
+            for (auto* child : *node) {
+                if (child->getScrollAnchorPosition() != ScrollAnchorPositionNone)
+                    return child;
+                auto* found = findAnchor(child, depth - 1);
+                if (found)
+                    return found;
+            }
+            return nullptr;
+        };
+        auto* anchorNode = findAnchor(this, 5);
+
+        if (anchorNode) {
+            int anchorPosition = anchorNode->getScrollAnchorPosition();
+
+            // Compute anchor's Y relative to this scroll node
+            float anchorY = sanitizeYogaValue(YGNodeLayoutGetTop(anchorNode->getYogaNode()));
+            for (auto* parent = anchorNode->getParent().get(); parent != nullptr && parent != this;
+                 parent = parent->getParent().get()) {
+                anchorY += sanitizeYogaValue(YGNodeLayoutGetTop(parent->getYogaNode()));
+            }
+
+            // Pin anchor to the specified viewport edge
+            float currentOffset = scrollState.getDirectionAgnosticContentOffset().y;
+            float targetOffset;
+            if (anchorPosition == ScrollAnchorPositionTop) {
+                targetOffset = anchorY;
+            } else {
+                targetOffset = anchorY - viewportH;
+            }
+
+            // Clamp to [0, maxScroll]
+            float maxScroll = std::max(highestHeight - viewportH, 0.0f);
+            targetOffset = std::max(0.0f, std::min(targetOffset, maxScroll));
+
+            float deltaY = targetOffset - currentOffset;
+            if (std::abs(deltaY) > 0.5f) {
+                auto currentContentOffset = scrollState.getDirectionAgnosticContentOffset();
+                currentContentOffset.y += deltaY;
+                scrollState.updateDirectionAgnosticContentOffset(currentContentOffset, currentContentOffset);
+                updateResult.changed = true;
+                scrollState.setNeedsSyncWithView(true);
+            }
+        }
+    }
+
+    // Preserve scroll position: keep on-screen content fixed by anchoring the first on-screen
+    // child and pinning it back to its recorded screen position after a content reflow. The anchor
+    // is refreshed on every scroll event (handleOnScroll) and layout pass, so it tracks the live
+    // viewport and never goes stale. We only *apply* the pin when the viewport is stationary (not
+    // being driven by an active drag or fling), so we don't fight the user's scroll. This replaces
+    // a net content-size delta, which was wrong whenever content was added at one end and trimmed
+    // at the other in the same pass. (maintainScrollAnchor above is a separate path used by in-game
+    // chat; PG drives this one instead.)
+    if (scrollState.getPreserveScrollPosition()) {
+        float viewportH = _calculatedFrame.height;
+        float maxScroll = std::max(highestHeight - viewportH, 0.0f);
+        float offsetY = scrollState.getDirectionAgnosticContentOffset().y;
+        bool stationary = !scrollState.isScrolling() && !scrollState.isCurrentlyAnimating();
+
+        // 1) Pin the anchor recorded last (its screen position is where the user is looking). Only
+        //    while stationary -- mid-scroll the native view owns the offset. We target
+        //    newAbsoluteTop - screenPos rather than offset + delta, so a clamp or scroll between
+        //    record and now can't double-count.
+        if (scrollState.hasPreserveAnchor() && stationary) {
+            auto* anchorNode =
+                preserveFindDescendantById(this, scrollState.getPreserveAnchorId(), kPreserveAnchorMaxDepth);
+            // Only pin if the anchor is still laid out. A recycled/un-laid-out row keeps its rawId
+            // but has no Yoga node, so preserveAnchorAbsoluteTop would read 0 and slam the viewport
+            // to the content top. Skip and let step 2 re-pick a valid anchor.
+            if (anchorNode != nullptr && anchorNode->getYogaNode() != nullptr) {
+                float newTop = preserveAnchorAbsoluteTop(this, anchorNode);
+                float targetY = std::max(0.0f, std::min(newTop - scrollState.getPreserveAnchorScreenPos(), maxScroll));
+                float delta = targetY - offsetY;
+                if (std::abs(delta) > 0.5f) {
+                    auto offset = scrollState.getDirectionAgnosticContentOffset();
+                    offset.y = targetY;
+                    scrollState.updateDirectionAgnosticContentOffset(offset, offset);
+                    offsetY = targetY;
+                    updateResult.changed = true;
+                    scrollState.setNeedsSyncWithView(true);
+                }
+            }
+        }
+
+        // 2) Refresh the anchor to the node at the current viewport center.
+        refreshPreserveAnchor(this, scrollState, offsetY, viewportH);
+    }
+
+    // Sticky headers: refresh per-child measurement cache from the current layout, then
+    // reposition. Called on every layout pass to survive content-size changes (section
+    // expand/collapse, rotation, keyboard, initial mount).
+    updateStickyHeaders(/*refreshCache=*/true);
 
     if (updateResult.changed) {
         setCalculatedViewportNeedsUpdate();
@@ -2323,7 +3008,7 @@ void ViewNode::updateScrollState() {
     }
 }
 
-void ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope,
+bool ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope,
                               bool didPerformLayout,
                               float viewOffsetX,
                               float viewOffsetY,
@@ -2380,8 +3065,21 @@ void ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope,
         }
     }
 
+    if (managesChildFrames()) {
+        updateManagedChildrenLayout(_calculatedFrame.width,
+                                    MeasureModeExactly,
+                                    _calculatedFrame.height,
+                                    MeasureModeExactly,
+                                    calculatedSizeDidChange);
+        if (_flags[kManagedChildrenLayoutNeedsCommit]) {
+            _flags[kManagedChildrenLayoutNeedsCommit] = false;
+            didPerformLayoutForChildren = true;
+            shouldVisitChildren = true;
+        }
+    }
+
     if (!shouldVisitChildren) {
-        return;
+        return calculatedFrameDidChange;
     }
 
     float childrenViewOffsetX = 0.0f;
@@ -2409,15 +3107,20 @@ void ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope,
     }
 
     auto* childrenIndexer = _childrenIndexer.get();
+    auto childCalculatedFrameDidChange = false;
     for (auto* childViewNode : *this) {
-        childViewNode->layoutFinished(viewTransactionScope,
-                                      didPerformLayoutForChildren,
-                                      childrenViewOffsetX,
-                                      childrenViewOffsetY,
-                                      childrenRtlOffsetX,
-                                      resolvedAnimator,
-                                      childrenIndexer,
-                                      frameObserver);
+        childCalculatedFrameDidChange |= childViewNode->layoutFinished(viewTransactionScope,
+                                                                       didPerformLayoutForChildren,
+                                                                       childrenViewOffsetX,
+                                                                       childrenViewOffsetY,
+                                                                       childrenRtlOffsetX,
+                                                                       resolvedAnimator,
+                                                                       childrenIndexer,
+                                                                       frameObserver);
+    }
+
+    if (childCalculatedFrameDidChange && managesChildFrames() && _view != nullptr) {
+        viewTransactionScope.transaction().invalidateViewLayout(_view);
     }
 
     syncScrollSpecsWithViewIfNeeded(viewTransactionScope);
@@ -2436,6 +3139,8 @@ void ViewNode::layoutFinished(ViewTransactionScope& viewTransactionScope,
             frameObserver->onFrameChanged(_rawId, getDirectionAgnosticFrame());
         }
     }
+
+    return calculatedFrameDidChange;
 }
 
 bool ViewNode::updateViewFrameIfNeeded(ViewTransactionScope& viewTransactionScope, const Ref<Animator>& animator) {
@@ -2509,6 +3214,13 @@ void ViewNode::applyFrame(ViewTransactionScope& viewTransactionScope,
         return;
     }
 
+    if (parentManagesChildFrames()) {
+        if (notifyAssetHandler && _assetHandler != nullptr) {
+            _assetHandler->onContainerSizeChanged(frame.width, frame.height);
+        }
+        return;
+    }
+
     viewTransactionScope.transaction().setViewFrame(getView(), frame, _flags[kLayoutIsRightToLeft], animator);
 
     if (notifyAssetHandler && _assetHandler != nullptr) {
@@ -2524,8 +3236,9 @@ bool ViewNode::handleCSSChange(bool cssChanged) {
 }
 
 bool ViewNode::isHorizontal() {
-    auto flexDirection = getYogaNodeForInsertingChildren()->getStyle().flexDirection();
-    return flexDirection == YGFlexDirectionRow || flexDirection == YGFlexDirectionRowReverse;
+    auto flexDirection = getYogaStyle(getYogaNodeForInsertingChildren()).flexDirection();
+    return flexDirection == facebook::yoga::FlexDirection::Row ||
+           flexDirection == facebook::yoga::FlexDirection::RowReverse;
 }
 
 bool ViewNode::setAttribute(ViewTransactionScope& viewTransactionScope,
@@ -2560,6 +3273,9 @@ bool ViewNode::setAttribute(ViewTransactionScope& viewTransactionScope,
         setPrefersLazyLayout(viewTransactionScope, attributeValue.toBool());
         return true;
     } else {
+        if (_attributesApplier.getBoundAttributes() == nullptr) {
+            return false;
+        }
         auto changed = getAttributesApplier().setAttribute(
             viewTransactionScope, attributeId, attributeOwner, attributeValue, animator);
 
@@ -2578,15 +3294,75 @@ void ViewNode::reapplyAttributesRecursive(ViewTransactionScope& viewTransactionS
         invalidateMeasuredSize();
     }
 
-    for (const auto& attribute : attributes) {
-        getAttributesApplier().reapplyAttribute(viewTransactionScope, attribute);
+    if (_attributesApplier.getBoundAttributes() != nullptr) {
+        for (const auto& attribute : attributes) {
+            getAttributesApplier().reapplyAttribute(viewTransactionScope, attribute);
+        }
+        getAttributesApplier().flush(viewTransactionScope);
     }
 
     for (auto* child : *this) {
         child->reapplyAttributesRecursive(viewTransactionScope, attributes, invalidateMeasure);
     }
+}
 
-    getAttributesApplier().flush(viewTransactionScope);
+bool ViewNode::hasOveriddenColorPalette() const {
+    return _flags[kHasOveriddenColorPalette];
+}
+
+void ViewNode::setHasOveriddenColorPalette(bool hasOveriddenColorPalette) {
+    _flags[kHasOveriddenColorPalette] = hasOveriddenColorPalette;
+}
+
+bool ViewNode::setResolvedColorPalette(const Ref<ColorPalette>& colorPalette) {
+    if (_colorPalette == colorPalette) {
+        return false;
+    }
+
+    _colorPalette = colorPalette;
+    return true;
+}
+
+Ref<ColorPalette> ViewNode::getParentResolvedColorPalette() const {
+    auto parent = getParent();
+    if (parent != nullptr) {
+        return parent->getResolvedColorPalette();
+    }
+
+    if (_viewNodeTree == nullptr) {
+        return nullptr;
+    }
+
+    const auto& viewManagerContext = _viewNodeTree->getViewManagerContext();
+    if (viewManagerContext == nullptr) {
+        return nullptr;
+    }
+
+    return viewManagerContext->getAttributesManager().getColorPaletteManager()->getActiveColorPalette();
+}
+
+void ViewNode::invalidateColorAttributes(ViewTransactionScope& viewTransactionScope, bool shouldApply) {
+    _attributesApplier.invalidateColorAttributes();
+    if (shouldApply && _colorPalette != nullptr) {
+        _attributesApplier.flush(viewTransactionScope);
+    }
+}
+
+void ViewNode::propagateInheritedColorPalette(ViewTransactionScope& viewTransactionScope,
+                                              const Ref<ColorPalette>& colorPalette) {
+    for (auto* child : *this) {
+        child->setInheritedColorPalette(viewTransactionScope, colorPalette);
+    }
+}
+
+void ViewNode::onColorPaletteMutated(ViewTransactionScope& viewTransactionScope, const ColorPalette& colorPalette) {
+    if (_colorPalette != nullptr && _colorPalette.get() == &colorPalette) {
+        invalidateColorAttributes(viewTransactionScope, true);
+    }
+
+    for (auto* child : *this) {
+        child->onColorPaletteMutated(viewTransactionScope, colorPalette);
+    }
 }
 
 void ViewNode::notifyAttributeFailed(AttributeId attributeId, const Error& error) {
@@ -2688,7 +3464,7 @@ bool ViewNode::isRightToLeft() const {
     if (_yogaNode == nullptr) {
         return false;
     }
-    return _yogaNode->getLayout().direction() == YGDirectionRTL;
+    return facebook::yoga::resolveRef(_yogaNode)->getLayout().direction() == facebook::yoga::Direction::RTL;
 }
 
 PlatformType ViewNode::getPlatformType() const {
@@ -2925,15 +3701,15 @@ void ViewNode::updateCSS(ViewTransactionScope& viewTransactionScope, const Ref<A
 }
 
 void ViewNode::setHorizontalScroll(bool horizontalScroll) {
-    YGFlexDirection newDirection;
+    facebook::yoga::FlexDirection newDirection;
     if (horizontalScroll) {
-        newDirection = YGFlexDirectionRow;
+        newDirection = facebook::yoga::FlexDirection::Row;
     } else {
-        newDirection = YGFlexDirectionColumn;
+        newDirection = facebook::yoga::FlexDirection::Column;
     }
 
-    if (getYogaNodeForInsertingChildren()->getStyle().flexDirection() != newDirection) {
-        getYogaNodeForInsertingChildren()->getStyle().flexDirection() = newDirection;
+    if (getYogaStyle(getYogaNodeForInsertingChildren()).flexDirection() != newDirection) {
+        getYogaStyle(getYogaNodeForInsertingChildren()).setFlexDirection(newDirection);
         markLayoutDirty();
     }
 
@@ -2965,6 +3741,128 @@ void ViewNode::setScrollStaticContentHeight(float staticContentHeight) {
     if (scrollState.getStaticContentHeight() != staticContentHeight) {
         scrollState.setStaticContentHeight(staticContentHeight);
         scrollState.setNeedsSyncWithView(true);
+    }
+}
+
+void ViewNode::setScrollAnchorPosition(int position) {
+    _scrollAnchorPosition = position;
+}
+
+int ViewNode::getScrollAnchorPosition() const {
+    return _scrollAnchorPosition;
+}
+
+void ViewNode::setStickyPosition(int position) {
+    int previous = _stickyPosition;
+    _stickyPosition = position;
+    // When transitioning out of sticky mode, release our native-priority hold on
+    // translationY so JS writes (fade path, tests, or a later consumer) can regain
+    // control. Without this, the header freezes at its last native-set displacement.
+    if (previous == StickyPositionTop && position != StickyPositionTop && _viewNodeTree != nullptr) {
+        _viewNodeTree->withLock([&]() {
+            auto& scope = _viewNodeTree->getCurrentViewTransactionScope();
+            getAttributesApplier().removeAttribute(
+                scope, DefaultAttributeTranslationY, AttributeOwner::getNativeOverridenAttributeOwner(), nullptr);
+            getAttributesApplier().flush(scope);
+        });
+    } else if (previous != StickyPositionTop && position == StickyPositionTop && _viewNodeTree != nullptr) {
+        // Runtime toggle none -> top: walk up to the nearest scroll ancestor with
+        // nativeStickyEnabled=true and refresh its sticky cache. Without this, a header
+        // that becomes sticky after the enclosing scroll has already run its layout pass
+        // won't have parentY/parentH/childH populated and will read defaults on next scroll.
+        for (auto* p = getParent().get(); p != nullptr; p = p->getParent().get()) {
+            if (p->_flags[kScrollAttributesBound]) {
+                if (p->_scrollState != nullptr && p->_scrollState->getNativeStickyEnabled()) {
+                    p->updateStickyHeaders(/*refreshCache=*/true);
+                }
+                break;
+            }
+        }
+    }
+}
+
+int ViewNode::getStickyPosition() const {
+    return _stickyPosition;
+}
+
+void ViewNode::setNativeStickyEnabled(bool enabled) {
+    auto& scrollState = getOrCreateScrollState();
+    bool previous = scrollState.getNativeStickyEnabled();
+    scrollState.setNativeStickyEnabled(enabled);
+
+    // Runtime toggle false -> true: build the sticky measurement cache now so the
+    // next scroll frame doesn't read default 0.0f values and misposition headers.
+    // Layout-driven refresh (updateScrollState -> refreshCache=true) would eventually
+    // populate it on the next layout pass, but scroll can fire before that.
+    if (!previous && enabled) {
+        updateStickyHeaders(/*refreshCache=*/true);
+    }
+
+    // When turning off, walk sticky descendants and release the native-priority
+    // hold on translationY so JS (or the consumer's next render) can reclaim it.
+    // Without this the pinned headers freeze at their last native-set displacement.
+    if (previous && !enabled && _viewNodeTree != nullptr) {
+        _viewNodeTree->withLock([&]() {
+            auto& scope = _viewNodeTree->getCurrentViewTransactionScope();
+            auto* owner = AttributeOwner::getNativeOverridenAttributeOwner();
+            static constexpr int kStickyMaxDepth = 16;
+            std::function<void(ViewNode*, int)> walk = [&](ViewNode* node, int depth) {
+                if (depth <= 0) {
+                    return;
+                }
+                for (auto* child : *node) {
+                    if (child->getStickyPosition() == StickyPositionTop) {
+                        child->getAttributesApplier().removeAttribute(
+                            scope, DefaultAttributeTranslationY, owner, nullptr);
+                        child->getAttributesApplier().flush(scope);
+                    }
+                    // Skip recursion into nested scrolls (they own their own sticky pass),
+                    // but only AFTER releasing on the scroll itself if it happened to be
+                    // tagged sticky.
+                    if (child->_flags[kScrollAttributesBound]) {
+                        continue;
+                    }
+                    walk(child, depth - 1);
+                }
+            };
+            walk(this, kStickyMaxDepth);
+        });
+    }
+}
+
+void ViewNode::setNativeStickyCover(float cover) {
+    auto& scrollState = getOrCreateScrollState();
+    scrollState.setNativeStickyCover(cover);
+    // Reapply the clamp with the new cover using the current cache. No re-measure needed:
+    // cover affects the clamp math (maxDisplacement = parentH - childH - cover), not layout.
+    if (scrollState.getNativeStickyEnabled()) {
+        updateStickyHeaders(/*refreshCache=*/false);
+    }
+}
+
+void ViewNode::setNativeStickyOffset(float offset) {
+    auto& scrollState = getOrCreateScrollState();
+    scrollState.setNativeStickyOffset(offset);
+    if (scrollState.getNativeStickyEnabled()) {
+        updateStickyHeaders(/*refreshCache=*/false);
+    }
+}
+
+void ViewNode::setMaintainScrollAnchor(bool maintain) {
+    auto& scrollState = getOrCreateScrollState();
+    scrollState.setMaintainScrollAnchor(maintain);
+}
+
+void ViewNode::setPreserveScrollPosition(bool preserve) {
+    auto& scrollState = getOrCreateScrollState();
+    scrollState.setPreserveScrollPosition(preserve);
+    // Capture the anchor immediately on enable, from the current (still valid, pre-insertion)
+    // layout. Otherwise the anchor stays empty until the next scroll/layout pass; if that pass is
+    // a content insertion (live message / forward page), Step 1 in updateScrollState would be
+    // skipped (no anchor) and the viewport would jump before the anchor is first recorded.
+    if (preserve && _calculatedFrame.height > 0.0f) {
+        refreshPreserveAnchor(
+            this, scrollState, scrollState.getDirectionAgnosticContentOffset().y, _calculatedFrame.height);
     }
 }
 
@@ -3240,32 +4138,59 @@ bool ViewNode::ignoreParentViewport() const {
 }
 
 float ViewNode::getTranslationX() const {
-    return _translationX;
+    return _translationX.getResolvedValue(_calculatedFrame.width, _flags[kTranslationXIsPercent]);
 }
 
-void ViewNode::setTranslationX(float translationX) {
-    updateTranslation(translationX, &_translationX);
+void ViewNode::setTranslationX(float translationX, bool isPercent) {
+    updateTranslation(translationX, isPercent, &_translationX, kTranslationXIsPercent);
 }
 
 float ViewNode::getDirectionDependentTranslationX() const {
+    auto translationX = getTranslationX();
     if (isRightToLeft()) {
-        return _translationX * -1;
+        return translationX * -1;
     } else {
-        return _translationX;
+        return translationX;
     }
 }
 
 float ViewNode::getTranslationY() const {
-    return _translationY;
+    return _translationY.getResolvedValue(_calculatedFrame.height, _flags[kTranslationYIsPercent]);
 }
 
-void ViewNode::setTranslationY(float translationY) {
-    updateTranslation(translationY, &_translationY);
+void ViewNode::setTranslationY(float translationY, bool isPercent) {
+    updateTranslation(translationY, isPercent, &_translationY, kTranslationYIsPercent);
 }
 
-void ViewNode::updateTranslation(float translation, float* outValue) {
-    if (*outValue != translation) {
-        *outValue = translation;
+void ViewNode::setScaleX(float scaleX) {
+    if (_scaleX != scaleX) {
+        _scaleX = scaleX;
+        setCalculatedViewportNeedsUpdate();
+        auto parent = getParent();
+        if (parent != nullptr) {
+            parent->setChildrenIndexerNeedsUpdate();
+        }
+    }
+}
+
+void ViewNode::setScaleY(float scaleY) {
+    if (_scaleY != scaleY) {
+        _scaleY = scaleY;
+        setCalculatedViewportNeedsUpdate();
+        auto parent = getParent();
+        if (parent != nullptr) {
+            parent->setChildrenIndexerNeedsUpdate();
+        }
+    }
+}
+
+void ViewNode::updateTranslation(float translation,
+                                 bool isPercent,
+                                 ViewNodeTranslation* outTranslation,
+                                 size_t percentFlag) {
+    if (outTranslation->value != translation || _flags[percentFlag] != isPercent) {
+        outTranslation->value = translation;
+        _flags[percentFlag] = isPercent;
         setCalculatedViewportNeedsUpdate();
 
         auto parent = getParent();
@@ -3360,14 +4285,13 @@ static MeasureMode yogaMeasureModeToValdiMeasureMode(YGMeasureMode measureMode) 
 }
 
 YGSize ygMeasureYoga(
-    YGNodeRef node, float width, YGMeasureMode widthMode, float height, YGMeasureMode heightMode, void* context) {
-    auto* viewNode = reinterpret_cast<ViewNode*>(Yoga::getAttachedViewNode(node));
+    YGNodeConstRef node, float width, YGMeasureMode widthMode, float height, YGMeasureMode heightMode) {
+    auto* viewNode = reinterpret_cast<ViewNode*>(facebook::yoga::resolveRef(node)->getContext());
     if (viewNode == nullptr) {
         return {.width = 0, .height = 0};
     }
-    SC_ASSERT(context != nullptr);
-    auto measureCount = reinterpret_cast<MeasureMetrics*>(context);
-    measureCount->totalMeasure++;
+    SC_ASSERT(currentMeasureMetrics != nullptr);
+    currentMeasureMetrics->totalMeasure++;
 
     auto convertedWidthMode = yogaMeasureModeToValdiMeasureMode(widthMode);
     auto convertedHeightMode = yogaMeasureModeToValdiMeasureMode(heightMode);
@@ -3382,14 +4306,18 @@ YGSize ygMeasureYoga(
     };
 }
 
-void ygDirtiedCallback(YGNodeRef node) {
-    auto* viewNode = reinterpret_cast<ViewNode*>(Yoga::getAttachedViewNode(node));
+void ygDirtiedCallback(YGNodeConstRef node) {
+    auto* viewNode = reinterpret_cast<ViewNode*>(facebook::yoga::resolveRef(node)->getContext());
     if (viewNode == nullptr) {
         return;
     }
 
     if (viewNode->isLazyLayout()) {
         viewNode->scheduleLazyLayout();
+    }
+
+    if (viewNode->managesChildFrames() && node != viewNode->getYogaNode()) {
+        viewNode->invalidateMeasuredSize();
     }
 
     if (!viewNode->hasParent()) {

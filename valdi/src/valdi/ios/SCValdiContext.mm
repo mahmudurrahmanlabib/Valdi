@@ -34,7 +34,9 @@
 #import "valdi/ios/SCValdiViewModel.h"
 #import "valdi/ios/SCValdiViewNode+CPP.h"
 #import "valdi/ios/Utils/ContextUtils.h"
+#import "valdi/ios/Gestures/SCValdiGestureRecognizers.h"
 
+#import <atomic>
 #import <limits>
 
 @interface SCValdiContext ()
@@ -59,6 +61,8 @@
     NSString *_componentPath;
 
     UITraitCollection *_traitCollection;
+    // Atomic: written on the main thread (setTraitCollection:), read on the JS thread by the bridge.
+    std::atomic<double> _dynamicTypeScale;
 }
 
 @synthesize gestureListener;
@@ -73,11 +77,13 @@ static Valdi::SharedRuntime getRuntimeFromContext(const Valdi::SharedContext &co
 
 - (instancetype)initWithContext:(Valdi::SharedContext)context
         enableReferenceTracking:(BOOL)enableReferenceTracking
+            enableGesturePrewarm:(BOOL)enableGesturePrewarm
 {
     self = [super init];
 
     if (self) {
         _context = std::move(context);
+        _dynamicTypeScale.store(1.0, std::memory_order_relaxed);
 
         if (enableReferenceTracking) {
             auto strongRefTable = Valdi::makeShared<Valdi::IOS::ObjCStrongReferenceTable>();
@@ -94,6 +100,13 @@ static Valdi::SharedRuntime getRuntimeFromContext(const Valdi::SharedContext &co
         _componentPath = ValdiIOS::NSStringFromSTDStringView(_context->getPath().toString());
         _moduleOwnerName = ValdiIOS::NSStringFromString(_context->getAttribution().owner);
         _moduleName = ValdiIOS::NSStringFromString(_context->getAttribution().moduleName);
+
+        // Warm Gestures.framework off a visible frame so the first onTouch recognizer a surface
+        // builds doesn't pay the one-time realization cost mid-render (COMPOSER-6174). No-op after
+        // the first context. Gated by a killswitch (VALDI_IOS_ENABLE_GESTURE_PREWARM).
+        if (enableGesturePrewarm) {
+            SCValdiPrewarmGestureRecognizers();
+        }
     }
 
     return self;
@@ -261,6 +274,12 @@ static Valdi::SharedRuntime getRuntimeFromContext(const Valdi::SharedContext &co
         oldRootView.valdiContext = nil;
     }
 
+    if (rootView != nil && rootView.valdiContext == nil) {
+        SCLogValdiError(@"Root view valdiContext is nil after setRootValdiView. "
+                        @"contextId=%u, componentPath=%@, oldRootView=%p, rootView=%p, sameView=%d",
+                        self.contextId, _componentPath, oldRootView, rootView, oldRootView == rootView);
+    }
+
     [rootView updateTraitCollection];
 }
 
@@ -338,12 +357,22 @@ static Valdi::LayoutDirection SCValdiLayoutDirectionToCpp(SCValdiLayoutDirection
     return _traitCollection;
 }
 
+- (CGFloat)dynamicTypeScale
+{
+    return _dynamicTypeScale.load(std::memory_order_relaxed);
+}
+
 - (void)setTraitCollection:(UITraitCollection *)traitCollection
 {
     UITraitCollection *prevTraitCollection = _traitCollection;
     UITraitCollection *nextTraitCollection = traitCollection;
 
     _traitCollection = traitCollection;
+
+    UIFontMetrics *bodyMetrics = [UIFontMetrics metricsForTextStyle:UIFontTextStyleBody];
+    _dynamicTypeScale.store(
+        traitCollection != nil ? [bodyMetrics scaledValueForValue:1.0 compatibleWithTraitCollection:traitCollection] : 1.0,
+        std::memory_order_relaxed);
 
     bool changedContentSizeCategory = [prevTraitCollection preferredContentSizeCategory] != [nextTraitCollection preferredContentSizeCategory];
     bool changedLegibilityWeight = NO;
@@ -698,9 +727,65 @@ static Valdi::MeasureMode resolveMeasureMode(CGFloat size, BOOL useLegacyMeasure
     }
 }
 
+- (BOOL)disableHitTestSyncDeadline
+{
+    auto runtime = getRuntimeFromContext(_context);
+    if (runtime.get() == nullptr) {
+        return NO;
+    }
+    return runtime->disableHitTestSyncDeadline();
+}
+
 + (SCValdiContext *)currentContext
 {
     return ValdiIOS::getValdiContext(Valdi::Context::current());
+}
+
++ (UITraitCollection *_Nullable)currentTraitCollectionForMeasurementContextDestroyed:
+    (BOOL *_Nullable)contextDestroyed
+{
+    if (contextDestroyed != NULL) {
+        *contextDestroyed = NO;
+    }
+
+    auto context = Valdi::Context::currentRef();
+    if (context == nullptr) {
+        return nil;
+    }
+
+    if (context->isDestroyed()) {
+        if (contextDestroyed != NULL) {
+            *contextDestroyed = YES;
+        }
+        return nil;
+    }
+
+    auto *rootContext = Valdi::Context::currentRoot();
+    if (rootContext != nullptr && rootContext->isDestroyed()) {
+        if (contextDestroyed != NULL) {
+            *contextDestroyed = YES;
+        }
+        return nil;
+    }
+
+    auto userData = context->getUserData();
+    if (userData == nullptr) {
+        return nil;
+    }
+
+    SCValdiContext *objcContext = ObjectAs(ValdiIOS::NSObjectFromValdiObject(userData, NO), SCValdiContext);
+    if (objcContext == nil) {
+        return nil;
+    }
+
+    if (objcContext.destroyed) {
+        if (contextDestroyed != NULL) {
+            *contextDestroyed = YES;
+        }
+        return nil;
+    }
+
+    return objcContext.traitCollection;
 }
 
 #if !defined(NS_BLOCK_ASSERTIONS)

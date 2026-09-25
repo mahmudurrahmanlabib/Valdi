@@ -32,9 +32,8 @@
 #import "valdi_core/SCNValdiCoreModuleFactory+Private.h"
 #import "valdi_core/SCNValdiCoreAsset+Private.h"
 #import "valdi/runtime/Runtime.hpp"
-#import <yoga/UIView+Yoga.h>
 #import "SCValdiJSRuntimeImpl.h"
-#import "valdi/SCNValdiJSRuntime+Private.h"
+#import "valdi_core/SCNValdiCoreJSRuntime+Private.h"
 
 #import "valdi/runtime/Attributes/AttributesBindingContextImpl.hpp"
 
@@ -130,7 +129,6 @@
         _jsRuntime = [[SCValdiJSRuntimeImpl alloc] initWithJSRuntimeProvider:self];
 
         _viewManagerContext->setAccessibilityEnabled(_runtime->getResourceManager().enableAccessibility());
-
     }
 
     return self;
@@ -288,9 +286,9 @@
     return _jsRuntime;
 }
 
-- (SCNValdiJSRuntime *)getJsRuntime
+- (SCNValdiCoreJSRuntime *)getJsRuntime
 {
-    return djinni_generated_client::valdi::JSRuntime::fromCpp(Valdi::strongRef(self->_runtime->getJavaScriptRuntime()));
+    return djinni_generated_client::valdi_core::JSRuntime::fromCpp(Valdi::strongRef(self->_runtime->getJavaScriptRuntime()));
 }
 
 - (void)getJSRuntimeWithBlock:(void (^)(id<SCValdiJSRuntime>))block
@@ -366,9 +364,11 @@
     [_applicationModule setIsIntegrationTestEnvironment:isIntegrationTestEnvironment];
 }
 
-- (void)setAllowDarkMode:(BOOL)allowDarkMode useScreenUserInterfaceStyleForDarkMode:(BOOL)useScreenUserInterfaceStyleForDarkMode
+- (void)setAllowDarkMode:(BOOL)allowDarkMode
+    useScreenUserInterfaceStyleForDarkMode:(BOOL)useScreenUserInterfaceStyleForDarkMode
 {
-    [_deviceModule setAllowDarkMode:allowDarkMode useScreenUserInterfaceStyleForDarkMode:useScreenUserInterfaceStyleForDarkMode];
+    [_deviceModule setAllowDarkMode:allowDarkMode
+        useScreenUserInterfaceStyleForDarkMode:useScreenUserInterfaceStyleForDarkMode];
 }
 
 #pragma mark - Asset factories
@@ -454,7 +454,7 @@ static SCNValdiCoreAsset *getAssetWithKey(Valdi::Runtime &runtime, const Valdi::
     auto attributes = attributesManager.getAttributesForClass(viewClassName);
 
     if (attributesBinder) {
-        Valdi::AttributesBindingContextImpl bindingContext(attributesManager.getAttributeIds(), attributesManager.getColorPalette(), _runtime->getLogger());
+        Valdi::AttributesBindingContextImpl bindingContext(attributesManager.getAttributeIds(), attributesManager.getColorPaletteManager(), _runtime->getLogger());
 
         SCValdiAttributesBinder *wrapper =
             [[SCValdiAttributesBinder alloc] initWithNativeAttributesBindingContext:(SCValdiAttributesBinderNative *)&bindingContext fontManager:_fontManager];

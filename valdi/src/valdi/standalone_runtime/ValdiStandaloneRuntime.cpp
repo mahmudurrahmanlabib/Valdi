@@ -58,26 +58,27 @@ private:
 
 #ifdef SNAP_DRAWING_ENABLED
 
-void registerSnapDrawingModuleFactoriesProvider(RuntimeManager& runtimeManager) {
-    auto lazy = makeShared<Lazy<Ref<snap::drawing::Runtime>>>([weakRuntimeManager = weakRef(&runtimeManager)]() {
-        auto runtime = makeShared<snap::drawing::Runtime>(nullptr,
-                                                          snap::drawing::GesturesConfiguration::getDefault(),
-                                                          nullptr,
-                                                          nullptr,
-                                                          ConsoleLogger::getLogger(),
-                                                          nullptr,
-                                                          0);
-        runtime->initializeViewManager(Valdi::PlatformTypeIOS);
+void registerSnapDrawingModuleFactoriesProvider(RuntimeManager& runtimeManager, Valdi::PlatformType platformType) {
+    auto lazy =
+        makeShared<Lazy<Ref<snap::drawing::Runtime>>>([weakRuntimeManager = weakRef(&runtimeManager), platformType]() {
+            auto runtime = makeShared<snap::drawing::Runtime>(nullptr,
+                                                              snap::drawing::GesturesConfiguration::getDefault(),
+                                                              nullptr,
+                                                              nullptr,
+                                                              ConsoleLogger::getLogger(),
+                                                              nullptr,
+                                                              0);
+            runtime->initializeViewManager(platformType);
 
-        auto runtimeManager = weakRuntimeManager.lock();
-        if (runtimeManager != nullptr) {
-            runtime->registerAssetLoaders(*runtimeManager->getAssetLoaderManager());
-            runtime->getFontManager()->setListener(
-                makeShared<snap::drawing::FontResolverWithRuntimeManager>(runtimeManager));
-        }
+            auto runtimeManager = weakRuntimeManager.lock();
+            if (runtimeManager != nullptr) {
+                runtime->registerAssetLoaders(*runtimeManager->getAssetLoaderManager());
+                runtime->getFontManager()->setListener(
+                    makeShared<snap::drawing::FontResolverWithRuntimeManager>(runtimeManager));
+            }
 
-        return runtime;
-    });
+            return runtime;
+        });
     auto moduleFactoriesProvider =
         makeShared<snap::drawing::SnapDrawingModuleFactoriesProvider>([lazy]() -> Ref<snap::drawing::Runtime> {
             return lazy->getOrCreate();
@@ -110,8 +111,15 @@ ValdiStandaloneRuntime::ValdiStandaloneRuntime(Ref<RuntimeManager> runtimeManage
 }
 
 ValdiStandaloneRuntime::~ValdiStandaloneRuntime() {
+    if (_exitCoordinator != nullptr) {
+        _exitCoordinator->flushUpdatesSync();
+    }
     _exitCoordinator = nullptr;
-    _runtime->fullTeardown();
+    // Stop debugger services and other shared resources BEFORE tearing down the runtime.
+    // This prevents the debugger from accepting new connections during runtime teardown.
+    // Note: _runtime was created via _runtimeManager->createRuntime(), so it's in _runtimes
+    // and will be torn down by _runtimeManager->fullTeardown(). Don't call it again.
+    _runtimeManager->fullTeardown();
     _runtime = nullptr;
     _runtimeManager = nullptr;
 }
@@ -156,7 +164,7 @@ void ValdiStandaloneRuntime::setupJsRuntime(const std::vector<StringBox>& jsArgu
     auto exitCoordinator = _exitCoordinator;
 
     auto standaloneRuntime = makeShared<ValueMap>();
-    (*standaloneRuntime)[STRING_LITERAL("exit")] = Value(makeShared<ValueFunctionWithCallable>(
+    auto exitFunction = makeShared<ValueFunctionWithCallable>(
         [this, exitCoordinator](const ValueFunctionCallContext& callContext) -> Value {
             if (exitCoordinator != nullptr) {
                 exitCoordinator->setEnabled(false);
@@ -168,7 +176,8 @@ void ValdiStandaloneRuntime::setupJsRuntime(const std::vector<StringBox>& jsArgu
                 _mainQueue->exit(0);
             }
             return Value::undefined();
-        }));
+        });
+    (*standaloneRuntime)[STRING_LITERAL("exit")] = Value(exitFunction);
     (*standaloneRuntime)[STRING_LITERAL("debuggerEnabled")] = Value(_runtimeManager->debuggerServiceEnabled());
 
     (*standaloneRuntime)[STRING_LITERAL("destroyAllComponents")] =
@@ -224,14 +233,12 @@ void ValdiStandaloneRuntime::setupJsRuntime(const std::vector<StringBox>& jsArgu
 
     auto process = makeShared<ValueMap>();
     (*process)[STRING_LITERAL("argv")] = Value(processArguments.build());
+    (*process)[STRING_LITERAL("exit")] = Value(exitFunction);
     (*process)[STRING_LITERAL("stdout")] = Value(stdoutObject);
     _runtime->getJavaScriptRuntime()->setValueToGlobalObject(STRING_LITERAL("process"), Value(process));
 
     (*standaloneRuntime)[STRING_LITERAL("arguments")] = Value(outJsArguments.build());
 
-    // TODO(4112): only get valdiStandalone once we're building tests from source
-    _runtime->getJavaScriptRuntime()->setValueToGlobalObject(STRING_LITERAL("valdiStandalone"),
-                                                             Value(standaloneRuntime));
     _runtime->getJavaScriptRuntime()->setValueToGlobalObject(STRING_LITERAL("valdiStandalone"),
                                                              Value(standaloneRuntime));
 }
@@ -294,6 +301,10 @@ Runtime& ValdiStandaloneRuntime::getRuntime() const {
 
 RuntimeManager& ValdiStandaloneRuntime::getRuntimeManager() const {
     return *_runtimeManager;
+}
+
+const Ref<StandaloneMainQueue>& ValdiStandaloneRuntime::getMainQueue() const {
+    return _mainQueue;
 }
 
 template<typename T>
@@ -366,19 +377,19 @@ const Ref<ViewManagerContext>& ValdiStandaloneRuntime::getViewManagerContext() c
     return _viewManagerContext;
 }
 
-Ref<ValdiStandaloneRuntime> ValdiStandaloneRuntime::create(
-    bool enableDebuggerService,
-    bool disableHotReloader,
-    bool enableViewPreloader,
-    bool registerCustomAttributes,
-    bool keepAttributesHistory,
-    IJavaScriptBridge* jsBridge,
-    const Ref<StandaloneMainQueue>& mainQueue,
-    const Ref<IDiskCache>& diskCache,
-    const Shared<IRuntimeListener>& runtimeListener,
-    const Shared<StandaloneResourceLoader>& resourceLoader,
-    const Shared<Valdi::ITweakValueProvider>& tweakValueProvider) {
-    auto viewManager = std::make_unique<StandaloneViewManager>();
+Ref<ValdiStandaloneRuntime> ValdiStandaloneRuntime::create(bool enableDebuggerService,
+                                                           bool disableHotReloader,
+                                                           bool enableViewPreloader,
+                                                           bool registerCustomAttributes,
+                                                           bool keepAttributesHistory,
+                                                           IJavaScriptBridge* jsBridge,
+                                                           const Ref<StandaloneMainQueue>& mainQueue,
+                                                           const Ref<IDiskCache>& diskCache,
+                                                           const Shared<IRuntimeListener>& runtimeListener,
+                                                           const Shared<StandaloneResourceLoader>& resourceLoader,
+                                                           const Shared<Valdi::ITweakValueProvider>& tweakValueProvider,
+                                                           PlatformType platformType) {
+    auto viewManager = std::make_unique<StandaloneViewManager>(platformType);
     viewManager->setRegisterCustomAttributes(registerCustomAttributes);
     viewManager->setKeepAttributesHistory(keepAttributesHistory);
 
@@ -392,7 +403,8 @@ Ref<ValdiStandaloneRuntime> ValdiStandaloneRuntime::create(
                                                             Valdi::strongSmallRef(&ConsoleLogger::getLogger()),
                                                             enableDebuggerService,
                                                             disableHotReloader,
-                                                            /* isStandalone */ true);
+                                                            /* isStandalone */ true,
+                                                            std::nullopt);
     runtimeManager->postInit();
     runtimeManager->registerBytesAssetLoader(diskCache);
     auto shouldWaitForHotReload = enableDebuggerService && !disableHotReloader;
@@ -401,7 +413,7 @@ Ref<ValdiStandaloneRuntime> ValdiStandaloneRuntime::create(
     }
 
 #ifdef SNAP_DRAWING_ENABLED
-    registerSnapDrawingModuleFactoriesProvider(*runtimeManager);
+    registerSnapDrawingModuleFactoriesProvider(*runtimeManager, viewManager->getPlatformType());
 #endif
 
     if (diskCache != nullptr) {

@@ -1,27 +1,42 @@
-import { Component } from "valdi_core/src/Component";
-import { ValdiRuntime } from "valdi_core/src/ValdiRuntime";
+import { Component } from 'valdi_core/src/Component';
+import { ValdiRuntime } from 'valdi_core/src/ValdiRuntime';
 
 declare const runtime: ValdiRuntime;
 
 export class ColorPaletteTest extends Component {
-
   onCreate() {
-    runtime.setColorPalette({
-      background: 'blue',
-      foreground: 'green'
+    runtime.configureColorPalette('light', {
+      background: 'rgba(0, 0, 255, 1)',
+      foreground: 'rgba(0, 128, 0, 1)',
     });
+    runtime.configureColorPalette('dark', {
+      background: 'rgba(255, 0, 0, 1)',
+      foreground: 'rgba(255, 255, 0, 1)',
+    });
+    runtime.setActiveColorPalette('light');
   }
 
   onRender() {
     <view border='1 solid background'>
-      <view background='foreground'/>
-    </view>
+      <view background='foreground' />
+    </view>;
   }
 
-  updateColorPalette() {
-    runtime.setColorPalette({
-      background: 'red',
-      foreground: 'yellow'
+  setDarkColorPalette() {
+    runtime.setActiveColorPalette('dark');
+  }
+
+  updateDarkColorPalette() {
+    runtime.configureColorPalette('dark', {
+      background: 'rgba(0, 0, 0, 1)',
+      foreground: 'rgba(255, 255, 255, 1)',
+    });
+  }
+
+  updateLightColorPalette() {
+    runtime.configureColorPalette('light', {
+      background: 'rgba(255, 0, 0, 1)',
+      foreground: 'rgba(255, 255, 0, 1)',
     });
   }
 }

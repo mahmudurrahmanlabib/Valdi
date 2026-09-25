@@ -1,7 +1,6 @@
 #include "utils/debugging/Assert.hpp"
 #include "valdi/jsbridge/JavaScriptBridge.hpp"
 #include "valdi/runtime/Context/Context.hpp"
-#include "valdi/runtime/Exception.hpp"
 #include "valdi/runtime/Interfaces/IJavaScriptBridge.hpp"
 #include "valdi/runtime/Interfaces/IJavaScriptContext.hpp"
 #include "valdi/runtime/JavaScript/JavaScriptContextEntryPoint.hpp"
@@ -11,6 +10,7 @@
 #include "valdi_core/cpp/Threading/DispatchQueue.hpp"
 #include "valdi_core/cpp/Threading/TaskQueue.hpp"
 #include "valdi_core/cpp/Threading/Thread.hpp"
+#include "valdi_core/cpp/Utils/Exception.hpp"
 #include "valdi_core/cpp/Utils/Marshaller.hpp"
 #include "valdi_core/cpp/Utils/StringCache.hpp"
 #include "valdi_core/cpp/Utils/ValueArrayBuilder.hpp"
@@ -94,6 +94,13 @@ struct TaskSchedulerImpl : public Valdi::JavaScriptTaskScheduler {
                 dispatchQueue->asyncAfter(std::move(dispatchFn), std::chrono::milliseconds(delayMs));
             }
         }
+    }
+
+    void dispatchOnJsThread(Valdi::JsThreadDispatchReason,
+                            Valdi::JavaScriptTaskScheduleType scheduleType,
+                            uint32_t delayMs,
+                            Valdi::JavaScriptThreadTask&& function) override {
+        dispatchOnJsThread(Valdi::Ref<Valdi::Context>(), scheduleType, delayMs, std::move(function));
     }
 
     bool isInJsThread() override {

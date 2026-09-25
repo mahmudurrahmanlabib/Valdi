@@ -7,8 +7,11 @@
 
 NSNotificationName const SCValdiRootViewDisplayInsetDidChangeNotificationKey = @"SCValdiRootViewDisplayInsetDidChangeNotificationKey";
 NSNotificationName const SCValdiRootViewTraitCollectionDidChangeNotificationKey = @"SCValdiRootViewTraitCollectionDidChangeNotificationKey";
+NSNotificationName const SCValdiRootViewDidMoveToWindowNotificationKey = @"SCValdiRootViewDidMoveToWindowNotificationKey";
 
-@implementation SCValdiRootView
+@implementation SCValdiRootView {
+    NSMutableArray *_pendingInitialRenderCompletions;
+}
 
 - (instancetype)initWithViewModelUntyped:(id)viewModelUntyped
                  componentContextUntyped:(id)componentContextUntyped
@@ -100,16 +103,19 @@ NSNotificationName const SCValdiRootViewTraitCollectionDidChangeNotificationKey 
 
 - (NSString *)bundleName
 {
+    NSString *result = nil;
+
     NSString *componentPath = self.componentPath;
     if (componentPath) {
-        return SCValdiComponentPathGetBundleName(componentPath);
+        result = SCValdiComponentPathGetBundleName(componentPath);
     }
-    return nil;
+
+    return result ?: [NSString stringWithFormat:@"missing-bundle-for-%@", NSStringFromClass([self class])];
 }
 
 - (NSString *)viewName
 {
-    return nil;
+    return [NSString stringWithFormat:@"missing-view-name-for-%@", NSStringFromClass([self class])];
 }
 
 - (void)dealloc
@@ -187,6 +193,10 @@ NSNotificationName const SCValdiRootViewTraitCollectionDidChangeNotificationKey 
         });
     } else {
         [self _updateViewInflationState];
+        // Lets the device module discover this view's window scene and observe its geometry
+        // (resizable windows, foldables) without owning the app's scene delegate.
+        [[NSNotificationCenter defaultCenter] postNotificationName:SCValdiRootViewDidMoveToWindowNotificationKey
+                                                            object:self];
     }
 }
 
@@ -199,11 +209,30 @@ NSNotificationName const SCValdiRootViewTraitCollectionDidChangeNotificationKey 
                         viewNode:(id<SCValdiViewNodeProtocol>)viewNode
 {
     [self _updateViewInflationState];
+
+    if (_pendingInitialRenderCompletions.count > 0 && valdiContext) {
+        NSArray *completions = _pendingInitialRenderCompletions;
+        _pendingInitialRenderCompletions = nil;
+        for (void (^completion)() in completions) {
+            [valdiContext waitUntilInitialRenderWithCompletion:completion];
+        }
+    }
 }
 
 - (void)waitUntilInitialRenderWithCompletion:(void (^)())completion
 {
-    [self.valdiContext waitUntilInitialRenderWithCompletion:completion];
+    if (!completion) {
+        return;
+    }
+    id<SCValdiContextProtocol> context = self.valdiContext;
+    if (context) {
+        [context waitUntilInitialRenderWithCompletion:completion];
+    } else {
+        if (!_pendingInitialRenderCompletions) {
+            _pendingInitialRenderCompletions = [NSMutableArray new];
+        }
+        [_pendingInitialRenderCompletions addObject:completion];
+    }
 }
 
 - (void)onLayoutDirty:(void (^)())onLayoutDirtyCallback
@@ -263,7 +292,7 @@ NSNotificationName const SCValdiRootViewTraitCollectionDidChangeNotificationKey 
 
 + (NSString *)componentPath
 {
-    return nil;
+    return [NSString stringWithFormat:@"missing-component-path-for-%@", NSStringFromClass(self)];
 }
 
 - (BOOL)canScrollAtPoint:(CGPoint)point direction:(SCValdiScrollDirection)direction

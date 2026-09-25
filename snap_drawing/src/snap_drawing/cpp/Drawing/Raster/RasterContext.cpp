@@ -14,6 +14,8 @@
 #include "valdi_core/cpp/Interfaces/IBitmapFactory.hpp"
 #include "valdi_core/cpp/Interfaces/ILogger.hpp"
 #include "valdi_core/cpp/Utils/Trace.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -77,7 +79,7 @@ Valdi::Result<RasterContext::RasterResult> RasterContext::raster(const Ref<Displ
     if (_deltaRasterizationEnabled) {
         std::lock_guard<std::recursive_mutex> lock(_mutex);
 
-        auto damageRects = computeDamageRects(displayList, inputBitmapInfo);
+        output.damageRects = computeDamageRects(displayList, inputBitmapInfo);
 
         if (needsNewBitmap(inputBitmapInfo)) {
             // Cannot do a delta raster if the input bitmap info has changed
@@ -102,8 +104,15 @@ Valdi::Result<RasterContext::RasterResult> RasterContext::raster(const Ref<Displ
             if (!result) {
                 return result.moveError();
             }
+
+            // Calculate rendered pixel count from damage rects for consistency
+            output.renderedPixelsCount = 0;
+            for (const auto& damageRect : output.damageRects) {
+                output.renderedPixelsCount +=
+                    static_cast<size_t>(damageRect.width()) * static_cast<size_t>(damageRect.height());
+            }
         } else {
-            auto result = doRasterDelta(composition, _lastBitmap, inputBitmapInfo, damageRects, rasterId);
+            auto result = doRasterDelta(composition, _lastBitmap, inputBitmapInfo, output.damageRects, rasterId);
             if (!result) {
                 return result.moveError();
             }
@@ -148,6 +157,8 @@ Valdi::Result<Valdi::Void> RasterContext::blitDeltaBitmapToOutputBitmap(const Re
         }
     }
 
+    auto deltaBitmapInfo = deltaBitmap->getInfo();
+
     // Copy bytes from our bitmap to the input bitmap
     auto inputBytes = deltaBitmap->lockBytes();
     if (inputBytes == nullptr) {
@@ -161,7 +172,19 @@ Valdi::Result<Valdi::Void> RasterContext::blitDeltaBitmapToOutputBitmap(const Re
     }
 
     if (fullReplace) {
-        std::memcpy(outputBytes, inputBytes, bitmapInfo.bytesLength());
+        if (deltaBitmapInfo.bytesLength() == bitmapInfo.bytesLength()) {
+            std::memcpy(outputBytes, inputBytes, bitmapInfo.bytesLength());
+        } else {
+            auto minRowBytes = std::min(deltaBitmapInfo.rowBytes, bitmapInfo.rowBytes);
+            auto* outputPtr = reinterpret_cast<uint8_t*>(outputBytes);
+            const auto* inputPtr = reinterpret_cast<const uint8_t*>(inputBytes);
+            for (int y = 0; y < bitmapInfo.height; y++) {
+                std::memcpy(outputPtr, inputPtr, minRowBytes);
+
+                inputPtr += deltaBitmapInfo.rowBytes;
+                outputPtr += bitmapInfo.rowBytes;
+            }
+        }
     } else {
         auto processProc = SkBlitRow::Factory32(SkBlitRow::kSrcPixelAlpha_Flag32);
 
@@ -174,7 +197,7 @@ Valdi::Result<Valdi::Void> RasterContext::blitDeltaBitmapToOutputBitmap(const Re
                         bitmapInfo.width,
                         255);
 
-            inputPtr += bitmapInfo.rowBytes;
+            inputPtr += deltaBitmapInfo.rowBytes;
             outputPtr += bitmapInfo.rowBytes;
         }
     }
@@ -206,6 +229,10 @@ Valdi::Result<RasterContext::RasterResult> RasterContext::rasterDelta(const Ref<
     auto result = doRasterDelta(composition, bitmap, bitmap->getInfo(), damageRects, rasterId);
 
     removeUnusedCachedRasterizedExternalSurfaces(rasterId);
+
+    if (result) {
+        result.value().damageRects = std::move(damageRects);
+    }
 
     return result;
 }
@@ -273,6 +300,38 @@ Valdi::Result<Valdi::Void> RasterContext::rasterNonDelta(const Ref<Valdi::IBitma
     return doRasterResult;
 }
 
+// Bound on how large an external surface may be rasterized, as a per-axis multiple of the output for
+// a square surface -- the actual bound is this value squared times the output's pixel count.
+//
+// Bounded by area rather than by longest edge so the worst case doesn't depend on the surface's aspect
+// ratio: a longest-edge bound lets a square surface consume this value squared times the memory a flat
+// one does, and the platform view's backing store is the memory that matters here. Raising it improves
+// the visible region's sharpness linearly and costs memory quadratically; CPU is not the constraint
+// (going 2 -> 4 quadrupled the raster area for ~1 ms).
+static constexpr Scalar kMaxExternalSurfaceRasterOutputMultiple = 4;
+
+/// Returns a factor <= 1 to scale an external surface's raster by, bounding its rasterized pixel count
+/// to `kMaxExternalSurfaceRasterOutputMultiple` squared times the output's.
+static Scalar externalSurfaceRasterCapScale(const Rect& frame,
+                                            const Valdi::BitmapInfo& bitmapInfo,
+                                            Scalar rasterScaleX,
+                                            Scalar rasterScaleY) {
+    // double: a heavily zoomed surface times a full-resolution raster scale overflows float precision
+    // well before it overflows the bound we are comparing against.
+    auto renderedArea =
+        static_cast<double>(frame.width() * rasterScaleX) * static_cast<double>(frame.height() * rasterScaleY);
+    if (!(renderedArea > 0)) {
+        return 1;
+    }
+    auto outputArea = static_cast<double>(bitmapInfo.width) * static_cast<double>(bitmapInfo.height);
+    auto cap = static_cast<double>(kMaxExternalSurfaceRasterOutputMultiple) *
+               static_cast<double>(kMaxExternalSurfaceRasterOutputMultiple) * outputArea;
+    if (renderedArea <= cap) {
+        return 1;
+    }
+    return static_cast<Scalar>(std::sqrt(cap / renderedArea));
+}
+
 Valdi::Result<Valdi::Void> RasterContext::doRaster(DrawableSurfaceCanvas& canvas,
                                                    const DisplayList& displayList,
                                                    const CompositorPlaneList& planeList,
@@ -298,12 +357,21 @@ Valdi::Result<Valdi::Void> RasterContext::doRaster(DrawableSurfaceCanvas& canvas
                 auto rasterScaleY = bitmapInfo.height / displayList.getSize().height;
                 const auto& presenterState = *plane.getExternalSurfacePresenterState();
 
+                // Bound the rendered extent. The surface still lays out at `presenterState.frame`
+                // (its natural absolute rect), so shape -- text wrapping in particular -- is
+                // untouched; only resolution drops, and only past the cap.
+                auto capScale =
+                    externalSurfaceRasterCapScale(presenterState.frame, bitmapInfo, rasterScaleX, rasterScaleY);
+                auto cappedWidth = std::max(1, static_cast<int>(std::ceil(bitmapInfo.width * capScale)));
+                auto cappedHeight = std::max(1, static_cast<int>(std::ceil(bitmapInfo.height * capScale)));
+
                 auto rasterImage = getOrCreateRasterImageForExternalSurfaceSnapshot(plane.getExternalSurfaceSnapshot(),
                                                                                     presenterState.frame,
                                                                                     presenterState.transform,
-                                                                                    bitmapInfo,
-                                                                                    rasterScaleX,
-                                                                                    rasterScaleY,
+                                                                                    cappedWidth,
+                                                                                    cappedHeight,
+                                                                                    rasterScaleX * capScale,
+                                                                                    rasterScaleY * capScale,
                                                                                     rasterId);
                 if (!rasterImage) {
                     return rasterImage.moveError();
@@ -321,8 +389,25 @@ Valdi::Result<Valdi::Void> RasterContext::doRaster(DrawableSurfaceCanvas& canvas
                 Paint paint;
                 paint.setAntiAlias(true);
                 paint.setAlpha(presenterState.opacity);
-                skiaCanvas->drawImage(
-                    rasterImage.value()->getSkValue(), 0, 0, SkSamplingOptions(), &paint.getSkValue());
+                const auto& image = *rasterImage.value();
+                // src is the (possibly capped) raster, dst the full output extent, so a capped raster
+                // is stretched back to where an uncapped one would have landed.
+                // Exact scaled extents, not the bitmap's dimensions: the bitmap is rounded up to whole
+                // pixels, so the content covers only `bitmapInfo.* * capScale` of it. Including that
+                // sub-pixel padding in src would squeeze the content by the rounding fraction when it
+                // is stretched to dst.
+                auto srcRect = Rect::makeXYWH(0,
+                                              0,
+                                              static_cast<Scalar>(bitmapInfo.width) * capScale,
+                                              static_cast<Scalar>(bitmapInfo.height) * capScale);
+                auto dstRect =
+                    Rect::makeXYWH(0, 0, static_cast<Scalar>(bitmapInfo.width), static_cast<Scalar>(bitmapInfo.height));
+                skiaCanvas->drawImageRect(image.getSkValue(),
+                                          srcRect.getSkValue(),
+                                          dstRect.getSkValue(),
+                                          SkSamplingOptions(SkFilterMode::kLinear),
+                                          &paint.getSkValue(),
+                                          SkCanvas::kStrict_SrcRectConstraint);
                 skiaCanvas->restoreToCount(saveCount);
             } break;
         }
@@ -346,7 +431,8 @@ Valdi::Result<Ref<Image>> RasterContext::getOrCreateRasterImageForExternalSurfac
     ExternalSurfaceSnapshot* externalSurfaceSnapshot,
     const Rect& frame,
     const Matrix& transform,
-    const Valdi::BitmapInfo& bitmapInfo,
+    int bitmapWidth,
+    int bitmapHeight,
     Scalar rasterScaleX,
     Scalar rasterScaleY,
     size_t rasterId) {
@@ -369,14 +455,14 @@ Valdi::Result<Ref<Image>> RasterContext::getOrCreateRasterImageForExternalSurfac
         return Valdi::Error("Cannot rasterize external surface without a bitmap factory");
     }
 
-    auto bitmap = _bitmapCache.allocateBitmap(bitmapFactory, bitmapInfo.width, bitmapInfo.height);
+    auto bitmap = _bitmapCache.allocateBitmap(bitmapFactory, bitmapWidth, bitmapHeight);
     if (!bitmap) {
         return bitmap.moveError();
     }
 
     void* pixels = bitmap.value()->lockBytes();
     if (pixels != nullptr) {
-        std::memset(pixels, 0, bitmapInfo.bytesLength());
+        std::memset(pixels, 0, bitmap.value()->getInfo().bytesLength());
         bitmap.value()->unlockBytes();
     }
 
@@ -409,7 +495,9 @@ bool RasterContext::needsNewBitmap(const Valdi::BitmapInfo& inputBitmapInfo) con
     }
 
     auto lastBitmapInfo = _lastBitmap->getInfo();
-    return lastBitmapInfo != inputBitmapInfo;
+    return lastBitmapInfo.width != inputBitmapInfo.width || lastBitmapInfo.height != inputBitmapInfo.height ||
+           lastBitmapInfo.colorType != inputBitmapInfo.colorType ||
+           lastBitmapInfo.alphaType != inputBitmapInfo.alphaType;
 }
 
 } // namespace snap::drawing

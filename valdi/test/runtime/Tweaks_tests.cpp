@@ -28,6 +28,10 @@ public:
         return config.getMapValue(key).toFloat();
     }
 
+    int32_t getInt(const StringBox& key, int32_t fallback) override {
+        return config.getMapValue(key).toInt();
+    }
+
     Value getBinary(const StringBox& key, const Value& fallback) override {
         return config.getMapValue(key);
     }
@@ -62,6 +66,17 @@ TEST(RuntimeTweaks, tsnPerModuleSetting) {
     provider->config = Value(config);
     ASSERT_TRUE(tweaks->enableTSNForModule(STRING_LITERAL("valdi_core")));
     ASSERT_FALSE(tweaks->enableTSNForModule(STRING_LITERAL("add_friends")));
+}
+
+TEST(RuntimeTweaks, anrDiagnosticsSetting) {
+    auto provider = makeShared<TestTweakValueProvider>();
+    auto tweaks = makeShared<ValdiRuntimeTweaks>(provider.toShared());
+
+    auto config = makeShared<ValueMap>();
+    (*config)[STRING_LITERAL("VALDI_ENABLE_MODULE_LOAD_DIAGNOSTICS")] = Value(true);
+
+    provider->config = Value(config);
+    ASSERT_TRUE(tweaks->enableANRDiagnostics());
 }
 
 } // namespace ValdiTest

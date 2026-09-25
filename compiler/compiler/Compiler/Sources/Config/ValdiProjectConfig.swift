@@ -67,8 +67,6 @@ struct ValdiProjectConfig {
 
     let minifyConfigURL: URL?
 
-    let pngquantURL: URL?
-
     let clientSqlURL: URL?
     
     let sqlExportPathTemplate: String?
@@ -98,6 +96,7 @@ struct ValdiProjectConfig {
     let nodeModulesWorkspace: String?
     let externalModulesTarget: String?
     let externalModulesWorkspace: String?
+    let nativeApiMinVersion: Int?
 
     private static func parseOutputConfig(inputConfig: Yams.Node.Mapping?,
                                           ignoredFiles: [NSRegularExpression]?,
@@ -273,16 +272,6 @@ struct ValdiProjectConfig {
             throw CompilerError("compiler_toolbox_path not configured in the Valdi project config file")
         }
 
-        var pngquantURL: URL?
-        if let path = args.directPngquantPath {
-            logger.info("Using direct pngquant: \(path)")
-            pngquantURL = currentDirectoryUrl.resolving(path: path)
-        } else {
-            pngquantURL = try getOSSpecificValue(config: config, key: "pngquant_bin_path")?.string
-                .map { try $0.resolvingVariables(environment) }
-                .flatMap { configDirectoryUrl.resolving(path: $0, isDirectory: false) }
-        }
-
         var minifyConfigURL:URL?
         if let path = args.directMinifyConfigPath {
             logger.info("Using direct minify config: \(path)")
@@ -329,6 +318,18 @@ struct ValdiProjectConfig {
         let nodeModulesWorkspace = config["node_modules_workspace"]?.string
         let externalModulesTarget = config["external_modules_target"]?.string
         let externalModulesWorkspace = config["external_modules_workspace"]?.string
+        let nativeApiMinVersion: Int?
+        if let configuredNativeApiMinVersion = config["native_api_min_version"] {
+            guard let parsedNativeApiMinVersion = configuredNativeApiMinVersion.int else {
+                throw CompilerError("native_api_min_version must be an integer")
+            }
+            guard parsedNativeApiMinVersion >= 0 && parsedNativeApiMinVersion <= Int(Int32.max) else {
+                throw CompilerError("native_api_min_version must be between 0 and \(Int32.max)")
+            }
+            nativeApiMinVersion = parsedNativeApiMinVersion
+        } else {
+            nativeApiMinVersion = nil
+        }
 
         var projectConfig = ValdiProjectConfig(configDirectoryUrl: configDirectoryUrl,
                                                   projectName: projectName,
@@ -355,7 +356,6 @@ struct ValdiProjectConfig {
                                                   shouldSkipRemoveOrphanFiles: false,
                                                   compilerToolboxURL: compilerToolboxURL,
                                                   minifyConfigURL: minifyConfigURL,
-                                                  pngquantURL: pngquantURL,
                                                   clientSqlURL: clientSqlURL,
                                                   sqlExportPathTemplate: sqlExportPathTemplate,
                                                   androidDefaultClassPath: androidDefaultClassPath,
@@ -370,7 +370,8 @@ struct ValdiProjectConfig {
                                                   nodeModulesTarget: nodeModulesTarget,
                                                   nodeModulesWorkspace: nodeModulesWorkspace,
                                                   externalModulesTarget: externalModulesTarget,
-                                                  externalModulesWorkspace: externalModulesWorkspace)
+                                                  externalModulesWorkspace: externalModulesWorkspace,
+                                                  nativeApiMinVersion: nativeApiMinVersion)
 
         projectConfig.shouldEmitDiagnostics = args.emitDiagnostics
         projectConfig.shouldDebugCompilerCompanion = args.debugCompanion

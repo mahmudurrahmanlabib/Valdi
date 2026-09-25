@@ -1,15 +1,17 @@
-import { RequireFunc } from "valdi_core/src/IModuleLoader";
-import { getModuleLoader } from "valdi_core/src/ModuleLoaderGlobal";
-
-declare const require: RequireFunc;
-
-interface NativeModule {
-    doSomeMath(l: number, r: number): number;
-}
-
-const nativeModule: NativeModule = require('NativeModuleTest');
+import { makeCalculator } from './NativeCalculator';
 
 export function compute(): number {
-    return nativeModule.doSomeMath(42, 8);
+  const calculator = makeCalculator();
+  calculator.add(42);
+  calculator.add(8);
+  return calculator.total();
 }
 
+let syncCallCount = 0;
+
+// Counts how many times native actually ran this function, so tests can tell a call that was
+// skipped after its deadline from one that ran late.
+export function countSyncCall(): number {
+  syncCallCount++;
+  return syncCallCount;
+}

@@ -1,10 +1,12 @@
-# Getting ready to build things with Valdi on MacOS
+# macOS Setup Reference Guide
+
+> **Get the CLI from npm:** `npm install -g @snap/valdi`. Then run `valdi dev_setup` for automated setup. This guide is a reference for manual installation or troubleshooting only.
 
 ## About
 
-Valdi needs a handful of dependencies in order to build. You can find information about installation in this doc.
+This guide documents the dependencies Valdi needs on macOS and how to install them manually. For the quickest setup, use [`valdi dev_setup`](../INSTALL.md) which automates most of these steps.
 
-This doc assumes you're using the default shell, zsh. Setup should be possible for other setups but you're on your own for updating config files.
+This guide assumes you're using the default shell (zsh). Setup is possible for other shells, but you'll need to adapt the configuration file paths.
 
 ## Setting up XCode
 
@@ -44,48 +46,23 @@ Make sure to load your changes via `source ~/.zshrc`.
 ## Brew install dependencies
 
 ```
-brew install npm bazelisk openjdk@11 temurin git-lfs watchman ios-webkit-debug-proxy
+brew install npm bazelisk openjdk@17 temurin watchman ios-webkit-debug-proxy
 ```
 
 ## Setup JDK path
 
 ```
-sudo ln -sfn /opt/homebrew/opt/openjdk@11/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-11.jdk
-echo 'export PATH="/opt/homebrew/opt/openjdk@ll/bin:$PATH"' >> ~/.zshrc
-echo 'export JAVA_HOME=`/usr/libexec/java_home -v 11`' >> ~/.zshrc
+sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-17.jdk
+echo 'export PATH="/opt/homebrew/opt/openjdk@17/bin:$PATH"' >> ~/.zshrc
+echo 'export JAVA_HOME=`/usr/libexec/java_home -v 17`' >> ~/.zshrc
 ```
 
-## Install git-lfs
+## Android SDK and NDK
 
-Git Large File Storage (LFS) manages the binaries that we need for Valdi.
+> **You do not need to install the Android SDK, build tools, or NDK manually.** Bazel downloads the correct versions hermetically during the build.
 
-```
-git lfs install
-```
-
-## Install Android SDK (only required for Android development)
-
-Download and install Android Studio by following [Google's directions](https://developer.android.com/studio).
-
-Open any project, navigate to `Tools` -> `SDK Manager`
-
-Under **SDK Platforms**, install **API level 35**.
-
-Under **SDK Tools**, uncheck `Hide obsolete packages` check `Show Package Details`
-
-Install build tools **version 34.0.0**.
-
-Install ndk version **25.2.9519653**
-
-Update `.zshrc` with the following:
-
-```
-echo "export ANDROID_HOME=$HOME/Library/Android/sdk" >> ~/.zshrc
-echo "export ANDROID_NDK_HOME=$HOME/Library/Android/Sdk/ndk/25.2.9519653" >> ~/.zshrc
-echo "export PATH=\$PATH:$HOME/Library/Android/sdk/platform-tools" >> ~/.zshrc
-source ~/.zshrc
-```
+If you want to use Android Studio or `adb` outside of Bazel, you can optionally install the SDK via `valdi dev_setup` or [Android Studio](https://developer.android.com/studio).
 
 # Next steps
 
-[Valdi setup](https://github.com/Snapchat/Valdi/blob/main/docs/INSTALL.md#valdi-setup)
+[Installation guide](../INSTALL.md#installation)

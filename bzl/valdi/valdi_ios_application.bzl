@@ -1,6 +1,14 @@
 load("@build_bazel_rules_apple//apple:ios.bzl", "ios_application")
 load("@build_bazel_rules_apple//apple:versioning.bzl", "apple_bundle_version")
 load("//bzl:expand_template.bzl", "expand_template")
+load(
+    "//bzl/valdi:valdi_ios_application_icons.bzl",
+    "generate_valdi_ios_application_icons",
+    _valdi_ios_application_icons = "valdi_ios_application_icons",
+)
+
+def valdi_ios_application_icons(src):
+    return _valdi_ios_application_icons(src = src)
 
 def make_short_version(version):
     components = version.split(".")
@@ -20,6 +28,7 @@ def valdi_ios_application(
         minimum_os_version = None,
         provisioning_profile = None,
         app_icons = None,
+        resources = [],
         version = None,
         deps = []):
     main_target = "{}_maingen".format(name)
@@ -54,7 +63,7 @@ def valdi_ios_application(
     expand_template(
         name = main_target,
         src = "@valdi//bzl/valdi/app_templates:ios_main.m.tpl",
-        output = "main.m",
+        output = "main_ios.m",
         substitutions = {
             "@VALDI_ROOT_COMPONENT_PATH@": root_component_path,
         },
@@ -87,7 +96,8 @@ def valdi_ios_application(
         deps = [":{}".format(src_target)],
         minimum_os_version = minimum_os_version,
         provisioning_profile = provisioning_profile,
-        app_icons = app_icons,
+        app_icons = generate_valdi_ios_application_icons(name, app_icons),
+        resources = resources,
         version = resolved_version,
         tags = ["valdi_ios_application"],
         visibility = ["//visibility:public"],

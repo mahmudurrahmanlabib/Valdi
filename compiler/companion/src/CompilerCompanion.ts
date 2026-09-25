@@ -16,7 +16,6 @@ import {
   ExportStringsFilesRequestBody,
   ExportTranslationStringsRequestBody,
   ExportStringsFilesResponseBody,
-  GenerateGhostOwnershipMapRequestBody,
   GenerateIdsFilesRequestBody,
   GenerateIdsFilesResponseBody,
   GetDiagnosticsRequestBody,
@@ -46,7 +45,6 @@ import {
   ExportTranslationStringsResponseBody,
   StartDebuggingProxyRequestBody,
   CompileNativeResponseBody,
-  GenerateGhostOwnershipMapResponseBody,
 } from './protocol';
 import { DebuggingProxy } from './DebuggingProxy';
 import { generateIdsFromPath } from './GenerateIds';
@@ -54,7 +52,6 @@ import { exportStringsFiles, exportTranslationStrings } from './strings/exportSt
 import { getArgumentValue } from './utils/getArgumentValue';
 import { compileNative } from './native/CompileNativeCommand';
 import { CodeInstrumentation } from './CodeInstrumentation';
-import { generateGhostOwnershipMap } from './cli/generateGhostOwnershipMap';
 import { rewriteImports } from './cli/rewriteImports';
 import { WorkspaceStore } from './WorkspaceStore';
 import { CompanionServiceBase, ExitKind } from './CompanionServiceBase';
@@ -105,7 +102,7 @@ export class CompilerCompanion extends CompanionServiceBase {
     });
 
     this.addEndpoint<CreateWorkspaceRequestBody, CreateWorkspaceResponseBody>(Command.createWorkspace, async (body) => {
-      const workspaceId = this.workspaceStore.createWorkspace().workspaceId;
+      const workspaceId = this.workspaceStore.createWorkspace(body.nativeApiMinVersion).workspaceId;
       return { workspaceId };
     });
 
@@ -273,7 +270,7 @@ export class CompilerCompanion extends CompanionServiceBase {
     this.addEndpoint<CompileNativeRequestBody, CompileNativeResponseBody>(Command.compileNative, async (body) => {
       let workspaceId: number;
       if (!body.workspaceId && body.registerInputFiles) {
-        workspaceId = this.workspaceStore.createWorkspace().workspaceId;
+        workspaceId = this.workspaceStore.createWorkspace(undefined).workspaceId;
       } else {
         workspaceId = body.workspaceId;
       }
@@ -288,13 +285,6 @@ export class CompilerCompanion extends CompanionServiceBase {
       this.debuggingProxy.updateAvailableHermesDevices(mapped);
       return {};
     });
-
-    this.addEndpoint<GenerateGhostOwnershipMapRequestBody, GenerateGhostOwnershipMapResponseBody>(
-      Command.generateGhostOwnershipMap,
-      async (body) => {
-        return await generateGhostOwnershipMap(this.logger, body.outputDir);
-      },
-    );
 
     this.addEndpoint<RewriteImportsRequestBody, RewriteImportsResponseBody>(Command.rewriteImports, async (body) => {
       await rewriteImports(

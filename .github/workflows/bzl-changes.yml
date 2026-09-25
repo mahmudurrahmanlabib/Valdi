@@ -1,0 +1,408 @@
+name: Valdi CI
+
+on:
+  pull_request:
+    paths:
+      - '**/*.bzl'
+      - '**/BUILD.bazel'
+      - '**/BUILD'
+      - 'MODULE.bazel'
+      - 'registry/**'
+      - 'tools/ci/**'
+      - 'tools/api_surface/**'
+      - 'npm_modules/cli/test/**'
+      - '.github/workflows/bzl-changes.yml'
+      - '**/*.cpp'
+      - '**/*.hpp'
+      - '**/*.h'
+      - '**/*.c'
+      - 'third-party/**'
+      - 'src/**/*.ts'
+      - 'src/**/*.tsx'
+      - 'compiler/**'
+      - 'apps/snapshot_tests/**'
+      - 'apps/helloworld/**'
+      - 'valdi/src/**'
+      - 'snap_drawing/**'
+      - 'experiments/helloworld_playground/**'
+      - 'tools/valdi_web_devtools/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.bzl'
+      - '**/BUILD.bazel'
+      - '**/BUILD'
+      - 'MODULE.bazel'
+      - 'registry/**'
+      - 'tools/ci/**'
+      - 'tools/api_surface/**'
+      - 'npm_modules/cli/test/**'
+      - '.github/workflows/bzl-changes.yml'
+      - '**/*.cpp'
+      - '**/*.hpp'
+      - '**/*.h'
+      - '**/*.c'
+      - 'third-party/**'
+      - 'src/**/*.ts'
+      - 'src/**/*.tsx'
+      - 'compiler/**'
+      - 'apps/snapshot_tests/**'
+      - 'apps/helloworld/**'
+      - 'valdi/src/**'
+      - 'snap_drawing/**'
+      - 'experiments/helloworld_playground/**'
+      - 'tools/valdi_web_devtools/**'
+
+# Workflow-level permissions: id-token: write needed for GCP WIF auth on push events.
+# For fork PRs, GitHub automatically downgrades to read-only — the auth step
+# has continue-on-error so builds proceed without remote cache.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    name: Valdi Smoke Tests
+    runs-on: macos-26
+
+    steps:
+      - name: Free disk space
+        run: |
+          # The smoke tests bootstrap two separate Bazel workspaces (ui_app +
+          # cli_app) which can exhaust the runner's disk. Remove large unused
+          # components to reclaim ~5-8 GB.
+          xcrun simctl delete unavailable 2>/dev/null || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* 2>/dev/null || true
+          rm -rf ~/Library/Android/sdk/system-images 2>/dev/null || true
+          sudo rm -rf /usr/local/share/powershell 2>/dev/null || true
+          sudo rm -rf /usr/local/share/dotnet 2>/dev/null || true
+          df -h /
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Pin Xcode
+        uses: ./.github/actions/pin-xcode
+
+      - name: Configure Bazel cache
+        uses: ./.github/actions/bazel-cache
+        with:
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          cache_bucket: ${{ vars.BAZEL_CACHE_BUCKET }}
+          cache_key: smoke-test
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Install Bazel and watchman
+        run: |
+          brew install bazelisk watchman
+          bazel --version
+          watchman --version
+
+      - name: Install Valdi CLI
+        run: ./tools/ci/install_cli.sh
+
+      - name: Run smoke tests
+        run: ./tools/ci/bootstrap_app.sh
+        env:
+          OPEN_SOURCE_DIR: ${{ github.workspace }}
+          PROJECT_ROOT: /tmp/valdi_app
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-macos
+          path: |
+            /tmp/valdi_app/*.log
+            /tmp/valdi_app/config.yaml
+            /tmp/valdi_app/WORKSPACE
+            /tmp/valdi_app/.bazelrc
+            /tmp/bazel-cred-helper.log
+          retention-days: 5
+
+  macos-tests:
+    name: "macOS: C++ & Platform Tests"
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Pin Xcode
+        uses: ./.github/actions/pin-xcode
+
+      - name: Configure Bazel cache
+        uses: ./.github/actions/bazel-cache
+        with:
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          cache_bucket: ${{ vars.BAZEL_CACHE_BUCKET }}
+          cache_key: macos-tests
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Install Bazel
+        run: |
+          brew install bazelisk
+          bazel --version
+          # run_tests.sh invokes `bzl`; on Linux setup_linux_env.sh creates this
+          # symlink, but the macOS runner only ships `bazel` from bazelisk.
+          sudo ln -sf "$(command -v bazel)" /usr/local/bin/bzl
+
+      - name: Run C++ and platform tests
+        # On macOS the `uname != Linux` branch of run_tests.sh fires, running the
+        # iOS/macOS ObjC/Swift suites that never execute on the Linux runner.
+        run: ./tools/ci/run_tests.sh
+
+  # Note: Linux CLI distribution tests moved to dedicated workflow:
+  # .github/workflows/test-cli-linux.yml
+  # This avoids duplication and provides better test organization.
+
+  linux-ci:
+    name: "Linux: ${{ matrix.name }}"
+    # Pin the major image (mirrors the macos-26 pin above) so a GitHub
+    # ubuntu-latest roll can't silently change the toolchain under CI.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: C++ Tests
+            task: test-cpp
+          - name: Build Compiler
+            task: build-compiler
+          - name: Build & Export
+            task: build-export
+          - name: Module Tests
+            task: test-modules
+          - name: Registry Validation
+            task: validate-registry
+          - name: Hotreload Smoke
+            task: hotreload-smoke
+          - name: Compiler Golden Diff
+            task: compiler-golden
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Configure Bazel cache
+        uses: ./.github/actions/bazel-cache
+        with:
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          cache_bucket: ${{ vars.BAZEL_CACHE_BUCKET }}
+          cache_key: ${{ matrix.task }}
+
+      - name: Setup Linux environment
+        # Also installs watchman (needed by the hotreload smoke); see setup_linux_env.sh.
+        run: source ./tools/ci/setup_linux_env.sh
+
+      - name: Setup environment and install Valdi CLI
+        if: matrix.task == 'build-export'
+        run: |
+          mkdir -p ~/.npm-global/lib
+          npm config set prefix '~/.npm-global'
+          npm install -g npm@11
+          export PATH=~/.npm-global/bin:$PATH
+          ./tools/ci/install_cli.sh
+
+      - name: "Validate: External build graph"
+        if: matrix.task == 'test-cpp'
+        run: ./tools/ci/test_external_build_graph.sh
+
+      - name: "Run: C++ Tests"
+        if: matrix.task == 'test-cpp'
+        run: ./tools/ci/run_tests.sh
+
+      - name: "Run: Build Compiler"
+        if: matrix.task == 'build-compiler'
+        run: ./tools/ci/build_compiler.sh
+
+      - name: "Run: Build & Export"
+        if: matrix.task == 'build-export'
+        run: |
+          export PATH=~/.npm-global/bin:$PATH
+          ./tools/ci/build_core_targets.sh
+          ./tools/ci/test_exported_lib.sh
+          ./tools/ci/bootstrap_app.sh
+        env:
+          OPEN_SOURCE_DIR: ${{ github.workspace }}
+          PROJECT_ROOT: /tmp/valdi_app
+
+      - name: "Run: Module Tests"
+        if: matrix.task == 'test-modules'
+        run: ./tools/ci/test_modules.sh
+
+      - name: "Run: Registry Validation"
+        if: matrix.task == 'validate-registry'
+        run: ./tools/ci/validate_registry.sh
+
+      - name: "Run: Hotreload Smoke"
+        if: matrix.task == 'hotreload-smoke'
+        run: ./tools/ci/hotreload_smoke.sh
+
+      - name: "Run: Compiler Golden Diff"
+        if: matrix.task == 'compiler-golden'
+        # Force the from-source companion so the diff reflects companion source,
+        # not a pinned prebuilt. GOLDEN_REGEN_DIR captures the freshly-generated
+        # goldens so they can be uploaded on drift (see next step). The second
+        # command is the in-process (jest) counterpart: Tier 2 golden diff.
+        run: |
+          ./tools/ci/compiler_golden_test.sh
+          bazel test //compiler/companion:golden_test --test_output=errors
+        env:
+          GOLDEN_BUILD_FLAGS: --//bzl/valdi:use_prebuilt_companion=false
+          GOLDEN_REGEN_DIR: ${{ runner.temp }}/regenerated-compiler-goldens
+
+      - name: "Upload regenerated goldens (on drift)"
+        if: matrix.task == 'compiler-golden' && failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regenerated-compiler-goldens
+          path: ${{ runner.temp }}/regenerated-compiler-goldens
+          if-no-files-found: warn
+
+  snapshot-tests:
+    name: Snapshot Tests
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Pin Xcode
+        uses: ./.github/actions/pin-xcode
+
+      - name: Configure Bazel cache
+        uses: ./.github/actions/bazel-cache
+        with:
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          cache_bucket: ${{ vars.BAZEL_CACHE_BUCKET }}
+          cache_key: snapshot-tests
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Install Bazel and watchman
+        run: |
+          brew install bazelisk watchman
+          bazel --version
+
+      - name: Run snapshot tests
+        run: ./tools/ci/snapshot_tests.sh /tmp/valdi-snapshots
+
+      - name: Upload diff images
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-diffs
+          path: /tmp/valdi-snapshots/diffs/
+          retention-days: 5
+
+  api-surface:
+    name: API Surface Check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check API surface
+        run: ./tools/ci/api_surface_tests.sh
+
+  web-integration-test:
+    name: valdi_web Integration Test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Configure Bazel cache
+        uses: ./.github/actions/bazel-cache
+        with:
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          cache_bucket: ${{ vars.BAZEL_CACHE_BUCKET }}
+          cache_key: web-integration
+
+      - name: Setup Linux environment
+        run: source ./tools/ci/setup_linux_env.sh
+
+      # valdi_web Puppeteer integration test for the helloworld_playground
+      # experiment. Builds the exported web bundle (requires enable_web) then
+      # boots it in chrome-headless-shell, which @puppeteer/browsers downloads
+      # at runtime — hence the target's `requires-network` tag (exempts it from
+      # Bazel's test network isolation).
+      - name: Run valdi_web integration test
+        run: ./tools/ci/web_integration_test.sh
+
+  test-coverage-delta:
+    name: Test Coverage Delta
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Full history so the check can diff HEAD against the merge base with main.
+          fetch-depth: 0
+
+      # Catch changes that remove test coverage. A deleted test cannot fail, so nothing else
+      # notices it.
+      - name: Check for removed test coverage
+        run: |
+          git fetch --no-tags --quiet origin main
+          ./tools/ci/check_test_coverage_delta.sh origin/main

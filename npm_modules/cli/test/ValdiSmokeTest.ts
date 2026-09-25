@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 import assert from 'node:assert';
-import { mkdir, unlink } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { lookForOutput } from './helpers/AsyncHelpers';
@@ -15,6 +15,7 @@ import {
 } from './helpers/ProjectHelpers';
 import { type ProjectConfig } from './helpers/ProjectHelpers';
 import { type TSServerClient, createClient, lineAndOffset } from './helpers/TypeScriptClient';
+import { error } from 'node:console';
 
 
 const PROJECT_ROOT = process.env['PROJECT_ROOT']!;
@@ -53,9 +54,9 @@ void describe('valdi ui app', () => {
       await lookForOutput({ stderr: [/Build completed successfully, \d+ total actions?/] }, task);
     });
 
-    void it('build android', { skip: true }, async () => {
+    void it('build android', async () => {
       const task = run('valdi', ['build', 'android']);
-      await lookForOutput({ stderr: [/Build completed successfully, \d+ total actions?/] }, task);
+      await lookForOutput({ stderr: [/Build completed successfully, \d+ total actions?/], idleTimeoutMs: 120_000 }, task);
     });
 
     void it('valdi doctor', async () => {
@@ -257,9 +258,9 @@ async function bootstrap(
   applicationType: 'ui_application' | 'cli_application',
 ) {
   // Delete and recreate the bootstrapped project
-  await unlink(projectRootPath).catch(() => {
-    // Logging the failure, it's ok if it doesn't exist though
-    console.log(projectRootPath, 'does not exist yet');
+  await rm(projectRootPath, { recursive: true, force: true }).catch((error) => {
+    // Logging the failure; if it doesn't exist the force flag will handle it 
+    console.error('Failed to remove', projectRootPath, ':', error);
   });
   await mkdir(projectRootPath, { recursive: true });
 

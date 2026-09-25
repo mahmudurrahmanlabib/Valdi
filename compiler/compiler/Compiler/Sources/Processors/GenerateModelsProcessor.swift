@@ -18,14 +18,37 @@ final class GenerateModelsProcessor: CompilationProcessor {
 
     private let logger: ILogger
     private let compilerConfig: CompilerConfig
+    private let generateNativeSources: Bool
 
-    init(logger: ILogger, compilerConfig: CompilerConfig) {
+    init(logger: ILogger, compilerConfig: CompilerConfig, generateNativeSources: Bool) {
         self.logger = logger
         self.compilerConfig = compilerConfig
+        self.generateNativeSources = generateNativeSources
     }
 
     var description: String {
         return "Generating Native Models"
+    }
+
+    /// Picks a deterministic attribution representative per shared-VM native identity.
+    /// A VM bound by multiple Components is attached to each consuming Component's
+    /// document (each with its own `componentPath`); the single emitted model must be
+    /// attributed to the same document across runs regardless of input order. Winner =
+    /// lexicographically smallest `(fileName, exportedMember)`.
+    static func attributionRepresentatives(
+        identityAndPaths: [(identity: String, path: ComponentPath)]
+    ) -> [String: ComponentPath] {
+        var chosen = [String: ComponentPath]()
+        for (identity, path) in identityAndPaths {
+            guard let existing = chosen[identity] else {
+                chosen[identity] = path
+                continue
+            }
+            if (path.fileName, path.exportedMember) < (existing.fileName, existing.exportedMember) {
+                chosen[identity] = path
+            }
+        }
+        return chosen
     }
 
     private func doGenerate<T: NativeSourceGenerator>(item: CompilationItem,
@@ -61,65 +84,73 @@ final class GenerateModelsProcessor: CompilationProcessor {
         let classMapping: ResolvedClassMapping
     }
 
-    private func typeDescription(for exportedType: ExportedType) -> GeneratedTypeDescription? {
+    private func typeDescription(for exportedType: ExportedType, baseline: String?) -> GeneratedTypeDescription {
         switch exportedType {
         case let .valdiModel(model):
             if model.exportAsInterface {
-                return .interface(GeneratedNativeInterfaceDescription(model: model))
+                return .interface(GeneratedNativeInterfaceDescription(model: model, baseline: baseline))
             } else {
-                return .class(GeneratedNativeClassDescription(model: model))
+                return .class(GeneratedNativeClassDescription(model: model, baseline: baseline))
             }
         case let .enum(exportedEnum):
-            return .enum(GeneratedEnumDescription.from(exportedEnum: exportedEnum))
+            return .enum(GeneratedEnumDescription.from(exportedEnum: exportedEnum, baseline: baseline))
         case let .function(exportedFunction):
-            return .function(GeneratedFunctionDescription.from(exportedFunction: exportedFunction))
-        case .module:
-            return nil
+            return .function(GeneratedFunctionDescription.from(exportedFunction: exportedFunction, baseline: baseline))
+        case let .module(exportedModule):
+            return .module(GeneratedNativeInterfaceDescription(model: exportedModule.model, baseline: baseline))
         }
     }
 
     private func generate(selectedItem: SelectedItem<[IntermediateItem]>) -> [CompilationItem] {
         var out = [CompilationItem]()
         for item in selectedItem.data {
-            switch item.exportedType {
-            case .valdiModel(let valdiModel):
-                out += doGenerate(item: selectedItem.item,
-                                  intermediateItem: item,
-                                  iosType: valdiModel.iosType,
-                                  androidClassName: valdiModel.androidClassName,
-                                  cppType: valdiModel.cppType,
-                                  generationType: "model",
-                                  generator: ValdiModelGenerator(model: valdiModel))
-            case .enum(let exportedEnum):
-                out += doGenerate(item: selectedItem.item,
-                                  intermediateItem: item,
-                                   iosType: exportedEnum.iosType,
-                                   androidClassName: exportedEnum.androidTypeName,
-                                   cppType: exportedEnum.cppType,
-                                   generationType: "enum",
-                                   generator: ExportedEnumGenerator(exportedEnum: exportedEnum))
-            case .function(let exportedFunc):
-                out += doGenerate(item: selectedItem.item,
-                                  intermediateItem: item,
-                                  iosType: exportedFunc.containingIosType,
-                                  androidClassName: exportedFunc.containingAndroidTypeName,
-                                  cppType: nil,
-                                  generationType: "function",
-                                  generator: ExportedFunctionGenerator(exportedFunction: exportedFunc, modulePath: selectedItem.item.relativeBundleURL.deletingPathExtension().absoluteString))
-            case .module(let exportedModule):
-                out += doGenerate(item: selectedItem.item,
-                                  intermediateItem: item,
-                                  iosType: exportedModule.model.iosType,
-                                  androidClassName: exportedModule.model.androidClassName,
-                                  cppType: exportedModule.model.cppType,
-                                  generationType: "module",
-                                  generator: ExportedModuleGenerator(bundleInfo: selectedItem.item.bundleInfo, exportedModule: exportedModule))
+            if generateNativeSources {
+                switch item.exportedType {
+                case .valdiModel(let valdiModel):
+                    out += doGenerate(item: selectedItem.item,
+                                      intermediateItem: item,
+                                      iosType: valdiModel.iosType,
+                                      androidClassName: valdiModel.androidClassName,
+                                      cppType: valdiModel.cppType,
+                                      generationType: "model",
+                                      generator: ValdiModelGenerator(model: valdiModel))
+                case .enum(let exportedEnum):
+                    out += doGenerate(item: selectedItem.item,
+                                      intermediateItem: item,
+                                       iosType: exportedEnum.iosType,
+                                       androidClassName: exportedEnum.androidTypeName,
+                                       cppType: exportedEnum.cppType,
+                                       generationType: "enum",
+                                       generator: ExportedEnumGenerator(exportedEnum: exportedEnum))
+                case .function(let exportedFunc):
+                    out += doGenerate(item: selectedItem.item,
+                                      intermediateItem: item,
+                                      iosType: exportedFunc.containingIosType,
+                                      androidClassName: exportedFunc.containingAndroidTypeName,
+                                      cppType: exportedFunc.containingCppType,
+                                      generationType: "function",
+                                      generator: ExportedFunctionGenerator(exportedFunction: exportedFunc, modulePath: selectedItem.item.relativeBundleURL.deletingPathExtension().absoluteString))
+                case .module(let exportedModule):
+                    out += doGenerate(item: selectedItem.item,
+                                      intermediateItem: item,
+                                      iosType: exportedModule.model.iosType,
+                                      androidClassName: exportedModule.model.androidClassName,
+                                      cppType: exportedModule.model.cppType,
+                                      generationType: "module",
+                                      generator: ExportedModuleGenerator(bundleInfo: selectedItem.item.bundleInfo, exportedModule: exportedModule))
+                }
             }
 
-            if let description = typeDescription(for: item.exportedType) {
-                let newItem = selectedItem.item.with(newKind: .generatedTypeDescription(description), newPlatform: .none)
-                out.append(newItem)
-            }
+            let baseline = selectedItem.item.bundleInfo.projectConfig.nativeApiMinVersion.map(String.init)
+            let description = typeDescription(for: item.exportedType, baseline: baseline)
+            let newItem = selectedItem.item.with(
+                newKind: .generatedTypeDescription(
+                    description,
+                    src: item.sourceFilename.src
+                ),
+                newPlatform: .none
+            )
+            out.append(newItem)
         }
 
         if case .document = selectedItem.item.kind {
@@ -142,17 +173,66 @@ final class GenerateModelsProcessor: CompilationProcessor {
     }
 
     func process(items: CompilationItems) throws -> CompilationItems {
+        // A ViewModel shared by multiple Components (e.g. one used by both HelloCard and
+        // GoodbyeCard) gets attached to every consuming Component's document. We only
+        // want to emit the model once, so we dedupe. Dedup key is the concrete native
+        // class identity (iosType.name, androidClassName, cppType.declaration.name) —
+        // NOT the TS type name. Two unrelated ViewModels in one module can legitimately
+        // share a bare TS name (`interface ViewModel {}` in different files with
+        // distinct `@ExportModel` iosType/androidClassName), and keying on tsType would
+        // silently collapse those distinct native emissions into one. Scoped to the
+        // document-VM slot only; plain `.exportedType` emissions are untouched.
+        var emittedViewModelIdentities = Set<String>()
+
+        func viewModelIdentity(_ model: ValdiModel) -> String {
+            return [
+                model.iosType?.name ?? "",
+                model.androidClassName ?? "",
+                model.cppType?.declaration.name ?? "",
+            ].joined(separator: "|")
+        }
+
+        // A shared VM is attached to every consuming Component's document, each carrying
+        // its own componentPath, and `items.allItems` order is not deterministic across
+        // clean builds (produced by a concurrent attach/append fan-out upstream). Choosing
+        // the emitting/attribution document by first-wins iteration order therefore made
+        // the "Generated from type ..." header attribution flip between runs and broke
+        // build hermeticity (COMPOSER-6163). Pick the representative deterministically.
+        let identityAndPaths: [(identity: String, path: ComponentPath)] = items.allItems.compactMap { item in
+            guard shouldProcessItem(item: item),
+                  case .document(let result) = item.kind,
+                  let viewModel = result.originalDocument.viewModel else {
+                return nil
+            }
+            return (viewModelIdentity(viewModel), result.componentPath)
+        }
+        let attributionRepresentatives = Self.attributionRepresentatives(identityAndPaths: identityAndPaths)
+
         let intermediateItems = items.select { (item) -> [IntermediateItem]? in
             guard shouldProcessItem(item: item) else {
                 return nil
             }
 
             if case .document(let result) = item.kind, let viewModel = result.originalDocument.viewModel {
-                let generatedSourceFilename = GeneratedSourceFilename(filename: result.componentPath.fileName, symbolName: result.componentPath.exportedMember)
+                let generatedSourceFilename = GeneratedSourceFilename(
+                    filename: result.componentPath.fileName,
+                    symbolName: result.componentPath.exportedMember,
+                    src: TypeScriptItemSrc(
+                        compilationPath: item.relativeProjectPath,
+                        sourceURL: item.sourceURL
+                    )
+                )
                 var out = [IntermediateItem]()
-                out.append(IntermediateItem(sourceFilename: generatedSourceFilename,
-                                            exportedType: .valdiModel(viewModel),
-                                            classMapping: result.classMapping))
+                let identity = viewModelIdentity(viewModel)
+                // Emit only from the deterministically-chosen representative document; the
+                // set is a secondary guard against double-emit if two items ever share an
+                // identical componentPath.
+                if attributionRepresentatives[identity] == result.componentPath,
+                   emittedViewModelIdentities.insert(identity).inserted {
+                    out.append(IntermediateItem(sourceFilename: generatedSourceFilename,
+                                                exportedType: .valdiModel(viewModel),
+                                                classMapping: result.classMapping))
+                }
 
                 for childModel in result.originalDocument.additionalModels {
                     out.append(IntermediateItem(sourceFilename: generatedSourceFilename,

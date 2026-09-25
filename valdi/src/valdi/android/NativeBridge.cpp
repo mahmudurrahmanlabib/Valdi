@@ -10,6 +10,7 @@
 #include "valdi/android/RuntimeManagerWrapper.hpp"
 #include "valdi/android/RuntimeWrapper.hpp"
 #include "valdi/runtime/Attributes/Yoga/Yoga.hpp"
+#include "valdi_core/cpp/Constants.hpp"
 #include "valdi_core/jni/JNIMethodUtils.hpp"
 #include "valdi_core/jni/JavaUtils.hpp"
 
@@ -21,6 +22,7 @@
 #include "valdi/runtime/Interfaces/IDiskCache.hpp"
 #include "valdi/runtime/Resources/AssetLoaderCompletion.hpp"
 #include "valdi/runtime/Resources/AssetsManager.hpp"
+#include "valdi/runtime/Views/ViewTransactionScope.hpp"
 #include "valdi_core/jni/IndirectJavaGlobalRef.hpp"
 #include "valdi_core/jni/JavaCache.hpp"
 #include "valdi_core/jni/JavaClass.hpp"
@@ -28,9 +30,9 @@
 
 #include "utils/platform/BuildOptions.hpp"
 #include "utils/time/StopWatch.hpp"
-#include "valdi/NativeJSRuntime.hpp"
 #include "valdi_core/NativeAsset.hpp"
 #include "valdi_core/NativeHTTPRequestManager.hpp"
+#include "valdi_core/NativeJSRuntime.hpp"
 #include "valdi_core/NativeModuleFactoriesProvider.hpp"
 #include "valdi_core/NativeModuleFactory.hpp"
 #include "valdi_core/cpp/Utils/DiskUtils.hpp"
@@ -41,15 +43,18 @@
 #include "valdi_core/cpp/Utils/ValueFunction.hpp"
 
 #include "valdi/runtime/Runtime.hpp"
+#include "valdi/runtime/ValdiBuildFlags.hpp"
 #include "valdi_core/cpp/Utils/Function.hpp"
 
 #include "valdi/android/AccessibilityBridge.hpp"
 #include "valdi/android/AndroidAssetLoader.hpp"
 #include "valdi/android/AndroidBitmap.hpp"
+#include "valdi/android/AndroidBitmapFactory.hpp"
 #include "valdi/android/AndroidViewHolder.hpp"
 #include "valdi/android/AttributesBindingContextWrapper.hpp"
 #include "valdi/android/DeferredViewOperations.hpp"
 #include "valdi/android/NativeBridge.hpp"
+#include "valdi/svg/SVGRenderer.hpp"
 
 #if SNAP_DRAWING_ENABLED
 #include "snap_drawing/cpp/Utils/LottieAnimatedImage.hpp"
@@ -57,6 +62,8 @@
 #endif
 
 #include <android/native_window_jni.h>
+#include <cstdlib>
+#include <string>
 
 inline ValdiAndroid::RuntimeWrapper* getRuntimeWrapper(jlong handle) {
     return reinterpret_cast<ValdiAndroid::RuntimeWrapper*>(handle);
@@ -141,6 +148,12 @@ jint ValdiAndroid::NativeBridge::getBuildOptions(fbjni::alias_ref<fbjni::JClass>
 #endif
 
     return static_cast<jint>(buildOptions);
+}
+
+void ValdiAndroid::NativeBridge::setDebuggerPortEnvironment(fbjni::alias_ref<fbjni::JClass> /* clazz */,
+                                                            jint debuggerPort) {
+    const auto debuggerPortString = std::to_string(debuggerPort);
+    setenv("VALDI_DEBUGGER_SERVICE_PORT", debuggerPortString.c_str(), 1);
 }
 
 jlong ValdiAndroid::NativeBridge::createRuntimeManager( // NOLINT
@@ -338,8 +351,7 @@ jlong ValdiAndroid::NativeBridge::createRuntime( // NOLINT
     auto* runtimeManagerWrapper = getRuntimeManagerWrapper(runtimeManagerHandle);
     auto runtime = runtimeManagerWrapper->createRuntime(customResourceResolver);
 
-    auto* runtimeWrapper =
-        new ValdiAndroid::RuntimeWrapper(runtime, runtimeManagerWrapper, runtimeManagerWrapper->getPointScale());
+    auto* runtimeWrapper = new ValdiAndroid::RuntimeWrapper(runtime, runtimeManagerWrapper);
 
     return reinterpret_cast<std::uintptr_t>(runtimeWrapper);
 }
@@ -816,7 +828,13 @@ void ValdiAndroid::NativeBridge::scheduleExclusiveUpdate( // NOLINT
 
     auto runnableRef = Valdi::makeShared<ValdiAndroid::JavaRunnable>(ValdiAndroid::JavaEnv(), runnable);
 
-    viewNodeTree->scheduleExclusiveUpdate([runnableRef = std::move(runnableRef)]() { (*runnableRef)(); });
+#if VALDI_DEBUG_TREE_UPDATES
+    viewNodeTree->scheduleExclusiveUpdate(
+        [runnableRef = std::move(runnableRef)]() { (*runnableRef)(); }, Valdi::DispatchFunction(), "native_bridge");
+#else
+    viewNodeTree->scheduleExclusiveUpdate([runnableRef = std::move(runnableRef)]() { (*runnableRef)(); },
+                                          Valdi::DispatchFunction());
+#endif
 }
 
 void ValdiAndroid::NativeBridge::setViewInflationEnabled( // NOLINT
@@ -857,6 +875,13 @@ void ValdiAndroid::NativeBridge::performCallback( // NOLINT
     std::unique_ptr<Valdi::DispatchFunction> ptr(callback);
 
     (*callback)();
+}
+
+void ValdiAndroid::NativeBridge::discardCallback( // NOLINT
+    fbjni::alias_ref<fbjni::JClass> /* clazz */,  // NOLINT
+    jlong callbackHandle) {
+    auto* callback = reinterpret_cast<Valdi::DispatchFunction*>(callbackHandle);
+    delete callback;
 }
 
 /*
@@ -1272,61 +1297,75 @@ jlong ValdiAndroid::NativeBridge::notifyScroll(  // NOLINT
         return 0;
     }
 
-    viewNodeTree->withLock([&]() {
-        auto pointScale = runtimeWrapper->getPointScale();
+    // Point conversions only need the point scale, not tree state; keep them out of the
+    // critical section.
+    auto pointScale = runtimeWrapper->getPointScale();
 
-        auto pointDirectionDependentContentOffset =
-            Valdi::Point::fromPixels(static_cast<int32_t>(pixelDirectionDependentContentOffsetX),
-                                     static_cast<int32_t>(pixelDirectionDependentContentOffsetY),
-                                     pointScale);
+    auto pointDirectionDependentContentOffset =
+        Valdi::Point::fromPixels(static_cast<int32_t>(pixelDirectionDependentContentOffsetX),
+                                 static_cast<int32_t>(pixelDirectionDependentContentOffsetY),
+                                 pointScale);
 
-        auto pointDirectionDependentUnclampedContentOffset =
-            Valdi::Point::fromPixels(static_cast<int32_t>(pixelDirectionDependentUnclampedContentOffsetX),
-                                     static_cast<int32_t>(pixelDirectionDependentUnclampedContentOffsetY),
-                                     pointScale);
+    auto pointDirectionDependentUnclampedContentOffset =
+        Valdi::Point::fromPixels(static_cast<int32_t>(pixelDirectionDependentUnclampedContentOffsetX),
+                                 static_cast<int32_t>(pixelDirectionDependentUnclampedContentOffsetY),
+                                 pointScale);
 
-        auto pointDirectionDependentVelocityX =
-            -Valdi::pixelsToPoints(static_cast<float>(pixelDirectionDependentInvertedVelocityX), pointScale);
-        auto pointDirectionDependentVelocityY =
-            -Valdi::pixelsToPoints(static_cast<float>(pixelDirectionDependentInvertedVelocityY), pointScale);
-        auto pointDirectionDependentVelocity =
-            Valdi::Point(pointDirectionDependentVelocityX, pointDirectionDependentVelocityY);
+    auto pointDirectionDependentVelocityX =
+        -Valdi::pixelsToPoints(static_cast<float>(pixelDirectionDependentInvertedVelocityX), pointScale);
+    auto pointDirectionDependentVelocityY =
+        -Valdi::pixelsToPoints(static_cast<float>(pixelDirectionDependentInvertedVelocityY), pointScale);
+    auto pointDirectionDependentVelocity =
+        Valdi::Point(pointDirectionDependentVelocityX, pointDirectionDependentVelocityY);
 
-        switch (static_cast<ScrollEventType>(eventType)) {
-            case ScrollEventTypeOnScroll: {
-                auto adjustedDirectionDependentContentOffset =
-                    viewNode->onScroll(pointDirectionDependentContentOffset,
-                                       pointDirectionDependentUnclampedContentOffset,
-                                       pointDirectionDependentVelocity);
+    // This runs on the main thread for every scroll event, so never park on the tree lock
+    // indefinitely (COMPOSER-5961). Per-frame ON_SCROLL events are skip-tolerant (the next frame
+    // supersedes them): attempt the lock exactly once. Lifecycle events get the shared input
+    // deadline; if it expires the event is dropped and `out` stays at the no-override sentinel.
+    auto lockDeadline = static_cast<ScrollEventType>(eventType) == ScrollEventTypeOnScroll ?
+                            std::chrono::steady_clock::now() :
+                            std::chrono::steady_clock::now() + Valdi::kInputSyncCallDeadline;
 
-                if (adjustedDirectionDependentContentOffset) {
-                    out = convertPointToPackedPixels(adjustedDirectionDependentContentOffset.value(), pointScale);
-                }
-            } break;
-
-            case ScrollEventTypeOnScrollEnd:
-                viewNode->onScrollEnd(pointDirectionDependentContentOffset,
-                                      pointDirectionDependentUnclampedContentOffset);
-                break;
-            case ScrollEventTypeOnDragStart:
-                viewNode->onDragStart(pointDirectionDependentContentOffset,
-                                      pointDirectionDependentUnclampedContentOffset,
-                                      pointDirectionDependentVelocity);
-                break;
-            case ScrollEventTypeOnDragEnding: {
-                auto adjustedPointDirectionDependentContentOffset =
-                    viewNode->onDragEnding(pointDirectionDependentContentOffset,
+    viewNodeTree->tryWithLock(
+        [&]() {
+            switch (static_cast<ScrollEventType>(eventType)) {
+                case ScrollEventTypeOnScroll: {
+                    auto adjustedDirectionDependentContentOffset =
+                        viewNode->onScroll(pointDirectionDependentContentOffset,
                                            pointDirectionDependentUnclampedContentOffset,
                                            pointDirectionDependentVelocity);
-                if (adjustedPointDirectionDependentContentOffset) {
-                    out = convertPointToPackedPixels(adjustedPointDirectionDependentContentOffset.value(), pointScale);
-                }
-            } break;
-            default:
-                ValdiAndroid::JavaEnv::getUnsafeEnv()->ThrowNew(
-                    ValdiAndroid::JavaEnv::getCache().getValdiExceptionClass().getClass(), "Invalid scroll event type");
-        }
-    });
+
+                    if (adjustedDirectionDependentContentOffset) {
+                        out = convertPointToPackedPixels(adjustedDirectionDependentContentOffset.value(), pointScale);
+                    }
+                } break;
+
+                case ScrollEventTypeOnScrollEnd:
+                    viewNode->onScrollEnd(pointDirectionDependentContentOffset,
+                                          pointDirectionDependentUnclampedContentOffset);
+                    break;
+                case ScrollEventTypeOnDragStart:
+                    viewNode->onDragStart(pointDirectionDependentContentOffset,
+                                          pointDirectionDependentUnclampedContentOffset,
+                                          pointDirectionDependentVelocity);
+                    break;
+                case ScrollEventTypeOnDragEnding: {
+                    auto adjustedPointDirectionDependentContentOffset =
+                        viewNode->onDragEnding(pointDirectionDependentContentOffset,
+                                               pointDirectionDependentUnclampedContentOffset,
+                                               pointDirectionDependentVelocity);
+                    if (adjustedPointDirectionDependentContentOffset) {
+                        out = convertPointToPackedPixels(adjustedPointDirectionDependentContentOffset.value(),
+                                                         pointScale);
+                    }
+                } break;
+                default:
+                    ValdiAndroid::JavaEnv::getUnsafeEnv()->ThrowNew(
+                        ValdiAndroid::JavaEnv::getCache().getValdiExceptionClass().getClass(),
+                        "Invalid scroll event type");
+            }
+        },
+        lockDeadline);
 
     return out;
 }
@@ -1365,6 +1404,18 @@ void ValdiAndroid::NativeBridge::applicationSetConfiguration( // NOLINT
     }
 
     wrapper->setDynamicTypeScale(dynamicTypeScale);
+}
+
+void ValdiAndroid::NativeBridge::setPointScale(  // NOLINT
+    fbjni::alias_ref<fbjni::JClass> /* clazz */, // NOLINT
+    jlong runtimeManagerHandle,
+    jfloat pointScale) {
+    auto* wrapper = getRuntimeManagerWrapper(runtimeManagerHandle);
+    if (wrapper == nullptr) {
+        return;
+    }
+
+    wrapper->setPointScale(pointScale);
 }
 
 void ValdiAndroid::NativeBridge::applicationDidResume( // NOLINT
@@ -1474,6 +1525,102 @@ void ValdiAndroid::NativeBridge::setValueForAttribute( // NOLINT
     }
 }
 
+jobject ValdiAndroid::NativeBridge::getStoredObjectForViewNode( // NOLINT
+    fbjni::alias_ref<fbjni::JClass> /* clazz */,                // NOLINT
+    jlong viewNodeHandle,
+    jlong key) {
+    auto viewNode = getViewNode(viewNodeHandle);
+    if (viewNode == nullptr) {
+        return nullptr;
+    }
+
+    auto javaEnv = ValdiAndroid::JavaEnv();
+    auto storedKey = ValdiAndroid::unwrapInternedString(key);
+    auto* viewNodeTree = viewNode->getViewNodeTree();
+    if (viewNodeTree == nullptr) {
+        return nullptr;
+    }
+
+    Valdi::Value value = Valdi::Value::undefined();
+    viewNodeTree->withLock([&]() { value = viewNode->getStoredObject(storedKey); });
+    if (value.isNullOrUndefined()) {
+        return nullptr;
+    }
+
+    return ValdiAndroid::toJavaObject(javaEnv, value).releaseObject();
+}
+
+void ValdiAndroid::NativeBridge::setStoredObjectForViewNode( // NOLINT
+    fbjni::alias_ref<fbjni::JClass> /* clazz */,             // NOLINT
+    jlong viewNodeHandle,
+    jlong key,
+    jobject object) {
+    auto viewNode = getViewNode(viewNodeHandle);
+    if (viewNode == nullptr) {
+        return;
+    }
+
+    auto javaEnv = ValdiAndroid::JavaEnv();
+    auto storedKey = ValdiAndroid::unwrapInternedString(key);
+    auto storedValue = ValdiAndroid::toValue(javaEnv, ValdiAndroid::JavaEnv::newLocalRef(object));
+    auto* viewNodeTree = viewNode->getViewNodeTree();
+    if (viewNodeTree == nullptr) {
+        return;
+    }
+
+    viewNodeTree->withLock([&]() { viewNode->setStoredObject(storedKey, storedValue); });
+}
+
+void ValdiAndroid::NativeBridge::setInlineTextAnimationAttributesForViewNode( // NOLINT
+    fbjni::alias_ref<fbjni::JClass> /* clazz */,                              // NOLINT
+    jlong viewNodeHandle,
+    jboolean hasOpacity,
+    jdouble opacity,
+    jboolean hasTransform,
+    jdouble translationY,
+    jdouble scale) {
+    auto viewNode = getViewNode(viewNodeHandle);
+    if (viewNode == nullptr) {
+        return;
+    }
+
+    auto* viewNodeTree = viewNode->getViewNodeTree();
+    if (viewNodeTree == nullptr) {
+        return;
+    }
+
+    auto* attributeOwner = Valdi::AttributeOwner::getNativeOverridenAttributeOwner();
+    auto& attributeIds = viewNode->getAttributeIds();
+    auto opacityId = attributeIds.getIdForName("opacity");
+    auto translationYId = attributeIds.getIdForName("translationY");
+    auto scaleXId = attributeIds.getIdForName("scaleX");
+    auto scaleYId = attributeIds.getIdForName("scaleY");
+
+    viewNodeTree->withLock([&]() {
+        auto& viewTransactionScope = viewNodeTree->getCurrentViewTransactionScope();
+        if (static_cast<bool>(hasOpacity)) {
+            viewNode->setAttribute(viewTransactionScope, opacityId, attributeOwner, Valdi::Value(opacity), nullptr);
+        } else {
+            viewNode->setAttribute(viewTransactionScope, opacityId, attributeOwner, Valdi::Value::undefined(), nullptr);
+        }
+
+        if (static_cast<bool>(hasTransform)) {
+            viewNode->setAttribute(
+                viewTransactionScope, translationYId, attributeOwner, Valdi::Value(translationY), nullptr);
+            viewNode->setAttribute(viewTransactionScope, scaleXId, attributeOwner, Valdi::Value(scale), nullptr);
+            viewNode->setAttribute(viewTransactionScope, scaleYId, attributeOwner, Valdi::Value(scale), nullptr);
+        } else {
+            viewNode->setAttribute(
+                viewTransactionScope, translationYId, attributeOwner, Valdi::Value::undefined(), nullptr);
+            viewNode->setAttribute(viewTransactionScope, scaleXId, attributeOwner, Valdi::Value::undefined(), nullptr);
+            viewNode->setAttribute(viewTransactionScope, scaleYId, attributeOwner, Valdi::Value::undefined(), nullptr);
+        }
+
+        viewNode->getAttributesApplier().flush(viewTransactionScope);
+        viewTransactionScope.flushNow(/* sync */ true);
+    });
+}
+
 void ValdiAndroid::NativeBridge::notifyApplyAttributeFailed(fbjni::alias_ref<fbjni::JClass> clazz, // NOLINT
                                                             jlong viewNodeHandle,
                                                             jint attributeId,
@@ -1483,9 +1630,19 @@ void ValdiAndroid::NativeBridge::notifyApplyAttributeFailed(fbjni::alias_ref<fbj
         return;
     }
 
+    // Failures can be reported asynchronously (e.g. font load completions posted to the main
+    // thread). By then the node may be detached and its tree/logger already destroyed, so
+    // logging through the node would dereference freed memory.
+    auto* viewNodeTree = viewNode->getViewNodeTree();
+    if (viewNodeTree == nullptr) {
+        return;
+    }
+
     auto errorMessageCpp = ValdiAndroid::toInternedString(ValdiAndroid::JavaEnv(), errorMessage);
 
-    viewNode->notifyAttributeFailed(static_cast<Valdi::AttributeId>(attributeId), Valdi::Error(errorMessageCpp));
+    viewNodeTree->withLock([&]() {
+        viewNode->notifyAttributeFailed(static_cast<Valdi::AttributeId>(attributeId), Valdi::Error(errorMessageCpp));
+    });
 }
 
 jobject ValdiAndroid::NativeBridge::getValueForAttribute( // NOLINT
@@ -1732,6 +1889,13 @@ jint ValdiAndroid::NativeBridge::bindAttribute(fbjni::alias_ref<fbjni::JClass> c
     return wrapper->bindAttributes(type, name, invalidateLayoutOnChange, delegate, compositeParts);
 }
 
+void ValdiAndroid::NativeBridge::bindTransformAttributes(fbjni::alias_ref<fbjni::JClass> clazz, // NOLINT
+                                                         jlong bindingContextHandle,
+                                                         jobject delegate) {
+    auto wrapper = getBindingContextWrapper(bindingContextHandle);
+    wrapper->bindTransformAttributes(delegate);
+}
+
 void ValdiAndroid::NativeBridge::bindScrollAttributes(fbjni::alias_ref<fbjni::JClass> clazz, // NOLINT
                                                       jlong bindingContextHandle) {
     auto wrapper = getBindingContextWrapper(bindingContextHandle);
@@ -1791,8 +1955,8 @@ jobject ValdiAndroid::NativeBridge::getJSRuntime( // NOLINT
         return nullptr;
     }
 
-    return djinni_generated_client::valdi::NativeJSRuntime::fromCpp(env,
-                                                                    Valdi::strongRef(runtime->getJavaScriptRuntime()))
+    return djinni_generated_client::valdi_core::NativeJSRuntime::fromCpp(
+               env, Valdi::strongRef(runtime->getJavaScriptRuntime()))
         .release();
 }
 
@@ -1840,9 +2004,10 @@ jlong ValdiAndroid::NativeBridge::createViewFactory( // NOLINT
     auto attributes = viewManagerContext->getAttributesManager().getAttributesForClass(cppViewClassName);
 
     if (hasBindAttributes == JNI_TRUE) {
-        Valdi::AttributesBindingContextImpl bindingContext(viewManagerContext->getAttributesManager().getAttributeIds(),
-                                                           viewManagerContext->getAttributesManager().getColorPalette(),
-                                                           runtimeManagerWrapper->getRuntimeManager().getLogger());
+        Valdi::AttributesBindingContextImpl bindingContext(
+            viewManagerContext->getAttributesManager().getAttributeIds(),
+            viewManagerContext->getAttributesManager().getColorPaletteManager(),
+            runtimeManagerWrapper->getRuntimeManager().getLogger());
 
         auto wrapper = Valdi::makeShared<AttributesBindingContextWrapper>(androidViewManager, bindingContext);
         auto ptr = reinterpret_cast<int64_t>(Valdi::unsafeBridgeCast(wrapper.get()));
@@ -2070,6 +2235,67 @@ jobject ValdiAndroid::NativeBridge::wrapAndroidBitmap(fbjni::alias_ref<fbjni::JC
     auto androidBitmap = Valdi::makeShared<AndroidBitmap>(JavaObject(JavaEnv(), bitmap));
 
     return newJavaObjectWrappingValue(JavaEnv(), Valdi::Value(androidBitmap)).releaseObject();
+}
+
+jobject ValdiAndroid::NativeBridge::rasterizeSVG(fbjni::alias_ref<fbjni::JClass> /*clazz*/, // NOLINT
+                                                 jbyteArray svgData,
+                                                 jint preferredWidth,
+                                                 jint preferredHeight,
+                                                 jfloat /*displayScale*/) {
+    auto* env = fbjni::Environment::current();
+    if (svgData == nullptr) {
+        ValdiAndroid::throwJavaValdiException(env, "SVG data cannot be null");
+        return nullptr;
+    }
+
+    auto bytes = ValdiAndroid::toByteArray(JavaEnv(), svgData);
+    auto bitmap = Valdi::SVGRenderer::rasterizeSVG(bytes,
+                                                   AndroidBitmapFactory::getSharedInstance(),
+                                                   static_cast<int32_t>(preferredWidth),
+                                                   static_cast<int32_t>(preferredHeight));
+    if (!bitmap) {
+        ValdiAndroid::throwJavaValdiException(env, bitmap.error());
+        return nullptr;
+    }
+
+    auto androidBitmap = Valdi::castOrNull<AndroidBitmap>(bitmap.value());
+    if (androidBitmap == nullptr) {
+        ValdiAndroid::throwJavaValdiException(env, "SVG rasterization did not return an Android bitmap");
+        return nullptr;
+    }
+
+    return androidBitmap->getJavaBitmap().releaseObject();
+}
+
+jobject ValdiAndroid::NativeBridge::rasterizeSVGFromFilePath(fbjni::alias_ref<fbjni::JClass> /*clazz*/, // NOLINT
+                                                             jstring filePath,
+                                                             jfloat /*displayScale*/) {
+    auto* env = fbjni::Environment::current();
+    if (filePath == nullptr) {
+        ValdiAndroid::throwJavaValdiException(env, "SVG file path cannot be null");
+        return nullptr;
+    }
+
+    auto pathString = ValdiAndroid::toStdString(JavaEnv(), filePath);
+    auto bytes = Valdi::DiskUtils::load(Valdi::DiskUtils::absolutePathFromString(pathString));
+    if (!bytes) {
+        ValdiAndroid::throwJavaValdiException(env, bytes.error());
+        return nullptr;
+    }
+
+    auto bitmap = Valdi::SVGRenderer::rasterizeSVG(bytes.value(), AndroidBitmapFactory::getSharedInstance(), 0, 0);
+    if (!bitmap) {
+        ValdiAndroid::throwJavaValdiException(env, bitmap.error());
+        return nullptr;
+    }
+
+    auto androidBitmap = Valdi::castOrNull<AndroidBitmap>(bitmap.value());
+    if (androidBitmap == nullptr) {
+        ValdiAndroid::throwJavaValdiException(env, "SVG rasterization did not return an Android bitmap");
+        return nullptr;
+    }
+
+    return androidBitmap->getJavaBitmap().releaseObject();
 }
 
 #ifdef SNAP_DRAWING_ENABLED
@@ -2312,6 +2538,7 @@ jlong ValdiAndroid::NativeBridge::snapDrawingGetMaxRenderTargetSize(fbjni::alias
 void ValdiAndroid::NativeBridge::registerNatives() {
     javaClassStatic()->registerNatives({
         makeNativeMethod("getBuildOptions", ValdiAndroid::NativeBridge::getBuildOptions),
+        makeNativeMethod("setDebuggerPortEnvironment", ValdiAndroid::NativeBridge::setDebuggerPortEnvironment),
         makeNativeMethod("getAllRuntimeAttachedObjects", ValdiAndroid::NativeBridge::getAllRuntimeAttachedObjects),
         makeNativeMethod("prepareRenderBackend", ValdiAndroid::NativeBridge::prepareRenderBackend),
         makeNativeMethod("emitRuntimeManagerInitMetrics", ValdiAndroid::NativeBridge::emitRuntimeManagerInitMetrics),
@@ -2338,6 +2565,8 @@ void ValdiAndroid::NativeBridge::registerNatives() {
         makeNativeMethod("getNodeId", ValdiAndroid::NativeBridge::getNodeId),
         makeNativeMethod("getViewClassName", ValdiAndroid::NativeBridge::getViewClassName),
         makeNativeMethod("getViewNodeDebugDescription", ValdiAndroid::NativeBridge::getViewNodeDebugDescription),
+        makeNativeMethod("getStoredObjectForViewNode", ValdiAndroid::NativeBridge::getStoredObjectForViewNode),
+        makeNativeMethod("setStoredObjectForViewNode", ValdiAndroid::NativeBridge::setStoredObjectForViewNode),
         makeNativeMethod("invalidateLayout", ValdiAndroid::NativeBridge::invalidateLayout),
         makeNativeMethod("isViewNodeLayoutDirectionHorizontal",
                          ValdiAndroid::NativeBridge::isViewNodeLayoutDirectionHorizontal),
@@ -2349,6 +2578,7 @@ void ValdiAndroid::NativeBridge::registerNatives() {
         makeNativeMethod("canViewNodeScroll", ValdiAndroid::NativeBridge::canViewNodeScroll),
         makeNativeMethod("isViewNodeScrollingOrAnimating", ValdiAndroid::NativeBridge::isViewNodeScrollingOrAnimating),
         makeNativeMethod("applicationSetConfiguration", ValdiAndroid::NativeBridge::applicationSetConfiguration),
+        makeNativeMethod("setPointScale", ValdiAndroid::NativeBridge::setPointScale),
         makeNativeMethod("applicationDidResume", ValdiAndroid::NativeBridge::applicationDidResume),
         makeNativeMethod("applicationIsInLowMemory", ValdiAndroid::NativeBridge::applicationIsInLowMemory),
         makeNativeMethod("applicationWillPause", ValdiAndroid::NativeBridge::applicationWillPause),
@@ -2371,6 +2601,7 @@ void ValdiAndroid::NativeBridge::registerNatives() {
         makeNativeMethod("destroyContext", ValdiAndroid::NativeBridge::destroyContext),
         makeNativeMethod("forceBindAttributes", ValdiAndroid::NativeBridge::forceBindAttributes),
         makeNativeMethod("bindAttribute", ValdiAndroid::NativeBridge::bindAttribute),
+        makeNativeMethod("bindTransformAttributes", ValdiAndroid::NativeBridge::bindTransformAttributes),
         makeNativeMethod("bindScrollAttributes", ValdiAndroid::NativeBridge::bindScrollAttributes),
         makeNativeMethod("bindAssetAttributes", ValdiAndroid::NativeBridge::bindAssetAttributes),
         makeNativeMethod("setPlaceholderViewMeasureDelegate",
@@ -2381,6 +2612,7 @@ void ValdiAndroid::NativeBridge::registerNatives() {
         makeNativeMethod("loadModule", ValdiAndroid::NativeBridge::loadModule),
         makeNativeMethod("enqueueWorkerTask", ValdiAndroid::NativeBridge::enqueueWorkerTask),
         makeNativeMethod("performCallback", ValdiAndroid::NativeBridge::performCallback),
+        makeNativeMethod("discardCallback", ValdiAndroid::NativeBridge::discardCallback),
         makeNativeMethod("performGcNow", ValdiAndroid::NativeBridge::performGcNow),
         makeNativeMethod("preloadViews", ValdiAndroid::NativeBridge::preloadViews),
         makeNativeMethod("reapplyAttribute", ValdiAndroid::NativeBridge::reapplyAttribute),
@@ -2398,6 +2630,8 @@ void ValdiAndroid::NativeBridge::registerNatives() {
         makeNativeMethod("setKeepViewAliveOnDestroy", ValdiAndroid::NativeBridge::setKeepViewAliveOnDestroy),
         makeNativeMethod("notifyScroll", ValdiAndroid::NativeBridge::notifyScroll),
         makeNativeMethod("setValueForAttribute", ValdiAndroid::NativeBridge::setValueForAttribute),
+        makeNativeMethod("setInlineTextAnimationAttributesForViewNode",
+                         ValdiAndroid::NativeBridge::setInlineTextAnimationAttributesForViewNode),
         makeNativeMethod("notifyApplyAttributeFailed", ValdiAndroid::NativeBridge::notifyApplyAttributeFailed),
         makeNativeMethod("setRuntimeAttachedObject", ValdiAndroid::NativeBridge::setRuntimeAttachedObject),
         makeNativeMethod("setRuntimeManagerRequestManager",
@@ -2420,6 +2654,8 @@ void ValdiAndroid::NativeBridge::registerNatives() {
         makeNativeMethod("startProfiling", ValdiAndroid::NativeBridge::startProfiling),
         makeNativeMethod("stopProfiling", ValdiAndroid::NativeBridge::stopProfiling),
         makeNativeMethod("wrapAndroidBitmap", ValdiAndroid::NativeBridge::wrapAndroidBitmap),
+        makeNativeMethod("rasterizeSVG", ValdiAndroid::NativeBridge::rasterizeSVG),
+        makeNativeMethod("rasterizeSVGFromFilePath", ValdiAndroid::NativeBridge::rasterizeSVGFromFilePath),
 #ifdef SNAP_DRAWING_ENABLED
         makeNativeMethod("getSnapDrawingRuntimeHandle", ValdiAndroid::NativeBridge::getSnapDrawingRuntimeHandle),
         makeNativeMethod("setSnapDrawingRootView", ValdiAndroid::NativeBridge::setSnapDrawingRootView),

@@ -1,89 +1,179 @@
+#include "ViewNodeTestsUtils.hpp"
 #include "valdi/runtime/Attributes/DefaultAttributeProcessors.hpp"
+#include "valdi/runtime/Attributes/TransformAttributes.hpp"
 #include "valdi/runtime/Attributes/ValueConverters.hpp"
-#include "valdi_core/cpp/Attributes/AttributeUtils.hpp"
+#include "valdi_core/cpp/Attributes/ColorPalette.hpp"
 #include "valdi_core/cpp/Utils/StringCache.hpp"
 #include "valdi_core/cpp/Utils/ValueArray.hpp"
 #include "gtest/gtest.h"
 #include <cmath>
+#include <initializer_list>
 
 using namespace Valdi;
 
 namespace ValdiTest {
 
-static auto kColorPalette = makeShared<ColorPalette>();
-
-static Value makeGradientValue(std::vector<Color> colors, std::vector<double> locations, int32_t angle, bool radial) {
+template<typename ColorsT>
+static Value makeGradientValueImpl(const ColorsT& colors,
+                                   std::initializer_list<double> locations,
+                                   int32_t angle,
+                                   bool radial) {
     auto outColors = ValueArray::make(colors.size());
     auto outLocations = ValueArray::make(locations.size());
 
-    for (size_t i = 0; i < colors.size(); i++) {
-        outColors->emplace(i, Value(colors[i].value));
+    size_t i = 0;
+    for (const auto& color : colors) {
+        outColors->emplace(i++, Value(color));
     }
-    for (size_t i = 0; i < locations.size(); i++) {
-        outLocations->emplace(i, Value(locations[i]));
+
+    i = 0;
+    for (auto location : locations) {
+        outLocations->emplace(i++, Value(location));
     }
 
     return Value(ValueArray::make({Value(outColors), Value(outLocations), Value(angle), Value(radial)}));
 }
 
+static Value makeGradientValue(std::initializer_list<StringBox> colors,
+                               std::initializer_list<double> locations,
+                               int32_t angle,
+                               bool radial) {
+    return makeGradientValueImpl(colors, locations, angle, radial);
+}
+
+static Value makeGradientValue(std::initializer_list<int64_t> colors,
+                               std::initializer_list<double> locations,
+                               int32_t angle,
+                               bool radial) {
+    return makeGradientValueImpl(colors, locations, angle, radial);
+}
+
+static Value makeGradientValue(std::initializer_list<Value> colors,
+                               std::initializer_list<double> locations,
+                               int32_t angle,
+                               bool radial) {
+    return makeGradientValueImpl(colors, locations, angle, radial);
+}
+
+static Ref<ColorPalette> makeTestColorPalette() {
+    auto colorPalette = makeShared<ColorPalette>(STRING_LITERAL("default"));
+    colorPalette->updateColors({
+        {STRING_LITERAL("primary"), Color(0x11223344)},
+        {STRING_LITERAL("secondary"), Color(0x55667788)},
+    });
+    return colorPalette;
+}
+
+static Value makeTransformValue(const Value& translationX,
+                                const Value& translationY,
+                                const Value& scaleX,
+                                const Value& scaleY,
+                                const Value& rotation,
+                                const Value& transformOrigin) {
+    return Value(ValueArray::make(
+        {transformOrigin, Value::undefinedRef(), translationX, translationY, scaleX, scaleY, rotation}));
+}
+
+static Value makeTransformValue(double translationX,
+                                double translationY,
+                                double scaleX,
+                                double scaleY,
+                                double rotation,
+                                const Value& transformOrigin = Value::undefinedRef()) {
+    return makeTransformValue(
+        Value(translationX), Value(translationY), Value(scaleX), Value(scaleY), Value(rotation), transformOrigin);
+}
+
+static Value makeTransformStringValue(const Value& transform, const Value& transformOrigin = Value::undefinedRef()) {
+    return Value(ValueArray::make({transformOrigin,
+                                   transform,
+                                   Value::undefinedRef(),
+                                   Value::undefinedRef(),
+                                   Value::undefinedRef(),
+                                   Value::undefinedRef(),
+                                   Value::undefinedRef()}));
+}
+
+static void expectTransformValues(
+    const Value& value, double translationX, double translationY, double scaleX, double scaleY, double rotation) {
+    const auto* values = value.getArray();
+    ASSERT_NE(values, nullptr);
+    ASSERT_EQ(values->size(), 5);
+    EXPECT_NEAR((*values)[0].toDouble(), translationX, 0.00001);
+    EXPECT_NEAR((*values)[1].toDouble(), translationY, 0.00001);
+    EXPECT_NEAR((*values)[2].toDouble(), scaleX, 0.00001);
+    EXPECT_NEAR((*values)[3].toDouble(), scaleY, 0.00001);
+    EXPECT_NEAR((*values)[4].toDouble(), rotation, 0.00001);
+}
+
+TEST(AttributeProcessor, boxShadowNoneClearsShadow) {
+    ViewNodeTestsDependencies dependencies;
+    auto viewNode = dependencies.createView();
+
+    auto preprocessed = preprocessBoxShadow(Value(STRING_LITERAL("none")));
+    ASSERT_TRUE(preprocessed) << preprocessed.description();
+    ASSERT_TRUE(preprocessed.value().isUndefined());
+
+    auto postprocessed = postprocessBoxShadow(*viewNode, preprocessed.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_TRUE(postprocessed.value().isUndefined());
+}
+
 TEST(AttributeProcessor, canParseSimpleBackground) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("red")));
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("red")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
-    ASSERT_EQ(makeGradientValue({Color::rgba(255, 0, 0, 1.0)}, {}, 0, false), result.value());
+    ASSERT_EQ(makeGradientValue({STRING_LITERAL("red")}, {}, 0, false), result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(result.value(), rtlResult.value());
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0xFF0000FF}, {}, 0, false), postprocessed.value());
 }
 
 TEST(AttributeProcessor, failsOnTrailingInvalidKeyword) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("red wtf")));
+    auto result = preprocessGradient(Value(STRING_LITERAL("red wtf")));
 
     ASSERT_FALSE(result.success()) << result.description();
 }
 
 TEST(AttributeProcessor, canParseSimpleLinearGradient) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("linear-gradient(blue, white, red)")));
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(blue, white, red)")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
     ASSERT_EQ(makeGradientValue(
                   {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
+                      STRING_LITERAL("blue"),
+                      STRING_LITERAL("white"),
+                      STRING_LITERAL("red"),
                   },
                   {},
                   0,
                   false),
               result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(result.value(), rtlResult.value());
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0x0000FFFF, 0xFFFFFFFF, 0xFF0000FF}, {}, 0, false), postprocessed.value());
 }
 
 TEST(AttributeProcessor, canParseLinearGradientWithLocations) {
-    auto result =
-        preprocessGradient(kColorPalette, Value(STRING_LITERAL("linear-gradient(blue 0, white 0.25, red 0.75)")));
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(blue 0, white 0.25, red 0.75)")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
     ASSERT_EQ(makeGradientValue(
                   {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
+                      STRING_LITERAL("blue"),
+                      STRING_LITERAL("white"),
+                      STRING_LITERAL("red"),
                   },
                   {
                       0.0,
@@ -94,125 +184,124 @@ TEST(AttributeProcessor, canParseLinearGradientWithLocations) {
                   false),
               result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(result.value(), rtlResult.value());
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0x0000FFFF, 0xFFFFFFFF, 0xFF0000FF}, {0.0, 0.25, 0.75}, 0, false),
+              postprocessed.value());
 }
 
-TEST(AttributeProcessor, failsWhenLinearGradientWithLocationsIsNotBalanced) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("linear-gradient(blue 0, white 0.25, red)")));
+TEST(AttributeProcessor, canParseLinearGradientWithTransparentRgbaStop) {
+    auto colorPalette = makeTestColorPalette();
 
-    ASSERT_FALSE(result.success()) << result.description();
-}
-
-TEST(AttributeProcessor, canParseAngleInLinearGradient) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("linear-gradient(45deg, blue, white, red)")));
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(red 0, rgba(0,0,0,0) 1)")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
     ASSERT_EQ(makeGradientValue(
                   {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
+                      Value(STRING_LITERAL("red")),
+                      Value(static_cast<int64_t>(0x00000000)),
+                  },
+                  {
+                      0.0,
+                      1.0,
+                  },
+                  0,
+                  false),
+              result.value());
+
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0xFF0000FF, 0x00000000}, {0.0, 1.0}, 0, false), postprocessed.value());
+}
+
+TEST(AttributeProcessor, failsWhenLinearGradientWithLocationsIsNotBalanced) {
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(blue 0, white 0.25, red)")));
+
+    ASSERT_FALSE(result.success()) << result.description();
+}
+
+TEST(AttributeProcessor, canParseAngleInLinearGradient) {
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(45deg, blue, white, red)")));
+
+    ASSERT_TRUE(result.success()) << result.description();
+
+    ASSERT_EQ(makeGradientValue(
+                  {
+                      STRING_LITERAL("blue"),
+                      STRING_LITERAL("white"),
+                      STRING_LITERAL("red"),
                   },
                   {},
                   1,
                   false),
               result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(makeGradientValue(
-                  {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
-                  },
-                  {},
-                  7,
-                  false),
-              rtlResult.value());
+    auto postprocessed = postprocessGradient(true, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0x0000FFFF, 0xFFFFFFFF, 0xFF0000FF}, {}, 7, false), postprocessed.value());
 }
 
 TEST(AttributeProcessor, canParseAngleAsRadInLinearGradient) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("linear-gradient(1.6rad, blue, white, red)")));
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(1.6rad, blue, white, red)")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
     ASSERT_EQ(makeGradientValue(
                   {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
+                      STRING_LITERAL("blue"),
+                      STRING_LITERAL("white"),
+                      STRING_LITERAL("red"),
                   },
                   {},
                   2,
                   false),
               result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(makeGradientValue(
-                  {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
-                  },
-                  {},
-                  6,
-                  false),
-              rtlResult.value());
+    auto postprocessed = postprocessGradient(true, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0x0000FFFF, 0xFFFFFFFF, 0xFF0000FF}, {}, 6, false), postprocessed.value());
 }
 
 TEST(AttributeProcessor, canParseSimpleRadialGradient) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("radial-gradient(blue, white, red)")));
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("radial-gradient(blue, white, red)")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
     ASSERT_EQ(makeGradientValue(
                   {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
+                      STRING_LITERAL("blue"),
+                      STRING_LITERAL("white"),
+                      STRING_LITERAL("red"),
                   },
                   {},
                   0,
                   true),
               result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(result.value(), rtlResult.value());
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0x0000FFFF, 0xFFFFFFFF, 0xFF0000FF}, {}, 0, true), postprocessed.value());
 }
 
 TEST(AttributeProcessor, canParseRadialGradientWithLocations) {
-    auto result =
-        preprocessGradient(kColorPalette, Value(STRING_LITERAL("radial-gradient(blue 0, white 0.25, red 0.75)")));
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("radial-gradient(blue 0, white 0.25, red 0.75)")));
 
     ASSERT_TRUE(result.success()) << result.description();
 
     ASSERT_EQ(makeGradientValue(
                   {
-                      Color::rgba(0, 0, 255, 1.0),
-                      Color::rgba(255, 255, 255, 1.0),
-                      Color::rgba(255, 0, 0, 1.0),
+                      STRING_LITERAL("blue"),
+                      STRING_LITERAL("white"),
+                      STRING_LITERAL("red"),
                   },
                   {
                       0.0,
@@ -223,24 +312,20 @@ TEST(AttributeProcessor, canParseRadialGradientWithLocations) {
                   true),
               result.value());
 
-    auto ltrResult = postprocessGradient(false, result.value());
-    ASSERT_TRUE(ltrResult) << ltrResult.description();
-    ASSERT_EQ(result.value(), ltrResult.value());
-
-    auto rtlResult = postprocessGradient(true, result.value());
-    ASSERT_TRUE(rtlResult) << rtlResult.description();
-    ASSERT_EQ(result.value(), rtlResult.value());
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed) << postprocessed.description();
+    ASSERT_EQ(makeGradientValue({0x0000FFFF, 0xFFFFFFFF, 0xFF0000FF}, {0.0, 0.25, 0.75}, 0, true),
+              postprocessed.value());
 }
 
 TEST(AttributeProcessor, failsWhenRadialGradientWithLocationsIsNotBalanced) {
-    auto result = preprocessGradient(kColorPalette, Value(STRING_LITERAL("radial-gradient(blue 0, white 0.25, red)")));
+    auto result = preprocessGradient(Value(STRING_LITERAL("radial-gradient(blue 0, white 0.25, red)")));
 
     ASSERT_FALSE(result.success()) << result.description();
 }
 
 TEST(AttributeProcessor, failsWhenRadialGradientHasAngle) {
-    auto result =
-        preprocessGradient(kColorPalette, Value(STRING_LITERAL("radial-gradient(45deg, blue 0, white 0.25, red)")));
+    auto result = preprocessGradient(Value(STRING_LITERAL("radial-gradient(45deg, blue 0, white 0.25, red)")));
 
     ASSERT_FALSE(result.success()) << result.description();
 }
@@ -317,7 +402,7 @@ TEST(AttributeProcessor, failsParseBorderRadiusWithInvalidValues) {
 }
 
 TEST(AttributeProcessor, flipsHorizontalBordersOnRTL) {
-    auto result = preprocessBorderRadius(nullptr, Value(STRING_LITERAL("42 12 100 1337")));
+    auto result = preprocessBorderRadius(Value(STRING_LITERAL("42 12 100 1337")));
     ASSERT_TRUE(result) << result.description();
 
     auto borderRadius = result.value().getTypedRef<BorderRadius>();
@@ -346,6 +431,164 @@ TEST(AttributeProcessor, flipsHorizontalBordersOnRTL) {
     ASSERT_EQ(borderRadius->getTopLeft(), rtlBorderRadius->getTopRight());
     ASSERT_EQ(borderRadius->getBottomLeft(), rtlBorderRadius->getBottomRight());
     ASSERT_EQ(borderRadius->getBottomRight(), rtlBorderRadius->getBottomLeft());
+}
+
+TEST(AttributeProcessor, postprocessGradientResolvesColors) {
+    auto colorPalette = makeTestColorPalette();
+
+    auto result = preprocessGradient(Value(STRING_LITERAL("linear-gradient(45deg, primary, secondary)")));
+    ASSERT_TRUE(result.success()) << result.description();
+
+    ASSERT_EQ(makeGradientValue({STRING_LITERAL("primary"), STRING_LITERAL("secondary")}, {}, 1, false),
+              result.value());
+
+    auto postprocessed = postprocessGradient(false, *colorPalette, result.value());
+    ASSERT_TRUE(postprocessed.success()) << postprocessed.description();
+
+    ASSERT_EQ(makeGradientValue({0x11223344, 0x55667788}, {}, 1, false), postprocessed.value());
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessKeepsCenterOriginTransforms) {
+    auto result = TransformAttributes::postprocess(100, 80, false, makeTransformValue(10, 20, 2, 3, 0.5));
+    ASSERT_TRUE(result.success()) << result.description();
+
+    expectTransformValues(result.value(), 10, 20, 2, 3, 0.5);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessResolvesKeywordOrigins) {
+    auto result = TransformAttributes::postprocess(
+        100, 80, false, makeTransformValue(0, 0, 2, 3, 0, Value(STRING_LITERAL("top left"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 50, 80, 2, 3, 0);
+
+    result = TransformAttributes::postprocess(
+        100, 80, false, makeTransformValue(0, 0, 2, 2, 0, Value(STRING_LITERAL("right bottom"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), -50, -40, 2, 2, 0);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessResolvesLengthAndPercentOrigins) {
+    auto result = TransformAttributes::postprocess(
+        100, 80, false, makeTransformValue(0, 0, 2, 2, 0, Value(STRING_LITERAL("50px 70px"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 0, -30, 2, 2, 0);
+
+    result = TransformAttributes::postprocess(
+        100, 80, false, makeTransformValue(0, 0, 2, 2, 0, Value(STRING_LITERAL("25% 75%"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 25, -20, 2, 2, 0);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessResolvesPercentOriginAgainstFrame) {
+    auto result = TransformAttributes::postprocess(
+        200, 80, false, makeTransformValue(0, 0, 1.5, 0.5, 0, Value(STRING_LITERAL("10% 25%"))));
+    ASSERT_TRUE(result.success()) << result.description();
+
+    expectTransformValues(result.value(), 40, -10, 1.5, 0.5, 0);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessResolvesTranslationPercentagesAgainstFrame) {
+    auto result = TransformAttributes::postprocess(100,
+                                                   80,
+                                                   false,
+                                                   makeTransformValue(Value(STRING_LITERAL("10%")),
+                                                                      Value(STRING_LITERAL("25%")),
+                                                                      Value(1.0),
+                                                                      Value(1.0),
+                                                                      Value(0.0),
+                                                                      Value::undefinedRef()));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 10, 20, 1, 1, 0);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessParsesWebTransformStrings) {
+    auto result = TransformAttributes::postprocess(
+        100,
+        80,
+        false,
+        makeTransformStringValue(Value(STRING_LITERAL("translate(50%, -25%) translateX(10px) translateY(5pt)"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 60, -15, 1, 1, 0);
+
+    result = TransformAttributes::postprocess(
+        100,
+        80,
+        false,
+        makeTransformStringValue(Value(STRING_LITERAL("translate(10px, 20px) rotate(90deg) scale(2, 3)"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 10, 20, 2, 3, M_PI_2);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessAppliesOriginToWebTransformStrings) {
+    auto result = TransformAttributes::postprocess(
+        100,
+        100,
+        false,
+        makeTransformStringValue(Value(STRING_LITERAL("rotate(90deg)")), Value(STRING_LITERAL("top left"))));
+    ASSERT_TRUE(result.success()) << result.description();
+
+    expectTransformValues(result.value(), -100, 0, 1, 1, M_PI_2);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessAppliesRtlToWebTransformStrings) {
+    auto result = TransformAttributes::postprocess(
+        100, 80, true, makeTransformStringValue(Value(STRING_LITERAL("translateX(50%) rotate(90deg)"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), -50, 0, 1, 1, -M_PI_2);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessRejectsInvalidWebTransformStrings) {
+    auto result = TransformAttributes::postprocess(
+        100, 80, false, makeTransformStringValue(Value(STRING_LITERAL("translateX(50%) nope(1)"))));
+    ASSERT_FALSE(result.success()) << result.description();
+
+    result = TransformAttributes::postprocess(
+        100, 80, false, makeTransformStringValue(Value(STRING_LITERAL("translateX(10px"))));
+    ASSERT_FALSE(result.success()) << result.description();
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessFoldsRotationAroundNonCenterOrigin) {
+    auto result = TransformAttributes::postprocess(
+        100, 100, false, makeTransformValue(0, 0, 1, 1, M_PI_2, Value(STRING_LITERAL("top left"))));
+    ASSERT_TRUE(result.success()) << result.description();
+
+    expectTransformValues(result.value(), -100, 0, 1, 1, M_PI_2);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessPreservesExistingRtlBehavior) {
+    auto result = TransformAttributes::postprocess(100, 100, true, makeTransformValue(10, 20, 1, 1, M_PI_2));
+    ASSERT_TRUE(result.success()) << result.description();
+
+    expectTransformValues(result.value(), -10, 20, 1, 1, -M_PI_2);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessMirrorsNonCenterOriginsInRtl) {
+    auto result = TransformAttributes::postprocess(
+        100, 100, true, makeTransformValue(0, 0, 1, 1, M_PI_2, Value(STRING_LITERAL("top left"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 100, 0, 1, 1, -M_PI_2);
+
+    result = TransformAttributes::postprocess(
+        100,
+        100,
+        true,
+        makeTransformStringValue(Value(STRING_LITERAL("rotate(90deg)")), Value(STRING_LITERAL("top left"))));
+    ASSERT_TRUE(result.success()) << result.description();
+    expectTransformValues(result.value(), 100, 0, 1, 1, -M_PI_2);
+}
+
+TEST(AttributeProcessor, transformAttributesPostprocessRejectsInvalidOrigins) {
+    auto result = TransformAttributes::postprocess(
+        100, 100, false, makeTransformValue(0, 0, 1, 1, 0, Value(STRING_LITERAL("top bottom"))));
+    ASSERT_FALSE(result.success()) << result.description();
+
+    result = TransformAttributes::postprocess(
+        100, 100, false, makeTransformValue(0, 0, 1, 1, 0, Value(STRING_LITERAL("10px 20px 0"))));
+    ASSERT_FALSE(result.success()) << result.description();
+
+    result = TransformAttributes::postprocess(
+        100, 100, false, makeTransformValue(0, 0, 1, 1, 0, Value(STRING_LITERAL("10 20"))));
+    ASSERT_FALSE(result.success()) << result.description();
 }
 
 } // namespace ValdiTest

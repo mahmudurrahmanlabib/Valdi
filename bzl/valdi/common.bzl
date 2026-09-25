@@ -20,9 +20,22 @@ _IOS_API_NAME_SUFFIX = "Types"
 
 _IOS_SWIFT_SUFFIX = "Swift"
 
+# The iOS OS constraint applied to valdi_module()'s generated iOS targets via
+# target_compatible_with. Constructed as a Label here so it resolves against
+# Valdi's own repo mapping (which declares the `platforms` bazel_dep) rather
+# than the repo mapping of whichever package calls valdi_module(). A bare
+# "@platforms//os:ios" string would resolve against the caller, forcing every
+# downstream consumer to declare `platforms` itself. See Valdi_Widgets#20.
+_IOS_OS_CONSTRAINT = Label("@platforms//os:ios")
+
 _WEB_OUTPUT_BASE = "web"
 _WEB_DEBUG_ONLY_BASE = paths.join(_WEB_OUTPUT_BASE, "debug")
 _WEB_RELEASE_READY_BASE = paths.join(_WEB_OUTPUT_BASE, "release")
+
+_CPP_OUTPUT_BASE = "cpp"
+_CPP_DEBUG_ONLY_BASE = paths.join(_CPP_OUTPUT_BASE, "debug")
+_CPP_RELEASE_READY_BASE = paths.join(_CPP_OUTPUT_BASE, "release")
+_CPP_METADATA_BASE = _CPP_OUTPUT_BASE  # metadata is written to the base directory for C++
 
 # NOTE(vfomin): this should probably go into the config file
 _IOS_DEFAULT_MODULE_PREFIX = "SCC"
@@ -41,6 +54,7 @@ IOS_OUTPUT_STRINGS_BASE_DIR = _IOS_OUTPUT_STRINGS_BASE_DIR
 
 IOS_API_NAME_SUFFIX = _IOS_API_NAME_SUFFIX
 IOS_SWIFT_SUFFIX = _IOS_SWIFT_SUFFIX
+IOS_OS_CONSTRAINT = _IOS_OS_CONSTRAINT
 IOS_DEFAULT_MODULE_NAME_PREFIX = _IOS_DEFAULT_MODULE_PREFIX
 
 NODE_MODULES_BASE = _NODE_MODULES_BASE
@@ -59,19 +73,20 @@ BUILD_DIR = ".valdi_build/compile"
 TYPESCRIPT_OUTPUT_DIR = paths.join(BUILD_DIR, "typescript/output")
 TYPESCRIPT_GENERATED_TS_DIR = paths.join(BUILD_DIR, "generated_ts")
 TYPESCRIPT_DUMPED_SYMBOLS_DIR = paths.join(BUILD_DIR, "typescript/dumped_symbols")
+COMPILATION_METADATA_FILENAME = "compilation-metadata.json"
 
 def base_relative_dir(platform, output_target, relative_dir):
     """Helper function for constructing paths relative to the _BASE_DIR.
 
     Args:
-        platform: The platform (android or ios).
+        platform: The platform (android, ios, web, or cpp).
         output_target: The output target (debug or release).
         relative_dir: The relative directory.
 
     Returns:
         The constructed path relative to the _BASE_DIR.
     """
-    if platform not in ["android", "ios", "web"]:
+    if platform not in ["android", "ios", "web", "cpp"]:
         fail("Unexpected platform: {platform}".format(platform = platform))
 
     if output_target not in ["debug", "release", "metadata"]:
@@ -83,12 +98,20 @@ def base_relative_dir(platform, output_target, relative_dir):
             base = _ANDROID_DEBUG_ONLY_BASE
         elif platform == "web":
             base = _WEB_DEBUG_ONLY_BASE
+        elif platform == "cpp":
+            base = _CPP_DEBUG_ONLY_BASE
     elif output_target == "release":
         base = _IOS_RELEASE_READY_BASE
         if platform == "android":
             base = _ANDROID_RELEASE_READY_BASE
         elif platform == "web":
             base = _WEB_RELEASE_READY_BASE
+        elif platform == "cpp":
+            base = _CPP_RELEASE_READY_BASE
+    elif platform == "android":
+        base = _ANDROID_METADATA_BASE
+    elif platform == "cpp":
+        base = _CPP_METADATA_BASE
     else:
-        base = _ANDROID_METADATA_BASE if platform == "android" else _IOS_METADATA_BASE
+        base = _IOS_METADATA_BASE
     return paths.join(base, relative_dir)

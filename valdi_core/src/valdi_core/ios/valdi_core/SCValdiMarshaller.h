@@ -127,6 +127,21 @@ BOOL SCValdiMarshallerIsMap(SCValdiMarshallerRef marshaller, NSInteger index);
 BOOL SCValdiMarshallerIsNullOrUndefined(SCValdiMarshallerRef marshaller, NSInteger index);
 BOOL SCValdiMarshallerIsError(SCValdiMarshallerRef marshaller, NSInteger index);
 
+/**
+ Returns the outcome code of the most recent interface (proxy) marshall on the
+ current thread and resets it to 0. Positive codes are successes, negative codes
+ identify the failure path; see InterfaceMarshallDiagnostics.hpp for the values.
+ Intended for diagnosing null results after pushing an interface object.
+ */
+int32_t SCValdiMarshallerGetAndResetLastInterfaceMarshallOutcome(void);
+
+/**
+ Enables or disables interface-marshall outcome recording process-wide.
+ Disabled by default; while disabled, marshalls perform no outcome writes and
+ SCValdiMarshallerGetAndResetLastInterfaceMarshallOutcome always returns 0.
+ */
+void SCValdiMarshallerSetInterfaceMarshallDiagnosticsEnabled(BOOL enabled);
+
 BOOL SCValdiMarshallerGetBool(SCValdiMarshallerRef marshaller, NSInteger index);
 NSNumber* _Nullable SCValdiMarshallerGetOptionalBool(SCValdiMarshallerRef marshaller, NSInteger index);
 
@@ -164,6 +179,13 @@ void SCValdiMarshallerSwapIndexes(SCValdiMarshallerRef marshaller, NSInteger lef
  Check the marshaller for any pending error and rethrow as Objective-C error if an error was found.
  */
 void SCValdiMarshallerCheck(SCValdiMarshallerRef marshaller);
+
+/**
+ If the marshaller carries the "resolution skipped during JS runtime teardown" error, clear it and
+ return YES so the caller can degrade gracefully instead of raising. Any other pending error is left
+ in place (raise it afterwards with SCValdiMarshallerCheck). Returns NO when no error is pending.
+ */
+BOOL SCValdiMarshallerConsumeResolutionTeardownError(SCValdiMarshallerRef marshaller);
 
 BOOL SCValdiMarshallerEquals(SCValdiMarshallerRef leftMarshaller, SCValdiMarshallerRef rightMarshaller);
 

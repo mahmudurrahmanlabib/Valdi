@@ -16,14 +16,15 @@ import com.snap.valdi.attributes.impl.ValdiRootViewAttributesBinder
 import com.snap.valdi.attributes.impl.ValdiIndexPickerAttributesBinder
 import com.snap.valdi.attributes.impl.ValdiDatePickerAttributesBinder
 import com.snap.valdi.attributes.impl.ValdiImageViewAttributesBinder
+import com.snap.valdi.attributes.impl.ValdiSpinnerViewAttributesBinder
 import com.snap.valdi.attributes.impl.ValdiVideoViewAttributesBinder
 import com.snap.valdi.attributes.impl.ValdiTextViewAttributesBinder
+import com.snap.valdi.attributes.impl.ValdiTextViewBaseAttributesBinder
 import com.snap.valdi.attributes.impl.ValdiTimePickerAttributesBinder
 import com.snap.valdi.attributes.impl.EditTextAttributesBinder
 import com.snap.valdi.attributes.impl.EditTextMultilineAttributesBinder
 import com.snap.valdi.attributes.impl.ScrollViewAttributesBinder
 import com.snap.valdi.attributes.impl.ShapeViewAttributesBinder
-import com.snap.valdi.attributes.impl.TextViewAttributesBinder
 import com.snap.valdi.attributes.impl.ViewAttributesBinder
 import com.snap.valdi.attributes.impl.ViewGroupAttributesBinder
 import com.snap.valdi.attributes.impl.fonts.DefaultFonts
@@ -33,13 +34,13 @@ import com.snap.valdi.attributes.impl.fonts.FontDescriptor
 import com.snap.valdi.attributes.impl.fonts.FontManager
 import com.snap.valdi.attributes.impl.fonts.TypefaceResLoader
 import com.snap.valdi.attributes.impl.richtext.FontAttributes
-import com.snap.valdi.attributes.impl.richtext.RichTextConverter
 import com.snap.valdi.bundle.IValdiCustomModuleProvider
 import com.snap.valdi.bundle.ResourceResolver
 import com.snap.valdi.context.ContextManager
 import com.snap.valdi.drawables.BoxShadowRendererPool
 import com.snap.valdi.exceptions.GlobalExceptionHandler
 import com.snap.valdi.exceptions.HostUncaughtExceptionHandler
+import com.snap.valdi.extensions.ViewUtils
 import com.snap.valdi.imageloading.ValdiImageLoaderPostprocessor
 import com.snap.valdi.imageloading.DefaultValdiImageLoader
 import com.snap.valdi.jsmodules.ValdiStringsModule
@@ -69,6 +70,7 @@ import com.snap.valdi.snapdrawing.SnapDrawingRuntimeCPP
 import com.snap.valdi.snapdrawing.SnapDrawingThreadedFrameScheduler
 import com.snap.valdi.ValdiRuntimeManager
 import com.snap.valdi.views.AnimatedImageView
+import com.snap.valdi.views.ValdiRootView
 import com.snapchat.client.valdi_core.HTTPRequestManager
 import com.snapchat.client.valdi_core.JavaScriptEngineType;
 import com.snapchat.client.valdi_core.ModuleFactoriesProvider
@@ -102,6 +104,18 @@ class ValdiRuntimeManager(context: Context,
 
     private var observingProcessLifecycle = false
 
+    /**
+     * Guards [destroyed], and every resolution of [mainRuntimeLazy] including the public
+     * [mainRuntime] getter's. Deliberately its own monitor rather than `mainRuntimeListeners`:
+     * resolving the runtime under this guard can run the lazy initializer, which takes the listener
+     * monitor, so every reader acquires this lock, then the lazy's, then the listeners', in that
+     * order. Reusing the listener monitor here would close that chain into a cycle.
+     */
+    private val lifecycleLock = Any()
+
+    // Guarded by `lifecycleLock`.
+    private var destroyed = false
+
     private var mainRuntimeHolder: ValdiRuntime? = null
 
     private val mainRuntimeLazy = lazy {
@@ -124,7 +138,18 @@ class ValdiRuntimeManager(context: Context,
     val baseContext: Context = context
     val context: Context = context.applicationContext
 
-    val mainRuntime: ValdiRuntime by mainRuntimeLazy
+    /**
+     * This manager's main Valdi runtime, created on first access.
+     *
+     * Resolved under [lifecycleLock] rather than by delegating straight to the lazy, so that every
+     * reader initializes the runtime under the same guard [destroy] takes: an initialization that
+     * raced [destroy] is then either not started yet or already finished when [destroy] looks, and
+     * a runtime handed back here is one [destroy] can see and tear down rather than one that
+     * outlives the manager undestroyed. A reader arriving after [destroy] still initializes a fresh
+     * runtime, as it always has.
+     */
+    val mainRuntime: ValdiRuntime
+        get() = synchronized(lifecycleLock) { mainRuntimeLazy.value }
 
     val fontManager = FontManager(context, typefaceResLoader ?: DefaultTypefaceResLoader())
 
@@ -167,7 +192,7 @@ class ValdiRuntimeManager(context: Context,
     val viewRefSupport: ViewRefSupport
     val imageLoaderPostprocessor: ValdiImageLoaderPostprocessor
 
-    private val displayScale = context.resources.displayMetrics.density
+    private var displayScale = context.resources.displayMetrics.density
 
     private val snapDrawingRuntimeField: SnapDrawingRuntimeCPP?
 
@@ -176,6 +201,7 @@ class ValdiRuntimeManager(context: Context,
     private val snapDrawingRenderBackendPrepared = AtomicBoolean(false)
     private val androidRenderBackendPrepared = AtomicBoolean(false)
     private val pendingRegisterFontsOperation = mutableListOf<Runnable>()
+    private val pendingImmediateRegisterFontsOperation = mutableListOf<Runnable>()
 
     private var runtimeStartupSpan: AsyncSpan? = null
 
@@ -207,9 +233,13 @@ class ValdiRuntimeManager(context: Context,
             NativeHandlesManager.start()
         }
         ValdiLeakTracker.enabled = tweaks?.enableLeakTracker == true
+        ViewUtils.enableTextAlignmentForRTL = tweaks?.enableTextAlignmentForRTL ?: true
+        ValdiRootView.enableLayoutInvalidationRetry = tweaks?.enableLayoutInvalidationRetry ?: false
+        ValdiRootView.enableLayoutSpecsCaching = tweaks?.enableLayoutSpecsCaching ?: false
 
-        viewManager = ValdiViewManager(context, logger, tweaks?.disableAnimations
-                ?: false, viewRefSupport)
+        viewManager = ValdiViewManager(context, logger,
+            tweaks?.disableAnimations ?: false, viewRefSupport,
+            tweaks?.maxViewOperationsProcessingTimeMs ?: 0)
 
         contextManager = ContextManager(nativeBridge, logger)
 
@@ -239,7 +269,9 @@ class ValdiRuntimeManager(context: Context,
         var debugTouchEvents = false
         var maxCacheSizeInBytes = 2 * displayMetrics.widthPixels.toLong() * displayMetrics.heightPixels.toLong()
         if (tweaks != null) {
-            maxCacheSizeInBytes = tweaks.maxImageCacheSizeInBytes ?: maxCacheSizeInBytes
+            if (tweaks.maxImageCacheSizeInBytes > 0) {
+                maxCacheSizeInBytes = tweaks.maxImageCacheSizeInBytes
+            }
             debugTouchEvents = tweaks.debugTouchEvents
         }
         val javaScriptEngineType = tweaks?.javaScriptEngineType ?: JavaScriptEngineType.AUTO
@@ -296,7 +328,11 @@ class ValdiRuntimeManager(context: Context,
         compositeRequestManager.addRequestManager("https", httpRequestManager)
         NativeBridge.setRuntimeManagerRequestManager(handle.nativeHandle, compositeRequestManager)
 
-        registerAssetLoader(DefaultValdiImageLoader(context, imageLoaderPostprocessor, httpRequestManager))
+        registerAssetLoader(DefaultValdiImageLoader(
+            context,
+            imageLoaderPostprocessor,
+            httpRequestManager,
+            ValdiSVGRasterizer(maxCacheSizeInBytes.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())))
         registerAssetLoader(ValdiRawImageResourceLoader(lazy { ExecutorsUtil.newSingleThreadCachedExecutor() }, context))
 
         fontManager.listener = this
@@ -338,8 +374,11 @@ class ValdiRuntimeManager(context: Context,
                     tweaks?.disableBoxShadow
                             ?: false, tweaks?.disableSlowClipping ?: false)
 
-            val textConverter = RichTextConverter(fontManager)
-            val editTextAttributesBinder = EditTextAttributesBinder(context, textConverter, FontAttributes.default)
+            val editTextAttributesBinder = EditTextAttributesBinder(context,
+                    fontManager,
+                    FontAttributes.default,
+                    resetSelectionMatchesIos = tweaks?.editTextResetSelectionMatchesIos == true,
+                    logger)
 
             arrayOf(
                     viewAttributesBinder,
@@ -348,11 +387,12 @@ class ValdiRuntimeManager(context: Context,
                     ScrollViewAttributesBinder(coordinateResolver, logger),
                     ShapeViewAttributesBinder(),
                     ValdiImageViewAttributesBinder(context),
+                    ValdiSpinnerViewAttributesBinder(),
                     ValdiVideoViewAttributesBinder(context),
-                    TextViewAttributesBinder(context, textConverter, FontAttributes.default),
+                    ValdiTextViewBaseAttributesBinder(context, fontManager, FontAttributes.default, logger),
                     ValdiTextViewAttributesBinder(context),
                     editTextAttributesBinder,
-                    EditTextMultilineAttributesBinder(context, editTextAttributesBinder),
+                    EditTextMultilineAttributesBinder(context),
                     ValdiIndexPickerAttributesBinder(context, logger),
                     ValdiDatePickerAttributesBinder(context, logger),
                     ValdiTimePickerAttributesBinder(context, logger)
@@ -394,10 +434,15 @@ class ValdiRuntimeManager(context: Context,
             } else {
                 preloadAndroid()
             }
+        } else if (preloadingMode == PreloadingMode.FONTS_ONLY && !useSnapDrawing) {
+            fontManager.preloadAll()
         }
 
         if (useSnapDrawing) {
             synchronized(pendingRegisterFontsOperation) {
+                while (pendingImmediateRegisterFontsOperation.isNotEmpty()) {
+                    enqueueLoadOperation(pendingImmediateRegisterFontsOperation.removeAt(pendingImmediateRegisterFontsOperation.size - 1))
+                }
                 while (pendingRegisterFontsOperation.isNotEmpty()) {
                     enqueueLoadOperation(pendingRegisterFontsOperation.removeAt(pendingRegisterFontsOperation.size - 1))
                 }
@@ -408,6 +453,7 @@ class ValdiRuntimeManager(context: Context,
     fun ensureSnapDrawingReady() {
         flushPendingLoadOperations()
         prepareRenderBackend(RenderBackend.SNAP_DRAWING, PreloadingMode.DISABLED)
+        flushPendingLoadOperations()
     }
 
     private fun preloadSnapDrawing() {
@@ -431,8 +477,8 @@ class ValdiRuntimeManager(context: Context,
                 ValdiApplicationModule(context, isIntegrationTestEnvironment),
                 ValdiDeviceModule(jsThreadDispatcher, context, forceDarkMode),
                 ValdiDateFormattingModule(context),
-                ValdiNumberFormattingModule(context),
-                DrawingModuleImpl(coordinateResolver, fontManager),
+                ValdiNumberFormattingModule(context, logger),
+                DrawingModuleImpl(coordinateResolver, fontManager, logger),
                 // We use `baseContext` here to ensure ContextWrapper is used if one was provided.
                 // This allows us to implement custom behavior when accessing string resources.
                 ValdiStringsModule(baseContext)
@@ -465,11 +511,28 @@ class ValdiRuntimeManager(context: Context,
      * Destroy the RuntimeManager and release all its native resources.
      */
     fun destroy() {
+        // Marked destroyed before anything is torn down, and the guard is never held across the
+        // teardown below: that teardown synchronizes with the JS thread, on which a worker-creation
+        // request may be waiting for this guard. Every reader of `mainRuntime` resolves it under
+        // this same guard, so an initialization racing this call has either finished -- and its
+        // runtime is the one destroyed here -- or not started, which makes it an ordinary
+        // post-destroy read, as free as it always was to build a runtime this manager no longer
+        // owns.
+        val mainRuntimeToDestroy = synchronized(lifecycleLock) {
+            destroyed = true
+            if (mainRuntimeLazy.isInitialized()) mainRuntimeLazy.value else null
+        }
+
         stopObservingProcessLifecycle()
 
-        if (mainRuntimeLazy.isInitialized()) {
-            mainRuntimeLazy.value.destroy()
-        }
+        // Before the runtime it creates workers on goes away: the cache stops requesting creations
+        // and stops handing caller blocks to the worker threads. A creation callback already queued
+        // on that runtime's JS thread is dropped by the runtime once it is destroyed, and the flag
+        // set above is what stops a request that lost the race from lazily re-initializing a
+        // runtime nothing would then destroy.
+        workerCache.destroy()
+
+        mainRuntimeToDestroy?.destroy()
         handle.destroy()
         snapDrawingRuntimeField?.clearCache()
     }
@@ -663,6 +726,11 @@ class ValdiRuntimeManager(context: Context,
     fun applicationDidResume() {
         runOnMainThreadIfNeeded {
             val density = context.resources.displayMetrics.density
+            if (tweaks?.updatePointScaleOnResume == true && density != displayScale) {
+                displayScale = density
+                NativeBridge.setPointScale(handle.nativeHandle, density)
+                snapDrawingRuntimeField?.updateDisplayScale(density)
+            }
             val scaledDensity = context.resources.displayMetrics.scaledDensity
             val dynamicTypeScale = scaledDensity / density
             NativeBridge.applicationSetConfiguration(handle.nativeHandle, dynamicTypeScale)
@@ -743,24 +811,32 @@ class ValdiRuntimeManager(context: Context,
         NativeBridge.enqueueWorkerTask(nativeHandle, runnable)
     }
 
+    // One worker per executor name per manager, pinned for as long as this manager lives, exactly
+    // as iOS does (SCValdiRuntimeManager keeps them in a strong-to-strong map). The executor name
+    // is only a cache key here: createWorker() does not take one.
+    private val workerCache = WorkerRuntimeCache<ValdiJSWorker>(
+        create = createWorker@{ _, onReady ->
+            // The cache no longer serializes creation against its own destroy(), so the destroyed
+            // check here is what keeps a request that lost that race from lazily initializing a
+            // runtime nothing would destroy. Held only across resolving the runtime: getJSRuntime
+            // dispatches onto the JS thread, and that dispatch runs inline when the caller already
+            // is that thread, so it must not run under a lock of ours.
+            val runtime = synchronized(lifecycleLock) {
+                if (destroyed) null else mainRuntime
+            } ?: return@createWorker
+
+            runtime.getJSRuntime { jsRuntime ->
+                onReady(ValdiJSWorker(jsRuntime.getNativeObject().createWorker()))
+            }
+        },
+        post = { worker, block -> worker.runOnJsThread { block(worker) } }
+    )
+
     /**
      * Acquire a Worker runtime on the given executor
      */
     fun getWorker(executor: String, block: (ValdiJSRuntime) -> Unit) {
-        val existingWorker = synchronized(workerExecutorCache) {
-            workerExecutorCache.get(executor)?.get()
-        }
-        if (existingWorker != null) {
-            existingWorker!!.runOnJsThread { block(existingWorker!!) }
-        } else {
-            mainRuntime.getJSRuntime {jsRuntime ->
-                val newWorker = ValdiJSWorker(jsRuntime.getNativeObject().createWorker())
-                synchronized(workerExecutorCache) {
-                    workerExecutorCache.put(executor, WeakReference(newWorker))
-                }
-                newWorker.runOnJsThread { block(newWorker) }
-            }
-        }
+        workerCache.getWorker(executor) { worker -> block(worker) }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -804,8 +880,18 @@ class ValdiRuntimeManager(context: Context,
         }
     }
 
-    override fun onTypefaceRegistered(descriptor: FontDescriptor, isFallback: Boolean, dataProvider: FontDataProvider) {
+    override fun onTypefaceRegistered(
+        descriptor: FontDescriptor,
+        isFallback: Boolean,
+        dataProvider: FontDataProvider,
+        registerImmediatelyWithSnapDrawing: Boolean,
+    ) {
         val registerFontOperation = makeRegisterFontOperation(descriptor, isFallback, dataProvider)
+
+        if (registerImmediatelyWithSnapDrawing && snapDrawingRuntime != null) {
+            registerFontOperation.run()
+            return
+        }
 
         synchronized(pendingRegisterFontsOperation) {
             if (snapDrawingRenderBackendPrepared.get()) {
@@ -814,7 +900,11 @@ class ValdiRuntimeManager(context: Context,
                 enqueueLoadOperation(registerFontOperation)
             } else {
                 // Otherwise, we wait until prepare() is called for SnapDrawing
-                pendingRegisterFontsOperation.add(registerFontOperation)
+                if (registerImmediatelyWithSnapDrawing) {
+                    pendingImmediateRegisterFontsOperation.add(registerFontOperation)
+                } else {
+                    pendingRegisterFontsOperation.add(registerFontOperation)
+                }
             }
         }
     }
@@ -852,7 +942,5 @@ class ValdiRuntimeManager(context: Context,
         fun allRuntimes(): List<ValdiRuntime> {
             return synchronized(runtimes) { runtimes.mapNotNull { it.get() } }
         }
-
-        private val workerExecutorCache = mutableMapOf<String, WeakReference<ValdiJSWorker>>()
     }
 }

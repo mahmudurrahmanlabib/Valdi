@@ -1,0 +1,9 @@
+{
+    "integrity": "sha256-Xv9xfBi7UTKFtJmt1o8jMVCc1OQR/whelqhrM0LB5ao=",
+    "strip_prefix": "",
+    "url": "https://github.com/bazelbuild/rules_swift/releases/download/3.1.2/rules_swift.3.1.2.tar.gz",
+    "patches": {
+        "rules_swift.patch": "sha256-4iXZbI8FKYSK++UOlKQ11Bbadpz6CsikBWvYCNd+zhQ="
+    },
+    "patch_strip": 1
+}

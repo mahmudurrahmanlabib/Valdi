@@ -6,8 +6,8 @@
 //
 
 #include "valdi/runtime/Context/ViewNodeScrollState.hpp"
-#include "valdi/runtime/Views/Measure.hpp"
 #include "valdi_core/cpp/Events/TouchEvents.hpp"
+#include "valdi_core/cpp/Views/Measure.hpp"
 
 #include "valdi_core/cpp/Constants.hpp"
 #include "valdi_core/cpp/Utils/Marshaller.hpp"
@@ -325,8 +325,10 @@ void ViewNodeScrollState::notifyOnDragStart(const Point& directionAgnosticConten
 
     if (_onDragStartCallback != nullptr) {
         VALDI_TRACE("Valdi.notifyOnDragStart")
+        // BoundedMainThreadSync: a SyncWithMainThread handler must not hold the main thread
+        // beyond kInputSyncCallDeadline (COMPOSER-5961); no caller reads the result.
         submitScrollEvent(_onDragStartCallback,
-                          ValueFunctionFlagsNone,
+                          ValueFunctionFlagsBoundedMainThreadSync,
                           directionAgnosticContentOffset,
                           directionAgnosticUnclampedContentOffset,
                           directionAgnosticVelocity);
@@ -340,7 +342,7 @@ void ViewNodeScrollState::notifyOnScrollEnd(const Point& directionAgnosticConten
         VALDI_TRACE("Valdi.notifyOnScrollEnd")
         static Point velocity = Point(0, 0);
         submitScrollEndEvent(_onScrollEndCallback,
-                             ValueFunctionFlagsNone,
+                             ValueFunctionFlagsBoundedMainThreadSync,
                              directionAgnosticContentOffset,
                              directionAgnosticUnclampedContentOffset,
                              velocity);
@@ -368,7 +370,7 @@ void ViewNodeScrollState::notifyOnDragEnd(const Point& directionAgnosticContentO
     VALDI_TRACE("Valdi.notifyOnDragEnd");
     auto scrollEvent = makeScrollEvent(
         directionAgnosticContentOffset, directionAgnosticUnclampedContentOffset, directionAgnosticVelocity);
-    _onDragEndCallback->call(ValueFunctionFlagsNone, &scrollEvent, 1);
+    _onDragEndCallback->call(ValueFunctionFlagsBoundedMainThreadSync, &scrollEvent, 1);
 }
 
 Result<std::optional<Point>> ViewNodeScrollState::notifyOnDragEnding(
@@ -383,8 +385,7 @@ Result<std::optional<Point>> ViewNodeScrollState::notifyOnDragEnding(
     auto scrollEvent = makeScrollEvent(
         directionAgnosticContentOffset, directionAgnosticUnclampedContentOffset, directionAgnosticVelocity);
 
-    constexpr auto kMaxOnDragEndingDuration = std::chrono::milliseconds(100);
-    auto result = _onDragEndingCallback->callSyncWithDeadline(kMaxOnDragEndingDuration, &scrollEvent, 1);
+    auto result = _onDragEndingCallback->callSyncWithDeadline(kInputSyncCallDeadline, &scrollEvent, 1);
     if (!result) {
         return result.moveError();
     }
@@ -454,6 +455,75 @@ void ViewNodeScrollState::setViewportExtensionRight(float viewportExtensionRight
 
 bool ViewNodeScrollState::onScrollCallbackPrefersSyncCalls() const {
     return false;
+}
+
+void ViewNodeScrollState::setMaintainScrollAnchor(bool maintain) {
+    _maintainScrollAnchor = maintain;
+}
+
+bool ViewNodeScrollState::getMaintainScrollAnchor() const {
+    return _maintainScrollAnchor;
+}
+
+void ViewNodeScrollState::setPreserveScrollPosition(bool preserve) {
+    _preserveScrollPosition = preserve;
+    if (!preserve) {
+        // Drop the remembered anchor so re-enabling starts fresh against the current layout
+        // instead of cancelling movement relative to a stale position.
+        clearPreserveAnchor();
+    }
+}
+
+bool ViewNodeScrollState::getPreserveScrollPosition() const {
+    return _preserveScrollPosition;
+}
+
+void ViewNodeScrollState::setNativeStickyEnabled(bool enabled) {
+    _nativeStickyEnabled = enabled;
+}
+
+bool ViewNodeScrollState::getNativeStickyEnabled() const {
+    return _nativeStickyEnabled;
+}
+
+void ViewNodeScrollState::setNativeStickyCover(float cover) {
+    _nativeStickyCover = cover;
+}
+
+float ViewNodeScrollState::getNativeStickyCover() const {
+    return _nativeStickyCover;
+}
+
+void ViewNodeScrollState::setNativeStickyOffset(float offset) {
+    _nativeStickyOffset = offset;
+}
+
+float ViewNodeScrollState::getNativeStickyOffset() const {
+    return _nativeStickyOffset;
+}
+
+bool ViewNodeScrollState::hasPreserveAnchor() const {
+    return _hasPreserveAnchor;
+}
+
+RawViewNodeId ViewNodeScrollState::getPreserveAnchorId() const {
+    return _preserveAnchorId;
+}
+
+float ViewNodeScrollState::getPreserveAnchorScreenPos() const {
+    return _preserveAnchorScreenPos;
+}
+
+void ViewNodeScrollState::setPreserveAnchor(RawViewNodeId id, float screenPos) {
+    _hasPreserveAnchor = true;
+    _preserveAnchorId = id;
+    _preserveAnchorScreenPos = screenPos;
+}
+
+void ViewNodeScrollState::clearPreserveAnchor() {
+    _hasPreserveAnchor = false;
+    _preserveAnchorId = 0;
+    _preserveAnchorScreenPos = 0.0f;
 }
 
 } // namespace Valdi

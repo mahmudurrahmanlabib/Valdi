@@ -28,7 +28,7 @@ public:
     double getWidth() const final;
     double getHeight() const final;
 
-    Ref<Asset> withDirection(bool rightToLeft) final;
+    Ref<Asset> withConfiguration(const AssetConfiguration& configuration) final;
 
     void addLoadObserver(const std::shared_ptr<snap::valdi_core::AssetLoadObserver>& observer,
                          snap::valdi_core::AssetOutputType outputType,

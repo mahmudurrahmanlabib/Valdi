@@ -116,7 +116,10 @@ std::optional<JSValueRef> JavaScriptObjectStore::getObjectForId(uint32_t objectI
         return std::nullopt;
     }
 
-    if (_jsContext->isValueUndefined(deref.get())) {
+    // A live entry can only deref to the stored object. JavaScriptCore on iOS 15 returns null
+    // (not undefined) for a collected WeakRef target, so test for "not an object" rather than
+    // for undefined; returning that null to the caller hands JS a null in place of the proxy.
+    if (!_jsContext->isValueObject(deref.get())) {
         _objectById.erase(it);
         return std::nullopt;
     }
@@ -463,8 +466,9 @@ class JavaScriptFunctionClassDelegate : public PlatformFunctionClassDelegate<JSV
 public:
     JavaScriptFunctionClassDelegate(IJavaScriptContext& jsContext,
                                     const Ref<PlatformFunctionTrampoline<JSValueRef>>& trampoline,
-                                    bool isSingleCall)
-        : _jsContext(jsContext), _trampoline(trampoline), _isSingleCall(isSingleCall) {}
+                                    bool isSingleCall,
+                                    bool allowSyncCall)
+        : _jsContext(jsContext), _trampoline(trampoline), _isSingleCall(isSingleCall), _allowSyncCall(allowSyncCall) {}
 
     ~JavaScriptFunctionClassDelegate() override = default;
 
@@ -485,7 +489,7 @@ public:
                                        const JSValueRef& function,
                                        const ReferenceInfoBuilder& referenceInfoBuilder,
                                        ExceptionTracker& exceptionTracker) final {
-        return jsFunctionToFunction(
+        auto result = jsFunctionToFunction(
             _jsContext,
             function.get(),
             referenceInfoBuilder,
@@ -508,12 +512,20 @@ public:
                         jsContext, jsValue, isSingleCall, referenceInfo, exceptionTracker, *trampoline);
                 }
             });
+        if (result != nullptr) {
+            auto vf = castOrNull<ValueFunctionWithJSValue>(result);
+            if (vf != nullptr) {
+                vf->setAllowSyncCall(_allowSyncCall);
+            }
+        }
+        return result;
     }
 
 private:
     IJavaScriptContext& _jsContext;
     Ref<PlatformFunctionTrampoline<JSValueRef>> _trampoline;
     bool _isSingleCall;
+    bool _allowSyncCall;
 };
 
 JavaScriptValueDelegate::JavaScriptValueDelegate(IJavaScriptContext& jsContext,
@@ -576,6 +588,10 @@ JSValueRef JavaScriptValueDelegate::newStringUTF8(std::string_view str, Exceptio
 
 JSValueRef JavaScriptValueDelegate::newStringUTF16(std::u16string_view str, ExceptionTracker& exceptionTracker) {
     return _jsContext->newStringUTF16(str, toJSExceptionTracker(exceptionTracker));
+}
+
+JSValueRef JavaScriptValueDelegate::newString(const StaticString& str, ExceptionTracker& exceptionTracker) {
+    return _jsContext->newString(str, toJSExceptionTracker(exceptionTracker));
 }
 
 JSValueRef JavaScriptValueDelegate::newByteArray(const BytesView& bytes, ExceptionTracker& exceptionTracker) {
@@ -846,7 +862,8 @@ Ref<PlatformFunctionClassDelegate<JSValueRef>> JavaScriptValueDelegate::newFunct
     const Ref<PlatformFunctionTrampoline<JSValueRef>>& trampoline,
     const Ref<ValueFunctionSchema>& schema,
     ExceptionTracker& exceptionTracker) {
-    return makeShared<JavaScriptFunctionClassDelegate>(*_jsContext, trampoline, schema->getAttributes().isSingleCall());
+    return makeShared<JavaScriptFunctionClassDelegate>(
+        *_jsContext, trampoline, schema->getAttributes().isSingleCall(), schema->getAttributes().allowSyncCall());
 }
 
 bool JavaScriptValueDelegate::valueIsNull(const JSValueRef& value) const {

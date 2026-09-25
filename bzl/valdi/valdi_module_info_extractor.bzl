@@ -1,5 +1,10 @@
 load(":valdi_compiled.bzl", "ValdiModuleInfo")
 load(":valdi_extract_output_rule_helper.bzl", "extract_valdi_output_rule")
+load(":valdi_toolchain_type.bzl", "VALDI_TOOLCHAIN_TYPE")
+
+def empty_bundle_directory(name, src, visibility = ["//visibility:private"]):
+    """Valid empty .bundle for apple_bundle_import when a valdi module has no bundle resources. Creates a filegroup."""
+    native.filegroup(name = name, srcs = [src], visibility = visibility)
 
 def _get_info_or_none(ctx):
     module_info = ctx.attr.compiled_module[ValdiModuleInfo]
@@ -21,8 +26,12 @@ def _extract_valdi_module_output_impl(ctx):
     info = _get_info_or_none(ctx)
     if info:
         return info
-    else:
-        return DefaultInfo()
+
+    # When output is empty, use fallback if provided (e.g. for resource bundles so apple_bundle_import gets at least one file).
+    fallback_files = ctx.attr.empty_bundle_fallback.files
+    if fallback_files.to_list():
+        return DefaultInfo(files = fallback_files)
+    return DefaultInfo()
 
 def _extract_valdi_module_native_output_impl(ctx):
     info = _get_info_or_none(ctx)
@@ -72,6 +81,10 @@ extract_valdi_module_output = extract_valdi_output_rule(
         "output_name": attr.string(
             mandatory = True,
         ),
+        "empty_bundle_fallback": attr.label(
+            default = Label("//bzl/valdi:empty_bundle_fallback_none"),
+            allow_files = True,
+        ),
     },
 )
 
@@ -102,4 +115,7 @@ extract_transitive_valdi_module_output = rule(
             allow_single_file = True,
         ),
     },
+    # See extract_valdi_output_rule: steers the exec transition above to a
+    # platform where the valdi toolchain can run.
+    toolchains = [VALDI_TOOLCHAIN_TYPE],
 )

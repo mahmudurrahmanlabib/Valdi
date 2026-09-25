@@ -74,6 +74,9 @@ JavaScriptANRDetector::~JavaScriptANRDetector() {
 
 void JavaScriptANRDetector::start(std::chrono::steady_clock::duration detectionThreshold) {
     std::lock_guard<Mutex> lock(_mutex);
+    if (!_started) {
+        rearmPendingSyns();
+    }
     _started = true;
     _detectionThreshold = detectionThreshold;
     scheduleNextTick();
@@ -93,8 +96,25 @@ void JavaScriptANRDetector::onEnterBackground() {
 
 void JavaScriptANRDetector::onEnterForeground() {
     std::lock_guard<Mutex> lock(_mutex);
+    if (!_isInForeground) {
+        rearmPendingSyns();
+    }
     _isInForeground = true;
     scheduleNextTick();
+}
+
+// Must be called with _mutex held. A syn probe that was in flight when monitoring paused is
+// measured against a clock that keeps advancing while the process is suspended (steady_clock does
+// not stop with the app), so evaluating it on the first tick after resume would report time the
+// app never spent running as a spurious unattributed ANR. Slide the probe's deadline so it gets a
+// full detection budget measured from re-entry, mirroring the not-ready slide in checkForANRs().
+void JavaScriptANRDetector::rearmPendingSyns() {
+    auto timepoint = std::chrono::steady_clock::now();
+    for (const auto& entry : _entries) {
+        if (entry->synScheduledTime && !entry->ack) {
+            entry->synScheduledTime = timepoint;
+        }
+    }
 }
 
 void JavaScriptANRDetector::cancelNextTick() {
@@ -131,6 +151,11 @@ void JavaScriptANRDetector::scheduleNextTick() {
 bool JavaScriptANRDetector::onANR(JavaScriptTaskScheduler& taskScheduler,
                                   std::chrono::steady_clock::duration detectionThreshold,
                                   const std::atomic<bool>& ack) {
+    // Read the native-side attribution before waiting on the stack capture. The capture can take up
+    // to kCaptureStacktraceTimeoutSeconds, and a native call that finishes during that wait clears
+    // its name, which would report the stall as unattributed. The getter reads saved native state,
+    // not JS, so it is safe to call while the JS thread is stuck.
+    auto attributionInfo = taskScheduler.getANRAttributionInfo();
     auto stacktraces = taskScheduler.captureStackTraces(std::chrono::seconds(kCaptureStacktraceTimeoutSeconds));
     StringBox moduleName;
     std::string message;
@@ -152,6 +177,9 @@ bool JavaScriptANRDetector::onANR(JavaScriptTaskScheduler& taskScheduler,
     } else {
         message = fmt::format("Detected ANR in '{}' after {}", moduleName, detectionThresholdString);
     }
+    // The bundle name says which module stalled; the stuck-in name says which file or bridge call,
+    // so attributed reports need the suffix as much as unattributed ones do.
+    message += attributionInfo;
 
     if (stacktraces.empty()) {
         message += " but unable to capture stack traces.";
@@ -214,15 +242,21 @@ void JavaScriptANRDetector::checkForANRs() {
             if (!entry->synScheduledTime || entry->ack) {
                 entry->synScheduledTime = timepoint;
                 entry->ack = false;
-                entry->taskScheduler->dispatchOnJsThreadAsync(nullptr,
+                entry->taskScheduler->dispatchOnJsThreadAsync(JsThreadDispatchReason::ANRDetectorAcknowledgement,
                                                               [entry](const auto& /*jsEntry*/) { entry->ack = true; });
+            } else if (!entry->taskScheduler->isReadyForANRDetection()) {
+                // Bootstrap can legitimately hold the JS thread past the threshold on slow
+                // devices. Slide the window on every tick while the scheduler is not ready so
+                // the in-flight syn gets a full detection budget once it becomes ready.
+                entry->synScheduledTime = timepoint;
             } else if (entry->synScheduledTime.value() + detectionThreshold < timepoint) {
                 entry->didANR = true;
                 auto& entryToProcess = entriesWithANRToProcess.emplace_back();
                 entryToProcess.entry = entry;
                 entryToProcess.taskScheduler = Ref(entry->taskScheduler);
             } else if (_nudgeEnabled) {
-                entry->taskScheduler->dispatchOnJsThreadAsync(nullptr, [](const auto& /*jsEntry*/) {});
+                entry->taskScheduler->dispatchOnJsThreadAsync(JsThreadDispatchReason::ANRDetectorNudge,
+                                                              [](const auto& /*jsEntry*/) {});
             }
         }
     }

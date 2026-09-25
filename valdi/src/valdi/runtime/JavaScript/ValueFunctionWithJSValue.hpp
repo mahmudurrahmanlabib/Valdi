@@ -34,12 +34,21 @@ public:
     Value operator()(const ValueFunctionCallContext& callContext) noexcept final;
     std::string_view getFunctionType() const final;
     bool prefersSyncCalls() const final;
+    bool ownerIsTearingDown() const final;
 
     bool isSingleCall() const;
     void setSingleCall(bool singleCall);
 
     void setShouldBlockMainThread(bool shouldBlockMainThread);
+    void setAllowSyncCall(bool allowSyncCall);
     void setIgnoreIfValdiContextIsDestroyed(bool ignoreIfValdiContextIsDestroyed);
+
+    /**
+     Killswitch for the fail-fast behavior of deadline-bounded sync calls: when disabled every
+     bounded call parks for its full deadline even if an earlier one is still overdue.
+     */
+    static void setDeadlineCircuitBreakerDisabled(bool disabled);
+    static bool isDeadlineCircuitBreakerDisabled();
 
 protected:
     virtual Value callJsFunction(JavaScriptEntryParameters& jsEntry,
@@ -50,17 +59,23 @@ protected:
 
     Result<Value> callSyncWithDeadline(const std::chrono::steady_clock::time_point& deadline,
                                        Value* parameters,
-                                       size_t size) noexcept override;
+                                       size_t size,
+                                       SyncCallTimeoutPolicy timeoutPolicy) noexcept override;
 
 private:
     std::atomic_int _callSequence;
     StringBox _functionName;
     MainThreadManager* _mainThreadManager;
+    Weak<Context> _creationContext;
     bool _shouldBlockMainThread = false;
+    bool _allowSyncCall = true;
     bool _ignoreIfValdiContextIsDestroyed = false;
     bool _isSingleCall;
 
     bool shouldCallSync(ValueFunctionFlags flags, JavaScriptTaskScheduler& taskScheduler) const;
+
+    /** Returns false if a sync call was requested but is disallowed (schema has allowSyncCall false). */
+    bool isSyncCallAllowed(ValueFunctionFlags flags) const;
 
     Value doJsCall(JavaScriptEntryParameters& jsEntry,
                    const Value* parameters,
@@ -70,6 +85,31 @@ private:
     Value callSync(ValueFunctionFlags flags,
                    const Ref<JavaScriptTaskScheduler>& taskScheduler,
                    const ValueFunctionCallContext& callContext);
+
+    /**
+     Dispatch the call on the JS thread and block the calling thread for its result until the
+     deadline. On timeout the JS call is left to complete on its own and its return value is
+     dropped, so the caller must treat the error as "no result" rather than "did not run".
+     Callers running on the main thread are expected to hold a MainThreadManager batch, so that
+     main thread work requested by the JS call is queued instead of dispatched while we wait.
+     This is the control path, selected by the deadline circuit breaker killswitch.
+     */
+    Result<Value> dispatchAndWaitOnJsThread(const Ref<JavaScriptTaskScheduler>& taskScheduler,
+                                            const std::chrono::steady_clock::time_point& deadline,
+                                            const Value* parameters,
+                                            size_t parametersSize);
+
+    /**
+     Same contract as dispatchAndWaitOnJsThread, plus: while an earlier timed-out call is still
+     queued the JS thread is known to be stalled, so the call fails immediately instead of waiting
+     (it is still dispatched unless the policy allows skipping it), and a call that timed out is
+     skipped when the JS thread reaches it if the policy is SkipIfTimedOut.
+     */
+    Result<Value> dispatchAndWaitOnJsThreadWithCircuitBreaker(const Ref<JavaScriptTaskScheduler>& taskScheduler,
+                                                              const std::chrono::steady_clock::time_point& deadline,
+                                                              const Value* parameters,
+                                                              size_t parametersSize,
+                                                              SyncCallTimeoutPolicy timeoutPolicy);
 
     const StringBox& getFunctionName();
 

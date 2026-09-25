@@ -1,5 +1,5 @@
 import { Asset } from 'valdi_tsx/src/Asset';
-import { BackendRenderingType, ValdiRuntime } from './ValdiRuntime';
+import { BackendRenderingType, LoadedAsset, LoadedAssetMetadata, ValdiRuntime } from './ValdiRuntime';
 import { Device } from './Device';
 
 export { Asset };
@@ -73,6 +73,10 @@ export type PlatformAssetOverrides = {
   android?: string | Asset;
 };
 
+export type ThemableAssetMap = {
+  [colorPaletteName: string]: string | Asset;
+};
+
 /**
  * Make a platform specific Asset from a default asset `defaultAsset` and
  * iOS and/or Android assets in `platformAssetOverrides`. The iOS asset will be
@@ -98,9 +102,21 @@ export function makePlatformSpecificAsset(
 }
 
 /**
+ * Make a themable Asset from an object keyed by color palette name.
+ * The asset matching the resolved color palette of the element will be
+ * rendered. If no asset matches the resolved color palette, nothing is rendered.
+ * @param assetsByColorPalette an object containing asset overrides keyed by color palette name
+ * @returns an Asset that can be used as a src attribute, and will use the
+ * asset matching the resolved color palette.
+ */
+export function makeThemableAsset(assetsByColorPalette: ThemableAssetMap): Asset {
+  return runtime.makeThemableAsset(assetsByColorPalette);
+}
+
+/**
  * Callback called whenever an asset has finished loading.
  */
-export type AssetLoadObserver = (loadedAsset: unknown, error: string | undefined) => void;
+export type AssetLoadObserver = (loadedAsset: LoadedAsset | Uint8Array | undefined, error: string | undefined) => void;
 
 export interface AssetSubscription {
   unsubscribe(): void;
@@ -165,4 +181,11 @@ export function addAssetLoadObserver(
 ): AssetSubscription {
   const unsubscribe = runtime.addAssetLoadObserver(asset, onLoad, outputType, preferredWidth, preferredHeight);
   return { unsubscribe };
+}
+
+/**
+ * Returns the metadata reported by the LoadedAsset.
+ */
+export function getLoadedAssetMetadata(loadedAsset: LoadedAsset): LoadedAssetMetadata | undefined {
+  return runtime.getLoadedAssetMetadata(loadedAsset);
 }

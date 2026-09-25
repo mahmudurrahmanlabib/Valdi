@@ -23,7 +23,12 @@ class GeneratedTypesVerificationProcessor: CompilationProcessor {
 
     func process(items: CompilationItems) throws -> CompilationItems {
         try items.select { item -> GeneratedTypeDescription? in
-            guard case let .generatedTypeDescription(generatedTypeDescription) = item.kind else {
+            guard case let .generatedTypeDescription(generatedTypeDescription, _) = item.kind else {
+                return nil
+            }
+            // Reference bindings (@NativeClass/@NativeInterface) don't generate the native type,
+            // so multiple TS modules may legitimately reference the same one — not a collision.
+            guard generatedTypeDescription.isGenerated else {
                 return nil
             }
             return generatedTypeDescription

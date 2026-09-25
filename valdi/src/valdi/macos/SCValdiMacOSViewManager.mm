@@ -11,6 +11,8 @@
 #import "valdi/macos/Views/SCValdiSurfacePresenterView.h"
 #import "valdi_core/cpp/Utils/StringCache.hpp"
 #import "valdi/runtime/Context/ViewNodeTree.hpp"
+#import "valdi/runtime/Context/ViewNode.hpp"
+#import "valdi/runtime/Runtime.hpp"
 #import "valdi/runtime/Views/PlaceholderViewMeasureDelegate.hpp"
 #import "valdi_core/cpp/Interfaces/IBitmap.hpp"
 #import "valdi/runtime/Attributes/BoundAttributes.hpp"
@@ -22,6 +24,88 @@
 #import "valdi/runtime/Views/DeferredViewTransaction.hpp"
 #import "valdi_core/cpp/Utils/TrackedLock.hpp"
 #import "snap_drawing/cpp/Utils/BitmapFactory.hpp"
+#import <objc/runtime.h>
+
+#include <vector>
+
+static const void *SCValdiMacOSViewNodeKey = &SCValdiMacOSViewNodeKey;
+
+@interface SCValdiMacOSViewNodeHandle : NSObject {
+@public
+    Valdi::Weak<Valdi::ViewNode> _viewNode;
+}
+
+- (instancetype)initWithViewNode:(Valdi::ViewNode *)viewNode;
+
+@end
+
+@implementation SCValdiMacOSViewNodeHandle
+
+- (instancetype)initWithViewNode:(Valdi::ViewNode *)viewNode
+{
+    self = [super init];
+    if (self) {
+        _viewNode = Valdi::weakRef(viewNode);
+    }
+    return self;
+}
+
+@end
+
+static Valdi::Ref<Valdi::ViewNode> SCValdiMacOSGetAttachedViewNode(NSView *view)
+{
+    SCValdiMacOSViewNodeHandle *handle = objc_getAssociatedObject(view, SCValdiMacOSViewNodeKey);
+    return handle == nil ? nullptr : Valdi::Ref<Valdi::ViewNode>(handle->_viewNode.lock());
+}
+
+@interface NSView (SCValdiMacOSNativeAttributeState)
+- (void)valdi_setAttachedViewNode:(Valdi::ViewNode *)viewNode;
+- (BOOL)valdi_hasAttachedViewNode;
+- (BOOL)valdi_hasAttachedViewNodeHandle;
+- (BOOL)valdi_isAttachedToViewNode:(Valdi::ViewNode *)viewNode;
+- (void)valdi_didChangeValue:(id)value forAttribute:(NSString *)attributeName;
+@end
+
+@implementation NSView (SCValdiMacOSNativeAttributeState)
+
+- (void)valdi_setAttachedViewNode:(Valdi::ViewNode *)viewNode
+{
+    SCValdiMacOSViewNodeHandle *handle =
+        viewNode == nullptr ? nil : [[SCValdiMacOSViewNodeHandle alloc] initWithViewNode:viewNode];
+    objc_setAssociatedObject(self, SCValdiMacOSViewNodeKey, handle, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (BOOL)valdi_hasAttachedViewNode
+{
+    return SCValdiMacOSGetAttachedViewNode(self) != nullptr;
+}
+
+- (BOOL)valdi_hasAttachedViewNodeHandle
+{
+    return objc_getAssociatedObject(self, SCValdiMacOSViewNodeKey) != nil;
+}
+
+- (BOOL)valdi_isAttachedToViewNode:(Valdi::ViewNode *)viewNode
+{
+    auto attachedViewNode = SCValdiMacOSGetAttachedViewNode(self);
+    return attachedViewNode.get() == viewNode;
+}
+
+- (void)valdi_didChangeValue:(id)value forAttribute:(NSString *)attributeName
+{
+    auto viewNode = SCValdiMacOSGetAttachedViewNode(self);
+    auto *viewNodeTree = viewNode != nullptr ? viewNode->getViewNodeTree() : nullptr;
+    auto runtime = viewNodeTree != nullptr ? viewNodeTree->getRuntime() : nullptr;
+    if (runtime == nullptr) {
+        return;
+    }
+    Valdi::Value attributeValue = [attributeName isEqualToString:@"focused"]
+        ? Valdi::Value([value boolValue])
+        : ValueFromNSObject(value);
+    runtime->updateAttributeState(*viewNode, StringFromNSString(attributeName), attributeValue);
+}
+
+@end
 
 namespace ValdiMacOS {
 
@@ -29,7 +113,11 @@ class NSViewWrapper: public Valdi::View {
 public:
     NSViewWrapper(NSView *view): _view(view) {}
 
-    ~NSViewWrapper() override = default;
+    ~NSViewWrapper() override {
+        // A host may retain a detached root NSView after its ViewNode and wrapper have been destroyed.
+        // Drop the weak handle promptly so a future wrapper cannot observe the previous attachment.
+        [_view valdi_setAttachedViewNode:nullptr];
+    }
 
     NSView *getView() const {
         return _view;
@@ -174,11 +262,18 @@ public:
 
     void willUpdateRootView(const Valdi::Ref<Valdi::View>& view) override {}
 
-    void didUpdateRootView(const Valdi::Ref<Valdi::View>& view, bool layoutDidBecomeDirty) override {}
+    void didUpdateRootView(const Valdi::Ref<Valdi::View>& view, bool layoutDidBecomeDirty) override {
+        auto callbacks = std::move(_pendingOnNextDrawCallbacks);
+        for (auto &callback : callbacks) {
+            callback();
+        }
+    }
 
     void moveViewToTree(const Valdi::Ref<Valdi::View>& view,
                         Valdi::ViewNodeTree* viewNodeTree,
-                        Valdi::ViewNode* viewNode) override {}
+                        Valdi::ViewNode* viewNode) override {
+        [fromValdiView(view) valdi_setAttachedViewNode:viewNode];
+    }
 
     void insertChildView(const Valdi::Ref<Valdi::View>& view,
                          const Valdi::Ref<Valdi::View>& childView,
@@ -187,7 +282,11 @@ public:
 
     void removeViewFromParent(const Valdi::Ref<Valdi::View>& view,
                               const Valdi::Ref<Valdi::Animator>& animator,
-                              bool shouldClearViewNode) override {}
+                              bool shouldClearViewNode) override {
+        if (shouldClearViewNode) {
+            [fromValdiView(view) valdi_setAttachedViewNode:nullptr];
+        }
+    }
 
     void invalidateViewLayout(const Valdi::Ref<Valdi::View>& view) override {}
 
@@ -210,7 +309,10 @@ public:
     void cancelAllViewAnimations(const Valdi::Ref<Valdi::View>& view) override {}
 
     void willEnqueueViewToPool(const Valdi::Ref<Valdi::View>& view,
-                               Valdi::Function<void(Valdi::View&)> onEnqueue) override {}
+                               Valdi::Function<void(Valdi::View&)> onEnqueue) override {
+        [fromValdiView(view) valdi_setAttachedViewNode:nullptr];
+        onEnqueue(*view);
+    }
 
     void snapshotView(const Valdi::Ref<Valdi::View>& view,
                       Valdi::Function<void(Valdi::Result<Valdi::BytesView>)> cb) override {
@@ -222,9 +324,16 @@ public:
 
     void cancelAnimator(const Valdi::Ref<Valdi::Animator>& animator) override {}
 
+    void scheduleOnNextDraw(const Valdi::Ref<Valdi::View>& rootView, Valdi::DispatchFunction callback) override {
+        _pendingOnNextDrawCallbacks.emplace_back(std::move(callback));
+    }
+
     void executeInTransactionThread(Valdi::DispatchFunction executeFn) override {
         executeFn();
     }
+
+private:
+    std::vector<Valdi::DispatchFunction> _pendingOnNextDrawCallbacks;
 };
 
 
@@ -236,7 +345,11 @@ Valdi::Ref<Valdi::View> toValdiView(NSView *view) {
 }
 
 NSView *fromValdiView(const Valdi::Ref<Valdi::View> &view) {
-    return Valdi::castOrNull<NSViewWrapper>(view)->getView();
+    auto wrapper = Valdi::castOrNull<NSViewWrapper>(view);
+    if (wrapper == nullptr) {
+        return nil;
+    }
+    return wrapper->getView();
 }
 
 class MacOSViewFactory: public Valdi::ViewFactory {
@@ -288,18 +401,20 @@ public:
     ~MacOSMeasureDelegate() override = default;
 
     Valdi::Size measureView(const Valdi::Ref<Valdi::View> &view,
-                               float width,
-                               Valdi::MeasureMode widthMode,
-                               float height,
-                               Valdi::MeasureMode heightMode) final {
+                            float width,
+                            Valdi::MeasureMode widthMode,
+                            float height,
+                            Valdi::MeasureMode heightMode) final {
         Valdi::Size size;
-
+        auto wrapper = Valdi::castOrNull<NSViewWrapper>(view);
+        if (wrapper == nullptr) {
+            return size;
+        }
         NSViewWrapper::executeSyncInMainThread([&]() {
-            NSView *nsView = Valdi::castOrNull<NSViewWrapper>(view)->getView();
+            NSView *nsView = wrapper->getView();
             NSSize fittingSize = [nsView fittingSize];
             size = Valdi::Size(fittingSize.width, fittingSize.height);
         });
-
         return size;
     }
 
@@ -324,16 +439,27 @@ static Valdi::StringBox resolveClassName(const Valdi::StringBox& valdiClassName)
     return Valdi::StringBox::emptyString();
 }
 
+// Returns the class name to use for native lookup: mapped name if any, otherwise the requested name.
+// Enables <custom-view> with iosClass to work on MacOS for any NSView subclass linked in the app.
+static Valdi::StringBox getEffectiveClassName(const Valdi::StringBox& className) {
+    auto resolved = resolveClassName(className);
+    return resolved.isEmpty() ? className : resolved;
+}
+
 ViewManager::ViewManager() = default;
 ViewManager::~ViewManager() = default;
 
 Valdi::Ref<Valdi::ViewFactory> ViewManager::createViewFactory(const Valdi::StringBox& className, const Valdi::Ref<Valdi::BoundAttributes>& boundAttributes) {
-    auto resolvedClassName = resolveClassName(className);
-    if (resolvedClassName.isEmpty()) {
+    auto effectiveClassName = getEffectiveClassName(className);
+    if (effectiveClassName.isEmpty()) {
         return nullptr;
     }
-
-    return Valdi::makeShared<MacOSViewFactory>(resolvedClassName, *this, boundAttributes);
+    NSString *nsClassName = NSStringFromString(effectiveClassName);
+    Class cls = nsClassName ? NSClassFromString(nsClassName) : nil;
+    if (!cls) {
+        return nullptr;
+    }
+    return Valdi::makeShared<MacOSViewFactory>(effectiveClassName, *this, boundAttributes);
 }
 
 void ViewManager::callAction(Valdi::ViewNodeTree* viewNodeTree,
@@ -343,7 +469,7 @@ void ViewManager::callAction(Valdi::ViewNodeTree* viewNodeTree,
 }
 
 Valdi::PlatformType ViewManager::getPlatformType() const {
-    return Valdi::PlatformTypeIOS;
+    return Valdi::PlatformTypeMacOS;
 }
 
 Valdi::RenderingBackendType ViewManager::getRenderingBackendType() const {
@@ -372,17 +498,29 @@ std::vector<Valdi::StringBox> ViewManager::getClassHierarchy(const Valdi::String
 
 void ViewManager::bindAttributes(const Valdi::StringBox& className,
                                  Valdi::AttributesBindingContext& binder) {
-    NSString *viewClassName = NSStringFromString(resolveClassName(className));
-     Class cls = NSClassFromString(viewClassName);
+    auto effectiveClassName = getEffectiveClassName(className);
+    NSString *viewClassName = NSStringFromString(effectiveClassName);
+    Class cls = viewClassName ? NSClassFromString(viewClassName) : nil;
+    if (!cls) {
+        return;
+    }
 
     binder.setMeasureDelegate(Valdi::makeShared<MacOSMeasureDelegate>(cls));
     SCValdiMacOSAttributesBinder *attributesBinder = [[SCValdiMacOSAttributesBinder alloc] initWithCppInstance:(void *)&binder cls:cls];
+    [attributesBinder bindAccessibilityAttributes];
 
-    [cls bindAttributes:attributesBinder];
+    if ([cls respondsToSelector:@selector(bindAttributes:)]) {
+        [cls bindAttributes:attributesBinder];
+    }
 }
 
 bool ViewManager::supportsClassNameNatively(const Valdi::StringBox& className) {
-    return !resolveClassName(className).isEmpty();
+    auto effectiveClassName = getEffectiveClassName(className);
+    if (effectiveClassName.isEmpty()) {
+        return false;
+    }
+    NSString *nsClassName = NSStringFromString(effectiveClassName);
+    return nsClassName && NSClassFromString(nsClassName) != nil;
 }
 
 Valdi::Value ViewManager::createViewNodeWrapper(const Valdi::Ref<Valdi::ViewNode>& viewNode, bool wrapInPlatformReference) {
@@ -391,9 +529,8 @@ Valdi::Value ViewManager::createViewNodeWrapper(const Valdi::Ref<Valdi::ViewNode
 
 Valdi::Ref<Valdi::IViewTransaction> ViewManager::createViewTransaction(
     const Valdi::Ref<Valdi::MainThreadManager>& mainThreadManager, bool shouldDefer) {
-    if (!shouldDefer || mainThreadManager->currentThreadIsMainThread()) {
-        static auto *kInstance = new MacOSViewTransaction();
-        return Valdi::Ref(kInstance);
+    if (!shouldDefer || mainThreadManager == nullptr || mainThreadManager->currentThreadIsMainThread()) {
+        return Valdi::makeShared<MacOSViewTransaction>();
     } else {
         return Valdi::makeShared<Valdi::DeferredViewTransaction>(*this, *mainThreadManager);
     }

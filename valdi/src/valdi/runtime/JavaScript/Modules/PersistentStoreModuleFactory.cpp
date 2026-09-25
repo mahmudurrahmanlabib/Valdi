@@ -22,14 +22,12 @@ PersistentStoreModuleFactory::PersistentStoreModuleFactory(const Ref<IDiskCache>
                                                            const Ref<DispatchQueue>& dispatchQueue,
                                                            const SharedAtomicObject<UserSession>& userSession,
                                                            const Shared<snap::valdi::Keychain>& keychain,
-                                                           ILogger& logger,
-                                                           bool disableDecryptionByDefault)
+                                                           ILogger& logger)
     : _diskCache(diskCache),
       _dispatchQueue(dispatchQueue),
       _userSession(userSession),
       _keychain(keychain),
-      _logger(logger),
-      _disableEncryptionByDefault(disableDecryptionByDefault) {}
+      _logger(logger) {}
 
 static void bindPersistentStoreMethod(const char* methodName,
                                       const Ref<ValueMap>& persistentStoreObject,
@@ -51,9 +49,11 @@ Valdi::Ref<PersistentStore> PersistentStoreModuleFactory::getOrCreatePersistentS
     uint64_t maxWeight,
     bool disableBatchWrites,
     std::optional<bool> enableEncryption) {
+    auto effectivePath = getEffectiveStorePath(stringPath, enableEncryption);
+
     std::lock_guard<Valdi::Mutex> guard(_existingStoreMutex);
 
-    auto result = _existingStores.find(stringPath);
+    auto result = _existingStores.find(effectivePath);
     if (result != _existingStores.end()) {
         auto store = result->second;
         if (auto spt = store.lock()) {
@@ -67,15 +67,25 @@ Valdi::Ref<PersistentStore> PersistentStoreModuleFactory::getOrCreatePersistentS
     auto keychain = shouldEncrypt(enableEncryption) ? _keychain : NULL;
 
     auto persistentStore = Valdi::makeShared<PersistentStore>(
-        stringPath, _diskCache, userSession, keychain, _dispatchQueue, _logger, maxWeight, disableBatchWrites);
-    _existingStores[stringPath] = persistentStore;
+        effectivePath, _diskCache, userSession, keychain, _dispatchQueue, _logger, maxWeight, disableBatchWrites);
+    _existingStores[effectivePath] = persistentStore;
     persistentStore->populate();
     return persistentStore;
 }
 
-// Use the COF value only if a non-null bool is provided
+// Encryption is disabled by default; consumers opt in by passing enableEncryption: true.
 bool PersistentStoreModuleFactory::shouldEncrypt(std::optional<bool> enableEncryption) {
-    return enableEncryption.value_or(!_disableEncryptionByDefault);
+    return enableEncryption.value_or(false);
+}
+
+StringBox PersistentStoreModuleFactory::getEffectiveStorePath(const StringBox& basePath,
+                                                              std::optional<bool> enableEncryption) {
+    // Stores that don't opt into encryption use a "_V2" suffix so they never attempt to
+    // read data written under the earlier encrypted-by-default behavior with a missing key.
+    if (!enableEncryption.has_value()) {
+        return STRING_FORMAT("{}_V2", basePath);
+    }
+    return basePath;
 }
 
 Value PersistentStoreModuleFactory::loadModule() {
